@@ -19,12 +19,12 @@ Nothing else can start without this. No business functionality yet.
 
 All five have integration tests passing against a live Postgres instance (`go test ./...` from the repo root).
 
-## Phase 1 — Ledger
+## Phase 1 — Ledger ✅ complete
 
-Build immediately after the foundation, before any money-moving module — even in sandbox/test mode.
-
-- `ledger_accounts`, `ledger_transactions`, `ledger_entries`, `ledger_balances` (see `ARCHITECTURE.md` §6 for schema).
-- The single `Post()` write path: enforces balance-per-asset invariant and idempotency-key uniqueness. No other code is allowed to write to `ledger_entries`.
+- ✅ `ledger_accounts`, `ledger_transactions`, `ledger_entries`, `ledger_balances` (see `ARCHITECTURE.md` §6 for schema). `tenant_id` has no FK yet — the `tenants` table doesn't exist until Phase 2; add the constraint then rather than stub a placeholder table now. Uses `UNIQUE NULLS NOT DISTINCT` on accounts so platform-level (tenant_id NULL) accounts correctly dedupe — a plain `UNIQUE` would treat every NULL as distinct and silently allow duplicates.
+- ✅ `internal/ledger.Post()` — the single write path. Enforces balance-per-asset (not just overall), rejects zero/negative amounts, and claims the idempotency key atomically (`ON CONFLICT ... DO NOTHING` + `ErrAlreadyPosted`) before any entry is written, all inside one DB transaction.
+- ✅ `decimal.Decimal` (shopspring) used throughout, never `float64` — registered as a native pgx type in `platform/db` so it works as both scan target and query param with no manual string conversion.
+- ✅ Verified with the exact worked example from `ARCHITECTURE.md` §6 (100 USDT-TRC20 → NGN, full deposit→fx→settlement→sweep flow) end to end against a live DB, asserting every final account balance. Also verified: unbalanced entries rejected (both single-asset and the cross-asset case where two different assets individually don't balance), duplicate idempotency key rejected without double-applying the balance change, and `GetOrCreateAccount` correctly dedupes platform-level accounts.
 
 Everything downstream posts through this — it needs to exist and be trustworthy before anything else that moves value.
 

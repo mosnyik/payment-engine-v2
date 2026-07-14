@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 
+	pgxdecimal "github.com/jackc/pgx-shopspring-decimal"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -15,9 +17,21 @@ type Pool struct {
 }
 
 // Open creates and validates a connection pool against databaseURL.
-// Callers must call Close when done.
+// Callers must call Close when done. Every connection gets shopspring/decimal
+// registered as a native type, so ledger code (and anything else touching
+// money) can use decimal.Decimal directly as a query param and scan target
+// instead of float64 or manual string conversion.
 func Open(ctx context.Context, databaseURL string) (*Pool, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("db: parse config: %w", err)
+	}
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		pgxdecimal.Register(conn.TypeMap())
+		return nil
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("db: create pool: %w", err)
 	}
