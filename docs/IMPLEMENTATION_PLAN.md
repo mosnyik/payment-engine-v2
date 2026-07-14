@@ -6,15 +6,17 @@ Status: living doc, pre-implementation. Companion to `ARCHITECTURE.md` (design d
 
 Distinct buildable parts, grouped into: the foundation layer everything depends on, the nine business modules from the module map, and cross-cutting ops tooling — ordered by dependency, with one deliberate sequencing call-out (Phase 4).
 
-## Phase 0 — Foundation
+## Phase 0 — Foundation ✅ complete
 
 Nothing else can start without this. No business functionality yet.
 
-- **`platform/db`** — Postgres connection pooling (`pgx`), `golang-migrate` setup, base migration tooling.
-- **`platform/gateway`** — tenant authentication (HMAC+API key and mTLS, per-tenant configurable), request routing.
-- **`platform/admin-auth`** — separate credential space for internal/staff access (KYB review, compliance holds, corridor config, manual settlement retry). Per-admin credentials, constant-time/hashed comparison, audit logging of who did what — not a single shared secret like v1's `ADMIN_SECRET`, since this surface gates wallet config and compliance decisions. Needed as early as Phase 2 (KYB review requires an authenticated admin from day one), so it belongs in the foundation, not deferred to Phase 8.
-- **`platform/eventbus`** — the `outbox_events` table, in-process dispatcher claiming rows via `SELECT ... FOR UPDATE SKIP LOCKED`, Publish/Subscribe interfaces.
-- **`platform/idempotency`** — inbound-request idempotency store (distinct from the ledger's own idempotency keys — this one covers "did the tenant already POST this request").
+- ✅ **`platform/db`** — Postgres connection pooling (`pgx`), `golang-migrate` setup, base migration tooling. Verified against a live local Postgres (Docker, port 5433 to avoid a conflicting native install).
+- ✅ **`platform/gateway`** — tenant HMAC+API key authentication: signature covers method+path+timestamp+body-hash, constant-time compare, 5-min replay window. mTLS deliberately deferred — it needs a tenant record to say which tenants use it, which doesn't exist until Phase 2; the router's shape doesn't change when it's added. Routing via `chi`.
+- ✅ **`platform/admin-auth`** — separate credential space for staff: bcrypt-hashed passwords, sessions looked up by token hash (no secret-comparison step at all, sidestepping timing attacks structurally rather than via constant-time compare), login-timing normalized against user enumeration, full audit log table. Direct replacement for v1's single shared `ADMIN_SECRET`.
+- ✅ **`platform/eventbus`** — `outbox_events` table, dispatcher claims one row per transaction via `SELECT ... FOR UPDATE SKIP LOCKED` (isolates a failing handler to its own event, not the whole batch), immediate wake-up + poll-interval backstop. Verified: successful dispatch marks `dispatched_at`; a failing handler rolls back cleanly and redelivers next tick.
+- ✅ **`platform/idempotency`** — inbound-request idempotency store, scoped per-tenant (`(tenant_id, key)`, not a bare key — two tenants can pick the same client-supplied string safely). Three-outcome model (`Claimed`/`InFlight`/`Completed`) verified against the live DB.
+
+All five have integration tests passing against a live Postgres instance (`go test ./...` from the repo root).
 
 ## Phase 1 — Ledger
 
