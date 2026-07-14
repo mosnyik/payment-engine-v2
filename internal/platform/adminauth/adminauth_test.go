@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -33,7 +34,7 @@ func openTestPool(t *testing.T) *db.Pool {
 func TestLoginAuthenticateAndAudit(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
-	store := adminauth.New(pool)
+	store := adminauth.New(pool, 12*time.Hour)
 
 	email := fmt.Sprintf("ops-%s@sirfi.test", uuid.New())
 	password := "correct-horse-battery-staple"
@@ -76,7 +77,7 @@ func TestLoginAuthenticateAndAudit(t *testing.T) {
 func TestLoginWrongPassword(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
-	store := adminauth.New(pool)
+	store := adminauth.New(pool, 12*time.Hour)
 
 	email := fmt.Sprintf("ops-%s@sirfi.test", uuid.New())
 	if _, err := store.CreateAdmin(ctx, email, "the-real-password"); err != nil {
@@ -91,7 +92,7 @@ func TestLoginWrongPassword(t *testing.T) {
 func TestLoginUnknownEmail(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
-	store := adminauth.New(pool)
+	store := adminauth.New(pool, 12*time.Hour)
 
 	if _, err := store.Login(ctx, "nobody@sirfi.test", "whatever"); err != adminauth.ErrInvalidCredentials {
 		t.Fatalf("expected ErrInvalidCredentials, got %v", err)
@@ -101,7 +102,7 @@ func TestLoginUnknownEmail(t *testing.T) {
 func TestAuthenticateInvalidToken(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
-	store := adminauth.New(pool)
+	store := adminauth.New(pool, 12*time.Hour)
 
 	if _, err := store.Authenticate(ctx, "not-a-real-token"); err != adminauth.ErrInvalidSession {
 		t.Fatalf("expected ErrInvalidSession, got %v", err)

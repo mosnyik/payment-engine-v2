@@ -50,7 +50,8 @@ type Handler func(ctx context.Context, tx pgx.Tx, event Event) error
 
 // Bus is the in-process event dispatcher backed by the outbox_events table.
 type Bus struct {
-	pool *db.Pool
+	pool      *db.Pool
+	batchSize int
 
 	mu       sync.RWMutex
 	handlers map[string][]Handler
@@ -58,11 +59,15 @@ type Bus struct {
 	wake chan struct{}
 }
 
-func New(pool *db.Pool) *Bus {
+// New builds a Bus. batchSize is an operational setting
+// (config.EventbusBatchSize), not a compiled-in constant, so it's tunable
+// per environment without a redeploy.
+func New(pool *db.Pool, batchSize int) *Bus {
 	return &Bus{
-		pool:     pool,
-		handlers: make(map[string][]Handler),
-		wake:     make(chan struct{}, 1),
+		pool:      pool,
+		batchSize: batchSize,
+		handlers:  make(map[string][]Handler),
+		wake:      make(chan struct{}, 1),
 	}
 }
 
@@ -122,13 +127,11 @@ func (b *Bus) Run(ctx context.Context, pollInterval time.Duration) error {
 	}
 }
 
-const batchSize = 50
-
-// dispatchBatch claims and processes up to batchSize events, one per
+// dispatchBatch claims and processes up to b.batchSize events, one per
 // transaction so a single failing handler only blocks its own event, not
 // the rest of the batch.
 func (b *Bus) dispatchBatch(ctx context.Context) {
-	for range batchSize {
+	for range b.batchSize {
 		dispatched, err := b.dispatchOne(ctx)
 		if err != nil {
 			log.Printf("eventbus: %v", err)

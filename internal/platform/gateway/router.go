@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -17,7 +18,7 @@ import (
 // exist until the tenant module (Phase 2) is built. HMAC is fully usable
 // standalone in the meantime — per-tenant choice of auth method comes once
 // tenant exists to express it, without changing this router's shape.
-func NewRouter(lookup CredentialLookup) chi.Router {
+func NewRouter(lookup CredentialLookup, hmacClockSkew time.Duration) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -28,7 +29,7 @@ func NewRouter(lookup CredentialLookup) chi.Router {
 	})
 
 	r.Group(func(protected chi.Router) {
-		protected.Use(HMACMiddleware(lookup))
+		protected.Use(HMACMiddleware(lookup, hmacClockSkew))
 		// Modules mount their authenticated routes on `protected` as they're built.
 	})
 

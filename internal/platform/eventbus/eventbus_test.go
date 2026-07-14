@@ -36,7 +36,7 @@ func TestPublishAndDispatch(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
 
-	bus := eventbus.New(pool)
+	bus := eventbus.New(pool, 50)
 
 	received := make(chan eventbus.Event, 1)
 	bus.Subscribe("test.thing_happened", func(ctx context.Context, tx pgx.Tx, e eventbus.Event) error {
@@ -90,7 +90,7 @@ func TestHandlerFailureDoesNotMarkDispatched(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
 
-	bus := eventbus.New(pool)
+	bus := eventbus.New(pool, 50)
 
 	attempts := 0
 	done := make(chan struct{})

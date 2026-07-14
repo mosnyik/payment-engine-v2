@@ -22,11 +22,6 @@ const (
 	headerAPIKey    = "X-API-Key"
 	headerTimestamp = "X-Timestamp"
 	headerSignature = "X-Signature"
-
-	// maxClockSkew bounds how old (or how far in the future) a signed
-	// request's timestamp may be — this is the replay window. A captured,
-	// validly-signed request is only replayable within this window.
-	maxClockSkew = 5 * time.Minute
 )
 
 var (
@@ -58,10 +53,12 @@ func TenantIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 // The signature covers method + path + timestamp + body-hash — not just the
 // body — so a captured signature can't be replayed against a different
 // endpoint or method. Comparison is constant-time (hmac.Equal); the
-// timestamp must fall within maxClockSkew to bound replay even of a
-// correctly-signed request. IP allowlisting, if configured per-tenant, is
-// layered on separately as defense-in-depth — it is never the sole gate.
-func HMACMiddleware(lookup CredentialLookup) func(http.Handler) http.Handler {
+// timestamp must fall within maxClockSkew (config.HMACClockSkew — an
+// operational setting, not a compiled-in constant, so it's tunable without
+// a redeploy) to bound replay even of a correctly-signed request. IP
+// allowlisting, if configured per-tenant, is layered on separately as
+// defense-in-depth — it is never the sole gate.
+func HMACMiddleware(lookup CredentialLookup, maxClockSkew time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiKey := r.Header.Get(headerAPIKey)

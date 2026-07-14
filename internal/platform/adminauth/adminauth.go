@@ -22,19 +22,20 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 )
 
-const sessionTTL = 12 * time.Hour
-
 var (
 	ErrInvalidCredentials = errors.New("adminauth: invalid email or password")
 	ErrInvalidSession     = errors.New("adminauth: invalid or expired session")
 )
 
 type Store struct {
-	pool *db.Pool
+	pool       *db.Pool
+	sessionTTL time.Duration
 }
 
-func New(pool *db.Pool) *Store {
-	return &Store{pool: pool}
+// New builds a Store. sessionTTL is an operational setting (config.AdminSessionTTL),
+// not a compiled-in constant, so it's tunable per environment without a redeploy.
+func New(pool *db.Pool, sessionTTL time.Duration) *Store {
+	return &Store{pool: pool, sessionTTL: sessionTTL}
 }
 
 // CreateAdmin creates a new admin user with a bcrypt-hashed password.
@@ -94,7 +95,7 @@ func (s *Store) Login(ctx context.Context, email, password string) (string, erro
 
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO admin_sessions (token_hash, admin_id, expires_at) VALUES ($1, $2, $3)`,
-		tokenHash, id, time.Now().Add(sessionTTL),
+		tokenHash, id, time.Now().Add(s.sessionTTL),
 	)
 	if err != nil {
 		return "", fmt.Errorf("adminauth: create session: %w", err)
