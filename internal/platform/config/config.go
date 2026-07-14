@@ -43,6 +43,8 @@ type Config struct {
 	HMACClockSkew     time.Duration // default 5m
 	AdminSessionTTL   time.Duration // default 12h
 	EventbusBatchSize int           // default 50
+
+	HTTPAddr string // default :8080
 }
 
 func (c *Config) IsProduction() bool {
