@@ -128,7 +128,7 @@ const batchSize = 50
 // transaction so a single failing handler only blocks its own event, not
 // the rest of the batch.
 func (b *Bus) dispatchBatch(ctx context.Context) {
-	for i := 0; i < batchSize; i++ {
+	for range batchSize {
 		dispatched, err := b.dispatchOne(ctx)
 		if err != nil {
 			log.Printf("eventbus: %v", err)
