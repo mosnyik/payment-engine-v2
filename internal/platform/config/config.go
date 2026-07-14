@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -19,12 +20,23 @@ import (
 // production, someone deployed without setting a real DATABASE_URL.
 const localDevDatabaseURL = "postgres://payment_engine:local_dev_only@localhost:5433/payment_engine?sslmode=disable"
 
+// localDevTenantSecretEncryptionKey matches .env.example — same
+// dev-default-in-production rejection as localDevDatabaseURL.
+const localDevTenantSecretEncryptionKey = "REPLACE_WITH_YOUR_OWN_32_BYTE_HEX_KEY"
+
 type Config struct {
 	// Environment is "development" (default) or "production", read from
 	// APP_ENV. Gates the weak/placeholder-secret checks below.
 	Environment string
 
 	DatabaseURL string
+
+	// TenantSecretEncryptionKey encrypts tenant credentials (e.g. HMAC
+	// secrets) at rest — see internal/platform/crypto. Interim measure, not
+	// a KMS: still a key colocated with app config, same limitation flagged
+	// for the HD wallet seed key in ARCHITECTURE.md §2, just applied here
+	// too rather than leaving tenant secrets in plaintext.
+	TenantSecretEncryptionKey []byte
 
 	// Operational tuning — previously hardcoded constants in their owning
 	// packages, now settable per-environment without a rebuild.
@@ -72,6 +84,22 @@ func Load(source Source) (*Config, error) {
 		errs = append(errs, "DATABASE_URL is still the local-dev default from .env.example — set a real value for production")
 	}
 
+	tenantSecretEncryptionKeyHex := requireString(source, "TENANT_SECRET_ENCRYPTION_KEY", &errs)
+	if environment == "production" && tenantSecretEncryptionKeyHex == localDevTenantSecretEncryptionKey {
+		errs = append(errs, "TENANT_SECRET_ENCRYPTION_KEY is still the local-dev default from .env.example — set a real value for production")
+	}
+	var tenantSecretEncryptionKey []byte
+	if tenantSecretEncryptionKeyHex != "" {
+		key, err := hex.DecodeString(tenantSecretEncryptionKeyHex)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("TENANT_SECRET_ENCRYPTION_KEY: invalid hex: %v", err))
+		} else if len(key) != 32 {
+			errs = append(errs, fmt.Sprintf("TENANT_SECRET_ENCRYPTION_KEY: must decode to 32 bytes, got %d", len(key)))
+		} else {
+			tenantSecretEncryptionKey = key
+		}
+	}
+
 	hmacClockSkew := durationOrDefault(source, "HMAC_CLOCK_SKEW", 5*time.Minute, &errs)
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
@@ -81,11 +109,12 @@ func Load(source Source) (*Config, error) {
 	}
 
 	return &Config{
-		Environment:       environment,
-		DatabaseURL:       databaseURL,
-		HMACClockSkew:     hmacClockSkew,
-		AdminSessionTTL:   adminSessionTTL,
-		EventbusBatchSize: eventbusBatchSize,
+		Environment:               environment,
+		DatabaseURL:               databaseURL,
+		TenantSecretEncryptionKey: tenantSecretEncryptionKey,
+		HMACClockSkew:             hmacClockSkew,
+		AdminSessionTTL:           adminSessionTTL,
+		EventbusBatchSize:         eventbusBatchSize,
 	}, nil
 }
 

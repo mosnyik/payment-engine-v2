@@ -56,7 +56,13 @@ func TestWorkedExample(t *testing.T) {
 	ctx := context.Background()
 	l := ledger.New(pool)
 
+	// ledger_accounts.tenant_id has a real FK to tenants(id) as of migration
+	// 000007 — insert a real row directly rather than depend on the tenant
+	// package from this test.
 	tenantID := uuid.New()
+	_, err := pool.Exec(ctx, `INSERT INTO tenants (id, name) VALUES ($1, $2)`, tenantID, "Test Tenant "+tenantID.String())
+	must(t, err)
+
 	sessionID := uuid.New()
 
 	treasuryInTransit, err := l.GetOrCreateAccount(ctx, nil, uniqueType("treasury_in_transit"), "USDT", "crypto", "Treasury in-transit USDT")
