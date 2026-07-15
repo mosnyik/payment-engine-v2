@@ -24,7 +24,7 @@ func NewRouter(lookup CredentialLookup, hmacClockSkew time.Duration) (router chi
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})

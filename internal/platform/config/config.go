@@ -44,7 +44,7 @@ type Config struct {
 	AdminSessionTTL   time.Duration // default 12h
 	EventbusBatchSize int           // default 50
 
-	HTTPAddr string // default :8080
+	HTTPAddr string // default :3700
 }
 
 func (c *Config) IsProduction() bool {
@@ -105,7 +105,7 @@ func Load(source Source) (*Config, error) {
 	hmacClockSkew := durationOrDefault(source, "HMAC_CLOCK_SKEW", 5*time.Minute, &errs)
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
-	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":8080")
+	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
