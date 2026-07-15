@@ -105,6 +105,7 @@ func Load(source Source) (*Config, error) {
 	hmacClockSkew := durationOrDefault(source, "HMAC_CLOCK_SKEW", 5*time.Minute, &errs)
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
+	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":8080")
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
@@ -117,6 +118,7 @@ func Load(source Source) (*Config, error) {
 		HMACClockSkew:             hmacClockSkew,
 		AdminSessionTTL:           adminSessionTTL,
 		EventbusBatchSize:         eventbusBatchSize,
+		HTTPAddr:                  httpAddr,
 	}, nil
 }
 

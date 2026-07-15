@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
@@ -38,11 +39,15 @@ func run() error {
 
 	log.Println("payment-engine-v2: db connected, migrations applied")
 
-	// gateway, adminauth, and eventbus are all built and config-driven
-	// (cfg.HMACClockSkew, cfg.AdminSessionTTL, cfg.EventbusBatchSize) but
-	// not wired into a running server yet — that needs a CredentialLookup
-	// implementation, which doesn't exist until the tenant module (Phase 2)
-	// is built. They'll be constructed and started here as those land.
+	router, err := buildRouter(cfg, pool)
+	if err != nil {
+		return err
+	}
 
-	return nil
+	// eventbus's dispatcher isn't started here yet — no module publishes
+	// real domain events to the outbox to dispatch. It'll start alongside
+	// the first module that does (Phase 5 onward).
+
+	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
+	return http.ListenAndServe(cfg.HTTPAddr, router)
 }
