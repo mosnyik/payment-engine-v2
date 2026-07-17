@@ -18,7 +18,7 @@ import (
 
 // localDevDatabaseURL matches .env.example — if this is still the value in
 // production, someone deployed without setting a real DATABASE_URL.
-const localDevDatabaseURL = "postgres://payment_engine:local_dev_only@localhost:5433/payment_engine?sslmode=disable"
+const localDevDatabaseURL = "postgres://payment_engine:local_dev_only@localhost:5433/2settle?sslmode=disable"
 
 // localDevTenantSecretEncryptionKey matches .env.example — same
 // dev-default-in-production rejection as localDevDatabaseURL.

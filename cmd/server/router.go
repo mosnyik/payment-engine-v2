@@ -54,5 +54,10 @@ func buildRouter(cfg *config.Config, pool *db.Pool) (chi.Router, error) {
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 	})
 
-	return r, nil
+	// Every route above lives under /v2 — the whole app is versioned at
+	// this single mount point rather than per-route.
+	versioned := chi.NewRouter()
+	versioned.Mount("/v2", r)
+
+	return versioned, nil
 }

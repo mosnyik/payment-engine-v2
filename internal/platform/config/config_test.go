@@ -105,7 +105,7 @@ func TestLoad_InvalidDuration(t *testing.T) {
 func TestLoad_RejectsDevDatabaseURLInProduction(t *testing.T) {
 	_, err := config.Load(mapSource{
 		"APP_ENV":                      "production",
-		"DATABASE_URL":                 "postgres://payment_engine:local_dev_only@localhost:5433/payment_engine?sslmode=disable",
+		"DATABASE_URL":                 "postgres://payment_engine:local_dev_only@localhost:5433/2settle?sslmode=disable",
 		"TENANT_SECRET_ENCRYPTION_KEY": validTestKey,
 	})
 	if err == nil {
@@ -118,7 +118,7 @@ func TestLoad_RejectsDevDatabaseURLInProduction(t *testing.T) {
 
 func TestLoad_DevDatabaseURLAllowedOutsideProduction(t *testing.T) {
 	_, err := config.Load(mapSource{
-		"DATABASE_URL":                 "postgres://payment_engine:local_dev_only@localhost:5433/payment_engine?sslmode=disable",
+		"DATABASE_URL":                 "postgres://payment_engine:local_dev_only@localhost:5433/2settle?sslmode=disable",
 		"TENANT_SECRET_ENCRYPTION_KEY": validTestKey,
 	})
 	if err != nil {

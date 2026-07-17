@@ -136,7 +136,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	var loginResp struct {
 		Token string `json:"token"`
 	}
-	resp := doJSON(t, client, http.MethodPost, srv.URL+"/admin/login", "", map[string]string{
+	resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/login", "", map[string]string{
 		"email": adminEmail, "password": "correct-horse-battery-staple",
 	}, &loginResp)
 	if resp.StatusCode != http.StatusOK {
@@ -150,7 +150,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	// Unauthenticated admin requests must be rejected — confirms the
 	// middleware is actually wired on the protected group, not just present
 	// in the package.
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants", "", map[string]string{"name": "should not work"}, nil)
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants", "", map[string]string{"name": "should not work"}, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated admin request, got %d", resp.StatusCode)
 	}
@@ -159,7 +159,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	var createResp struct {
 		ID string `json:"id"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants", token, map[string]string{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants", token, map[string]string{
 		"name": "Test Fintech " + uuid.NewString(),
 	}, &createResp)
 	if resp.StatusCode != http.StatusCreated {
@@ -172,7 +172,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 
 	// Credential issuance before KYB approval must be refused — the
 	// onboarding chain's core guarantee.
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/api-keys", token, nil, nil)
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/api-keys", token, nil, nil)
 	if resp.StatusCode == http.StatusCreated {
 		t.Fatal("expected credential issuance to be refused before KYB approval")
 	}
@@ -182,7 +182,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 		ID     string `json:"ID"`
 		Status string `json:"Status"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/kyb", token, map[string]any{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/kyb", token, map[string]any{
 		"submitted_data": map[string]string{"company": "Test Fintech Ltd"},
 		"provider_name":  "",
 	}, &kybCase)
@@ -197,7 +197,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	var holds []struct {
 		ID string `json:"ID"`
 	}
-	resp = doJSON(t, client, http.MethodGet, srv.URL+"/admin/compliance/holds?case_type=kyb", token, nil, &holds)
+	resp = doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/compliance/holds?case_type=kyb", token, nil, &holds)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list holds: expected 200, got %d", resp.StatusCode)
 	}
@@ -215,7 +215,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	var resolvedCase struct {
 		Status string `json:"Status"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/compliance/holds/"+kybCase.ID+"/resolve", token, map[string]any{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/compliance/holds/"+kybCase.ID+"/resolve", token, map[string]any{
 		"approved": true, "reason": "documents verified",
 	}, &resolvedCase)
 	if resp.StatusCode != http.StatusOK {
@@ -230,7 +230,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 		APIKey     string `json:"api_key"`
 		HMACSecret string `json:"hmac_secret"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/api-keys", token, nil, &credsResp)
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/api-keys", token, nil, &credsResp)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("issue api key: expected 201, got %d", resp.StatusCode)
 	}
@@ -239,7 +239,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 
 	// --- Step 5: corridor entitlement ---
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/corridors/"+corridorID.String(), token, map[string]any{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/corridors/"+corridorID.String(), token, map[string]any{
 		"active": true,
 	}, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -247,14 +247,14 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 
 	// --- Step 6: webhook config, SSRF-validated ---
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/webhook", token, map[string]string{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/webhook", token, map[string]string{
 		"url": "https://169.254.169.254/latest/meta-data/",
 	}, nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected the SSRF webhook attempt to be rejected with 400, got %d", resp.StatusCode)
 	}
 
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/admin/tenants/"+tenantID.String()+"/webhook", token, map[string]string{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/webhook", token, map[string]string{
 		"url": "https://example.com/webhooks/sirfi",
 	}, nil)
 	if resp.StatusCode != http.StatusOK {
@@ -262,15 +262,15 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 
 	// --- Final proof: the issued credential actually authenticates against
-	// a real protected tenant-facing route (/v1/ping) — a completely
+	// a real protected tenant-facing route (/v2/ping) — a completely
 	// separate auth surface from /admin, gated by HMACMiddleware rather
 	// than adminauth.Middleware. This is what proves the ISSUED credential
 	// is usable end to end, not just that Store-level HMAC logic is
 	// correct in isolation (already covered in internal/tenant's own test).
 	timestampStr := jsonNumberString(time.Now().UnixMilli())
-	sig := gateway.Sign(credsResp.HMACSecret, http.MethodGet, "/v1/ping", timestampStr, nil)
+	sig := gateway.Sign(credsResp.HMACSecret, http.MethodGet, "/v2/ping", timestampStr, nil)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/ping", nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/ping", nil)
 	req.Header.Set("X-API-Key", credsResp.APIKey)
 	req.Header.Set("X-Timestamp", timestampStr)
 	req.Header.Set("X-Signature", sig)
@@ -280,7 +280,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 	defer tenantResp.Body.Close()
 	if tenantResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected /v1/ping with a valid credential to return 200, got %d", tenantResp.StatusCode)
+		t.Fatalf("expected /v2/ping with a valid credential to return 200, got %d", tenantResp.StatusCode)
 	}
 	var pingBody struct {
 		TenantID string `json:"tenant_id"`
@@ -289,25 +289,25 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 		t.Fatalf("decode ping response: %v", err)
 	}
 	if pingBody.TenantID != tenantID.String() {
-		t.Fatalf("expected /v1/ping to identify tenant %s, got %s", tenantID, pingBody.TenantID)
+		t.Fatalf("expected /v2/ping to identify tenant %s, got %s", tenantID, pingBody.TenantID)
 	}
 
 	// Negative case: the same route with no credentials must be rejected —
-	// proves the middleware is actually gating /v1/ping, not that it
+	// proves the middleware is actually gating /v2/ping, not that it
 	// happens to be open.
-	noAuthResp, err := client.Get(srv.URL + "/v1/ping")
+	noAuthResp, err := client.Get(srv.URL + "/v2/ping")
 	if err != nil {
 		t.Fatalf("unauthenticated ping request: %v", err)
 	}
 	defer noAuthResp.Body.Close()
 	if noAuthResp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for /v1/ping with no credentials, got %d", noAuthResp.StatusCode)
+		t.Fatalf("expected 401 for /v2/ping with no credentials, got %d", noAuthResp.StatusCode)
 	}
 
 	// An admin bearer token must not work on the tenant surface, and vice
 	// versa — the two auth spaces are genuinely separate, not just
 	// differently-labeled views of the same thing.
-	adminOnPingReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/ping", nil)
+	adminOnPingReq, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/ping", nil)
 	adminOnPingReq.Header.Set("Authorization", "Bearer "+token)
 	adminOnPingResp, err := client.Do(adminOnPingReq)
 	if err != nil {
@@ -315,7 +315,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 	defer adminOnPingResp.Body.Close()
 	if adminOnPingResp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected an admin bearer token to be rejected on /v1/ping, got %d", adminOnPingResp.StatusCode)
+		t.Fatalf("expected an admin bearer token to be rejected on /v2/ping, got %d", adminOnPingResp.StatusCode)
 	}
 }
 
