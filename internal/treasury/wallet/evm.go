@@ -29,8 +29,15 @@ func keccak256(data []byte) []byte {
 // evmAddress derives the EIP-55 checksummed address for priv's public key
 // — identical for Ethereum and BSC (same secp256k1/Keccak256 addressing).
 func evmAddress(priv *btcec.PrivateKey) (string, error) {
-	pub := priv.PubKey().SerializeUncompressed() // 0x04 || X(32) || Y(32)
-	hash := keccak256(pub[1:])
+	return addressFromPubKey(priv.PubKey())
+}
+
+// addressFromPubKey derives the EIP-55 checksummed address for an
+// already-known public key — used both by evmAddress and by tests that
+// recover a public key from a signature and need to re-derive its address.
+func addressFromPubKey(pub *btcec.PublicKey) (string, error) {
+	serialized := pub.SerializeUncompressed() // 0x04 || X(32) || Y(32)
+	hash := keccak256(serialized[1:])
 	addrBytes := hash[12:] // last 20 bytes
 	return eip55Checksum(addrBytes), nil
 }
