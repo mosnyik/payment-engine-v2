@@ -88,10 +88,10 @@ type Config struct {
 }
 
 type Store struct {
-	pool                *db.Pool
-	corridorStore       *corridor.Store
-	providers           map[string]CollectionProvider
-	bushaWebhookSecret  string
+	pool               *db.Pool
+	corridorStore      *corridor.Store
+	providers          map[string]CollectionProvider
+	bushaWebhookSecret string
 }
 
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {

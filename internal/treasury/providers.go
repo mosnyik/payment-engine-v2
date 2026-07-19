@@ -1,6 +1,7 @@
 package treasury
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -98,8 +99,8 @@ func (p *bushaProvider) ReserveAddress(ctx context.Context, cryptoAsset, cryptoN
 
 	// TODO: replace with the real Busha response shape.
 	var parsed struct {
-		Address    string `json:"address"`
-		Tag        string `json:"tag"`
+		Address     string `json:"address"`
+		Tag         string `json:"tag"`
 		ReferenceID string `json:"reference_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
@@ -117,13 +118,22 @@ func (p *bushaProvider) ReserveAddress(ctx context.Context, cryptoAsset, cryptoN
 }
 
 func (p *bushaProvider) buildRequest(ctx context.Context, cryptoAsset, cryptoNetwork string) (*http.Request, error) {
-	// TODO: replace with the real Busha deposit-address endpoint/payload.
-	req, err := http.NewRequest(http.MethodPost, p.cfg.APIURL+"/TODO/addresses", nil)
+	// TODO: replace with the real Busha deposit-address endpoint/payload
+	// shape — asset/network field names below are a placeholder guess.
+	body, err := json.Marshal(struct {
+		Asset   string `json:"asset"`
+		Network string `json:"network"`
+	}{Asset: cryptoAsset, Network: cryptoNetwork})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, p.cfg.APIURL+"/TODO/addresses", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	return req, nil
 }

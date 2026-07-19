@@ -47,6 +47,7 @@ type Config struct {
 	HTTPAddr string // default :3700
 
 	RateEngine RateEngineConfig
+	Treasury   TreasuryConfig
 }
 
 // RateProviderConfig configures one external HTTP rate-provider adapter
