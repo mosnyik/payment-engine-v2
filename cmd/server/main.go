@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/rate"
 )
 
 func main() {
@@ -47,6 +49,16 @@ func run() error {
 	// eventbus's dispatcher isn't started here yet — no module publishes
 	// real domain events to the outbox to dispatch. It'll start alongside
 	// the first module that does (Phase 5 onward).
+
+	rateStore := rate.New(pool, rate.Config{
+		CoinMarketCapAPIKey: cfg.RateEngine.CoinMarketCapAPIKey,
+		Busha:               rate.ProviderConfig(cfg.RateEngine.Busha),
+		LiquidRamp:          rate.ProviderConfig(cfg.RateEngine.LiquidRamp),
+		Anchor:              rate.ProviderConfig(cfg.RateEngine.Anchor),
+	})
+	corridorStore := corridor.New(pool)
+	fetchJob := rate.NewFetchJob(rateStore, corridorStore, cfg.RateEngine.FetchInterval)
+	go fetchJob.Run(ctx)
 
 	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
 	return http.ListenAndServe(cfg.HTTPAddr, router)
