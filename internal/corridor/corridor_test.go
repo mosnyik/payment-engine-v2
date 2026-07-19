@@ -182,6 +182,55 @@ func TestProviderBindingsOrderedByPriorityAndFiltersInactive(t *testing.T) {
 	}
 }
 
+func TestListActiveFiatCurrencies(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := corridor.New(pool)
+
+	network := uniqueNetwork(t)
+	fiat := "TSTX_" + t.Name()
+
+	if _, err := s.UpsertCorridor(ctx, corridor.UpsertCorridorInput{
+		CryptoAsset:   "USDT",
+		CryptoNetwork: network,
+		FiatCurrency:  fiat,
+		Active:        true,
+	}); err != nil {
+		t.Fatalf("upsert active corridor: %v", err)
+	}
+
+	inactiveFiat := fiat + "_INACTIVE"
+	if _, err := s.UpsertCorridor(ctx, corridor.UpsertCorridorInput{
+		CryptoAsset:   "USDT",
+		CryptoNetwork: network + "_2",
+		FiatCurrency:  inactiveFiat,
+		Active:        false,
+	}); err != nil {
+		t.Fatalf("upsert inactive corridor: %v", err)
+	}
+
+	currencies, err := s.ListActiveFiatCurrencies(ctx)
+	if err != nil {
+		t.Fatalf("list active fiat currencies: %v", err)
+	}
+
+	var sawActive, sawInactive bool
+	for _, c := range currencies {
+		if c == fiat {
+			sawActive = true
+		}
+		if c == inactiveFiat {
+			sawInactive = true
+		}
+	}
+	if !sawActive {
+		t.Fatalf("expected active corridor's fiat currency %q in %v", fiat, currencies)
+	}
+	if sawInactive {
+		t.Fatalf("expected inactive corridor's fiat currency %q NOT in %v", inactiveFiat, currencies)
+	}
+}
+
 func TestUpsertProviderBinding_ConfigRoundTrips(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()

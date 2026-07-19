@@ -45,6 +45,27 @@ type Config struct {
 	EventbusBatchSize int           // default 50
 
 	HTTPAddr string // default :3700
+
+	RateEngine RateEngineConfig
+}
+
+// RateProviderConfig configures one external HTTP rate-provider adapter
+// (Busha, LiquidRamp, Anchor) — see internal/rate. All default disabled:
+// none of these have a real endpoint/response shape wired in yet.
+type RateProviderConfig struct {
+	Enabled bool
+	APIURL  string
+	APIKey  string
+}
+
+// RateEngineConfig is the rate engine's operational tuning — see
+// ARCHITECTURE.md §7.
+type RateEngineConfig struct {
+	CoinMarketCapAPIKey string
+	FetchInterval       time.Duration // default 30s
+	Busha               RateProviderConfig
+	LiquidRamp          RateProviderConfig
+	Anchor              RateProviderConfig
 }
 
 func (c *Config) IsProduction() bool {

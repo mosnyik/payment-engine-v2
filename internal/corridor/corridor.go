@@ -179,6 +179,33 @@ func (s *Store) UpsertProviderBinding(ctx context.Context, corridorID uuid.UUID,
 	return id, nil
 }
 
+// ListActiveFiatCurrencies returns the distinct fiat currencies used by
+// active corridors. The rate engine's background fetch job polls exactly
+// this list (see ARCHITECTURE.md §7) — adding a fiat currency is a
+// corridor config change, not a redeploy.
+func (s *Store) ListActiveFiatCurrencies(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT fiat_currency FROM corridors WHERE active ORDER BY fiat_currency`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("corridor: list active fiat currencies: %w", err)
+	}
+	defer rows.Close()
+
+	var currencies []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, fmt.Errorf("corridor: scan fiat currency: %w", err)
+		}
+		currencies = append(currencies, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("corridor: list active fiat currencies: %w", err)
+	}
+	return currencies, nil
+}
+
 // ListActiveProviders returns active provider bindings for a corridor,
 // ordered by priority (lowest first — the settlement retry policy fails
 // over down this list before retrying the one that just failed).
