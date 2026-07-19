@@ -69,6 +69,24 @@ type RateEngineConfig struct {
 	Anchor              RateProviderConfig
 }
 
+// CollectionProviderConfig configures one external crypto-collection
+// adapter (see internal/treasury) — a different credential surface from
+// RateProviderConfig even for the same partner (Busha), since rate-quote
+// and collection are separate APIs. Default disabled: no real endpoint or
+// webhook signature scheme is wired in yet.
+type CollectionProviderConfig struct {
+	Enabled       bool
+	APIURL        string
+	APIKey        string
+	WebhookSecret string
+}
+
+// TreasuryConfig is treasury's operational tuning — see internal/treasury
+// and ARCHITECTURE.md §2/§3.
+type TreasuryConfig struct {
+	Busha CollectionProviderConfig
+}
+
 func (c *Config) IsProduction() bool {
 	return c.Environment == "production"
 }
@@ -137,6 +155,10 @@ func Load(source Source) (*Config, error) {
 		Anchor:              loadRateProviderConfig(source, "ANCHOR"),
 	}
 
+	treasury := TreasuryConfig{
+		Busha: loadCollectionProviderConfig(source, "BUSHA_TREASURY"),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -150,6 +172,7 @@ func Load(source Source) (*Config, error) {
 		EventbusBatchSize:         eventbusBatchSize,
 		HTTPAddr:                  httpAddr,
 		RateEngine:                rateEngine,
+		Treasury:                  treasury,
 	}, nil
 }
 
@@ -162,6 +185,19 @@ func loadRateProviderConfig(source Source, prefix string) RateProviderConfig {
 		Enabled: boolOrDefault(source, prefix+"_RATE_ENABLED", false),
 		APIURL:  stringOrDefault(source, prefix+"_RATE_API_URL", ""),
 		APIKey:  stringOrDefault(source, prefix+"_RATE_API_KEY", ""),
+	}
+}
+
+// loadCollectionProviderConfig reads an optional, disabled-by-default
+// external collection provider's settings — same malformed-value-defaults-
+// safely reasoning as loadRateProviderConfig, since none of these have a
+// real endpoint/webhook scheme wired in yet.
+func loadCollectionProviderConfig(source Source, prefix string) CollectionProviderConfig {
+	return CollectionProviderConfig{
+		Enabled:       boolOrDefault(source, prefix+"_ENABLED", false),
+		APIURL:        stringOrDefault(source, prefix+"_API_URL", ""),
+		APIKey:        stringOrDefault(source, prefix+"_API_KEY", ""),
+		WebhookSecret: stringOrDefault(source, prefix+"_WEBHOOK_SECRET", ""),
 	}
 }
 
