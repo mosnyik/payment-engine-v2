@@ -48,7 +48,7 @@ Ported from v1 (see `ARCHITECTURE.md` §7): provider adapters, background fetch 
 - ✅ **`LockRate()`** — selects the lowest quote among enabled providers (system rate as ceiling), applies the 1% slippage buffer, prices the crypto asset in USD (CoinMarketCap, USDT hardcoded to 1 — same known gap as v1: no fallback provider for asset pricing, revisit post-pilot), and persists the result to `rate_locks`.
 - No HTTP routes yet — same state as `corridor`: config/Store-level only. Nothing calls `LockRate()` until Phase 5's session module exists; `internal/rate/rate_test.go` exercises the Store directly against a live Postgres.
 
-*Next: Phase 4 — Treasury. Build the Busha (partner-custodied) collection adapter first; self-custody HD wallets come after.*
+*Next: Phase 4 — Treasury. Busha (partner-custodied) collection adapter ✅ done; self-custody HD wallets are next.*
 
 ## Phase 4 — Treasury *(sequencing call, not strict dependency order)*
 
@@ -56,8 +56,8 @@ The highest-stakes module — self-custody HD wallets, KMS-backed key encryption
 
 **Build the partner-custodied adapter (Busha) first.** It's simpler (no HD derivation, no KMS integration, no watcher/sweep policy to get right) and the SLA already exists. This gets a working end-to-end pilot (collection → settlement) running fastest, while self-custody gets the time and scrutiny it deserves without blocking everything else behind it.
 
-1. `treasury` — Busha (partner-custodied) collection provider adapter.
-2. `treasury` — self-custody HD wallet manager (KMS-backed key encryption), per-chain deposit watchers, confirmation policy, sweep policy execution (volatile-immediate / stable-batched).
+1. ✅ **`treasury` — Busha (partner-custodied) collection provider adapter.** `treasury_address_reservations`/`treasury_deposits`/`treasury_custody_balances` tables; `CollectionProvider` interface + Busha adapter built the same TODO-stub way rate's Busha/LiquidRamp/Anchor adapters were (real endpoint/response shape/webhook signature scheme unknown — v1 never actually built this integration either, so there was nothing to port). `ReserveAddress`/`GetDepositInstructions` fail over across a corridor's active collection-provider bindings by priority; `HandleDepositWebhook` does signature-verified, compare-and-set (`pending`→`detected`→`confirmed`) deposit-state transitions, idempotent on `(reservation_id, tx_reference)`. Same "config/Store-level only" precedent as `rate`/`corridor` — no HTTP routes wired yet, nothing calls `GetDepositInstructions()` until `session` (Phase 5) exists. Verified against a live Postgres (`go test ./internal/treasury/...`).
+2. **`treasury` — self-custody HD wallet manager** (KMS-backed key encryption), per-chain deposit watchers, confirmation policy, sweep policy execution (volatile-immediate / stable-batched). *Next.*
 
 ## Phase 5 — Session
 
