@@ -128,6 +128,14 @@ func Load(source Source) (*Config, error) {
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
 
+	rateEngine := RateEngineConfig{
+		CoinMarketCapAPIKey: stringOrDefault(source, "COINMARKETCAP_API_KEY", ""),
+		FetchInterval:       durationOrDefault(source, "RATE_FETCH_INTERVAL", 30*time.Second, &errs),
+		Busha:               loadRateProviderConfig(source, "BUSHA"),
+		LiquidRamp:          loadRateProviderConfig(source, "LIQUIDRAMP"),
+		Anchor:              loadRateProviderConfig(source, "ANCHOR"),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -140,7 +148,32 @@ func Load(source Source) (*Config, error) {
 		AdminSessionTTL:           adminSessionTTL,
 		EventbusBatchSize:         eventbusBatchSize,
 		HTTPAddr:                  httpAddr,
+		RateEngine:                rateEngine,
 	}, nil
+}
+
+// loadRateProviderConfig reads an optional, disabled-by-default external
+// rate provider's settings. Unlike the required config above, a malformed
+// *_RATE_ENABLED value defaulting to "disabled" is safe — these providers
+// have no real endpoint wired in yet — so it's not collected as an error.
+func loadRateProviderConfig(source Source, prefix string) RateProviderConfig {
+	return RateProviderConfig{
+		Enabled: boolOrDefault(source, prefix+"_RATE_ENABLED", false),
+		APIURL:  stringOrDefault(source, prefix+"_RATE_API_URL", ""),
+		APIKey:  stringOrDefault(source, prefix+"_RATE_API_KEY", ""),
+	}
+}
+
+func boolOrDefault(source Source, key string, def bool) bool {
+	v, ok := source.Get(key)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func stringOrDefault(source Source, key, def string) string {
