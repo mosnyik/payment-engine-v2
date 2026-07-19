@@ -21,6 +21,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/treasury/wallet"
 )
 
 var (
@@ -92,18 +93,26 @@ type Store struct {
 	corridorStore      *corridor.Store
 	providers          map[string]CollectionProvider
 	bushaWebhookSecret string
+
+	// seed is the decrypted HD wallet seed, populated by LoadHDWalletSeed.
+	// nil until then — the self-custody provider stays disabled (see
+	// selfCustodyProvider.IsEnabled) until a seed has been loaded.
+	seed *wallet.Seed
 }
 
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 	busha := newBushaProvider(cfg.Busha)
-	return &Store{
-		pool:          pool,
-		corridorStore: corridorStore,
-		providers: map[string]CollectionProvider{
-			busha.Name(): busha,
-		},
+	s := &Store{
+		pool:               pool,
+		corridorStore:      corridorStore,
 		bushaWebhookSecret: cfg.Busha.WebhookSecret,
 	}
+	selfCustody := &selfCustodyProvider{store: s}
+	s.providers = map[string]CollectionProvider{
+		busha.Name():       busha,
+		selfCustody.Name(): selfCustody,
+	}
+	return s
 }
 
 // ReserveAddress picks the corridor's active collection-provider bindings
