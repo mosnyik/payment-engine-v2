@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_USER: payment_engine
       POSTGRES_PASSWORD: local_dev_only
-      POSTGRES_DB: payment_engine
+      POSTGRES_DB: 2settle
     ports:
       - "5433:5432"
     volumes:

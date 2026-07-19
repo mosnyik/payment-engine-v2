@@ -1,6 +1,8 @@
 # Payment Rail v2 — Implementation Plan
 
-Status: living doc, pre-implementation. Companion to `ARCHITECTURE.md` (design decisions, module map, ledger schema, session state machine) — this doc is about *build order and sequencing*, not design. Update as phases complete or sequencing changes.
+> **Resuming in a new session?** Read this file top to bottom — every phase is marked ✅ if done, and each section ends with a `*Next: ...*` line. Then run `git log --oneline -10` and `go test ./...` (with `docker compose up -d postgres` running) to confirm the working tree matches what's documented here before continuing. `ARCHITECTURE.md` has every design decision behind these choices — check it before re-deciding something that's already settled.
+
+Status: living doc. Companion to `ARCHITECTURE.md` (design decisions, module map, ledger schema, session state machine) — this doc is about *build order and sequencing*, not design. Update as phases complete or sequencing changes.
 
 ## How this is organized
 
@@ -28,18 +30,25 @@ All five have integration tests passing against a live Postgres instance (`go te
 
 Everything downstream posts through this — it needs to exist and be trustworthy before anything else that moves value.
 
-## Phase 2 — Tenant, Corridor, Compliance (parallelizable)
+## Phase 2 — Tenant, Corridor, Compliance ✅ complete
 
-These three don't depend heavily on each other and can be built concurrently.
+- ✅ **`corridor`** — config entity binding asset+network × fiat currency to provider bindings (priority-ordered for failover), limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor). Upsert-by-natural-key throughout.
+- ✅ **`tenant`** — profile, fee schedule (with per-corridor override), corridor entitlements, credential storage. Satisfies `gateway.CredentialLookup` (compile-time-asserted and runtime-tested). Added `platform/crypto` (AES-256-GCM) along the way — an HMAC secret can't be one-way hashed like a password, so it needed at-rest encryption instead of plaintext; documented as an interim measure until a real KMS exists. Closed the `ledger_accounts.tenant_id` FK gap flagged back in Phase 1. SSRF-validated webhook URLs (rejects non-https and loopback/private/link-local resolved addresses, tested against the real AWS metadata IP) — direct fix for the matching v1 audit finding.
+- ✅ **`compliance`** — KYB case flow, manual-hold queue, provider registry scaffold (`Registry`/`ScreeningProvider`, empty by default — no vendor selected yet). Transaction-screening routing and Travel Rule volume aggregates deliberately **not** built — no real caller exists until the `session` module (Phase 5); building them now would be speculative.
+- ✅ **Onboarding workflow** — wired as real HTTP endpoints (not just a Store-level test): `POST /admin/login`, `/admin/tenants`, `/admin/tenants/{id}/kyb`, `/admin/compliance/holds`, `/admin/compliance/holds/{id}/resolve`, `/admin/tenants/{id}/api-keys`, `/admin/tenants/{id}/corridors/{id}`, `/admin/tenants/{id}/webhook`, all gated by `platform/admin-auth`. `cmd/server` now actually listens on a port for the first time — previously it only connected to the DB and ran migrations. Along the way, `gateway.NewRouter`'s protected route group was found to be unreachable from outside the package (a real gap, not by design) and fixed to return the sub-router so other packages can mount authenticated routes on it — proven with a `/v1/ping` smoke route hit by an actually-issued tenant credential, not a synthetic one.
+- The **Phase 2 acceptance test** (`cmd/server/onboarding_test.go`) drives the full sequence over real HTTP: register → submit KYB (falls into hold, no vendor configured) → appears in the ops queue → resolved by an admin → tenant activates → credential issuance refused-then-allowed → corridor entitlement → webhook SSRF rejection-then-acceptance → the issued credential successfully authenticates on a real protected route, and is confirmed rejected without credentials and rejected using an admin token (proving the two auth surfaces are genuinely separate, not just differently labeled).
 
-- **`tenant`** — profile, fee schedule, corridor entitlements, credential storage.
-- **`corridor`** — config entity binding asset+network × fiat currency to provider bindings, limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor).
-- **`compliance`** — provider registry, KYB case flow, manual-hold queue. Ships as hold-queue-only initially (no screening vendor selected yet); automated providers slot in later per corridor/currency without touching callers. Compliance cases persist independently of session lifecycle — a session expiring out of `compliance_hold` never closes the underlying case.
-- **Onboarding workflow** — not a separate module, but the concrete end-to-end sequence that has to work by the end of this phase (see `ARCHITECTURE.md` §5 for the full breakdown): tenant registration → KYB submission → KYB review (via `platform/admin-auth`) → credential issuance (via `platform/gateway`, nothing issued before KYB clears) → corridor entitlement assignment → webhook config (SSRF-validated). A tenant can't call the API at all until this whole chain works, so treat it as the Phase 2 acceptance test, not an afterthought.
-
-## Phase 3 — Rate engine
+## Phase 3 — Rate engine ✅ complete
 
 Ported from v1 (see `ARCHITECTURE.md` §7): provider adapters, background fetch job, aggregator (system-rate-as-ceiling selection rule), `LockRate()`, plus the new `rate_locks` table (not in v1). Depends only on `corridor` (active-currency list) and the foundation.
+
+- ✅ **`internal/rate`** — `system_rates` (ops-configured ceiling, keyed per fiat currency — not a single hardcoded-NGN row like v1), `provider_rates` (background-cached external quotes), `rate_locks` (persisted lock, adaptation #3). `Provider`/`LiveFetcher` interfaces split reading a cached quote (transaction path) from making the real HTTP call (background job only) — mirrors v1's `RateProvider`/`HttpRateProvider` split. `systemProvider` always enabled; `busha`/`liquidramp`/`anchor` ported as the same TODO-endpoint stubs v1 shipped with, disabled by default via config (`BUSHA_RATE_ENABLED` etc.) until a real integration is supplied.
+- ✅ **`corridor.ListActiveFiatCurrencies`** — adaptation #2: the fetch job polls this instead of a hardcoded `['NGN']`.
+- ✅ **`FetchJob`** — ticker-driven (default 30s, `RATE_FETCH_INTERVAL`), skips starting entirely if no external provider is enabled (matches v1), wired into `cmd/server/main.go` as a background goroutine.
+- ✅ **`LockRate()`** — selects the lowest quote among enabled providers (system rate as ceiling), applies the 1% slippage buffer, prices the crypto asset in USD (CoinMarketCap, USDT hardcoded to 1 — same known gap as v1: no fallback provider for asset pricing, revisit post-pilot), and persists the result to `rate_locks`.
+- No HTTP routes yet — same state as `corridor`: config/Store-level only. Nothing calls `LockRate()` until Phase 5's session module exists; `internal/rate/rate_test.go` exercises the Store directly against a live Postgres.
+
+*Next: Phase 4 — Treasury. Build the Busha (partner-custodied) collection adapter first; self-custody HD wallets come after.*
 
 ## Phase 4 — Treasury *(sequencing call, not strict dependency order)*
 

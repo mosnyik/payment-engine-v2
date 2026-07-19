@@ -6,6 +6,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -17,7 +18,11 @@ import (
 
 // localDevDatabaseURL matches .env.example — if this is still the value in
 // production, someone deployed without setting a real DATABASE_URL.
-const localDevDatabaseURL = "postgres://payment_engine:local_dev_only@localhost:5433/payment_engine?sslmode=disable"
+const localDevDatabaseURL = "postgres://payment_engine:local_dev_only@localhost:5433/2settle?sslmode=disable"
+
+// localDevTenantSecretEncryptionKey matches .env.example — same
+// dev-default-in-production rejection as localDevDatabaseURL.
+const localDevTenantSecretEncryptionKey = "REPLACE_WITH_YOUR_OWN_32_BYTE_HEX_KEY"
 
 type Config struct {
 	// Environment is "development" (default) or "production", read from
@@ -26,11 +31,41 @@ type Config struct {
 
 	DatabaseURL string
 
+	// TenantSecretEncryptionKey encrypts tenant credentials (e.g. HMAC
+	// secrets) at rest — see internal/platform/crypto. Interim measure, not
+	// a KMS: still a key colocated with app config, same limitation flagged
+	// for the HD wallet seed key in ARCHITECTURE.md §2, just applied here
+	// too rather than leaving tenant secrets in plaintext.
+	TenantSecretEncryptionKey []byte
+
 	// Operational tuning — previously hardcoded constants in their owning
 	// packages, now settable per-environment without a rebuild.
 	HMACClockSkew     time.Duration // default 5m
 	AdminSessionTTL   time.Duration // default 12h
 	EventbusBatchSize int           // default 50
+
+	HTTPAddr string // default :3700
+
+	RateEngine RateEngineConfig
+}
+
+// RateProviderConfig configures one external HTTP rate-provider adapter
+// (Busha, LiquidRamp, Anchor) — see internal/rate. All default disabled:
+// none of these have a real endpoint/response shape wired in yet.
+type RateProviderConfig struct {
+	Enabled bool
+	APIURL  string
+	APIKey  string
+}
+
+// RateEngineConfig is the rate engine's operational tuning — see
+// ARCHITECTURE.md §7.
+type RateEngineConfig struct {
+	CoinMarketCapAPIKey string
+	FetchInterval       time.Duration // default 30s
+	Busha               RateProviderConfig
+	LiquidRamp          RateProviderConfig
+	Anchor              RateProviderConfig
 }
 
 func (c *Config) IsProduction() bool {
@@ -72,21 +107,73 @@ func Load(source Source) (*Config, error) {
 		errs = append(errs, "DATABASE_URL is still the local-dev default from .env.example — set a real value for production")
 	}
 
+	tenantSecretEncryptionKeyHex := requireString(source, "TENANT_SECRET_ENCRYPTION_KEY", &errs)
+	if environment == "production" && tenantSecretEncryptionKeyHex == localDevTenantSecretEncryptionKey {
+		errs = append(errs, "TENANT_SECRET_ENCRYPTION_KEY is still the local-dev default from .env.example — set a real value for production")
+	}
+	var tenantSecretEncryptionKey []byte
+	if tenantSecretEncryptionKeyHex != "" {
+		key, err := hex.DecodeString(tenantSecretEncryptionKeyHex)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("TENANT_SECRET_ENCRYPTION_KEY: invalid hex: %v", err))
+		} else if len(key) != 32 {
+			errs = append(errs, fmt.Sprintf("TENANT_SECRET_ENCRYPTION_KEY: must decode to 32 bytes, got %d", len(key)))
+		} else {
+			tenantSecretEncryptionKey = key
+		}
+	}
+
 	hmacClockSkew := durationOrDefault(source, "HMAC_CLOCK_SKEW", 5*time.Minute, &errs)
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
+	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
+
+	rateEngine := RateEngineConfig{
+		CoinMarketCapAPIKey: stringOrDefault(source, "COINMARKETCAP_API_KEY", ""),
+		FetchInterval:       durationOrDefault(source, "RATE_FETCH_INTERVAL", 30*time.Second, &errs),
+		Busha:               loadRateProviderConfig(source, "BUSHA"),
+		LiquidRamp:          loadRateProviderConfig(source, "LIQUIDRAMP"),
+		Anchor:              loadRateProviderConfig(source, "ANCHOR"),
+	}
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 
 	return &Config{
-		Environment:       environment,
-		DatabaseURL:       databaseURL,
-		HMACClockSkew:     hmacClockSkew,
-		AdminSessionTTL:   adminSessionTTL,
-		EventbusBatchSize: eventbusBatchSize,
+		Environment:               environment,
+		DatabaseURL:               databaseURL,
+		TenantSecretEncryptionKey: tenantSecretEncryptionKey,
+		HMACClockSkew:             hmacClockSkew,
+		AdminSessionTTL:           adminSessionTTL,
+		EventbusBatchSize:         eventbusBatchSize,
+		HTTPAddr:                  httpAddr,
+		RateEngine:                rateEngine,
 	}, nil
+}
+
+// loadRateProviderConfig reads an optional, disabled-by-default external
+// rate provider's settings. Unlike the required config above, a malformed
+// *_RATE_ENABLED value defaulting to "disabled" is safe — these providers
+// have no real endpoint wired in yet — so it's not collected as an error.
+func loadRateProviderConfig(source Source, prefix string) RateProviderConfig {
+	return RateProviderConfig{
+		Enabled: boolOrDefault(source, prefix+"_RATE_ENABLED", false),
+		APIURL:  stringOrDefault(source, prefix+"_RATE_API_URL", ""),
+		APIKey:  stringOrDefault(source, prefix+"_RATE_API_KEY", ""),
+	}
+}
+
+func boolOrDefault(source Source, key string, def bool) bool {
+	v, ok := source.Get(key)
+	if !ok || v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func stringOrDefault(source Source, key, def string) string {
