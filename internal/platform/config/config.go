@@ -85,6 +85,54 @@ type CollectionProviderConfig struct {
 // and ARCHITECTURE.md §2/§3.
 type TreasuryConfig struct {
 	Busha CollectionProviderConfig
+
+	// HDWalletSeedEncryptionKey decrypts the singleton hd_wallet_seed row
+	// (see internal/treasury.LoadHDWalletSeed) — same interim
+	// key-in-config pattern as TenantSecretEncryptionKey, structurally
+	// separated from the ciphertext it protects (which lives in the DB,
+	// not here), fixing the exact v1 audit gap where both sat in the same
+	// .env file.
+	HDWalletSeedEncryptionKey []byte
+
+	Bitcoin  ChainConfig
+	Ethereum ChainConfig
+	BSC      ChainConfig
+	Tron     ChainConfig
+
+	Watcher WatcherConfig
+	Sweep   SweepConfig
+}
+
+// ChainConfig configures one self-custody chain watcher/broadcaster. APIURL
+// is a REST explorer endpoint for bitcoin/ethereum/bsc (Blockstream /
+// Etherscan V2 / an EVM JSON-RPC URL) or a gRPC host:port for tron
+// (TronGrid). All default disabled — self-custody stays off until both a
+// seed is loaded and the specific chain is turned on.
+type ChainConfig struct {
+	Enabled          bool
+	APIURL           string
+	APIKey           string
+	MinConfirmations int
+}
+
+// WatcherConfig is the self-custody deposit watcher's operational tuning.
+type WatcherConfig struct {
+	PollInterval time.Duration // default 30s, matches v1's cadence
+}
+
+// SweepConfig is the stable-asset batch-sweep policy's tuning (volatile
+// assets always sweep immediately — see internal/treasury/sweep.go). This
+// volatile/stable split has no v1 equivalent (confirmed absent there); the
+// defaults below are this system's own choice, not ported.
+type SweepConfig struct {
+	// StableBalanceThreshold is a decimal string (parsed by
+	// internal/treasury, not here, to keep this package free of the
+	// decimal dependency) — once a stable-asset address's confirmed,
+	// unswept balance reaches this, it's eligible for a batch sweep.
+	StableBalanceThreshold string
+	// StableTimeBackstop sweeps a stable-asset address regardless of
+	// balance once its oldest unswept confirmed deposit is this old.
+	StableTimeBackstop time.Duration
 }
 
 func (c *Config) IsProduction() bool {
@@ -155,8 +203,39 @@ func Load(source Source) (*Config, error) {
 		Anchor:              loadRateProviderConfig(source, "ANCHOR"),
 	}
 
+	// Optional, unlike TENANT_SECRET_ENCRYPTION_KEY — self-custody has no
+	// HTTP routes wired yet (see internal/treasury package doc), so a
+	// deployment that never sets this simply can't call LoadHDWalletSeed,
+	// not a startup failure. Validated the same way when present, though:
+	// a malformed key here is exactly as dangerous as a malformed tenant
+	// key, just not yet load-bearing for every deployment.
+	hdWalletSeedEncryptionKeyHex := stringOrDefault(source, "HD_WALLET_SEED_ENCRYPTION_KEY", "")
+	var hdWalletSeedEncryptionKey []byte
+	if hdWalletSeedEncryptionKeyHex != "" {
+		key, err := hex.DecodeString(hdWalletSeedEncryptionKeyHex)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("HD_WALLET_SEED_ENCRYPTION_KEY: invalid hex: %v", err))
+		} else if len(key) != 32 {
+			errs = append(errs, fmt.Sprintf("HD_WALLET_SEED_ENCRYPTION_KEY: must decode to 32 bytes, got %d", len(key)))
+		} else {
+			hdWalletSeedEncryptionKey = key
+		}
+	}
+
 	treasury := TreasuryConfig{
-		Busha: loadCollectionProviderConfig(source, "BUSHA_TREASURY"),
+		Busha:                     loadCollectionProviderConfig(source, "BUSHA_TREASURY"),
+		HDWalletSeedEncryptionKey: hdWalletSeedEncryptionKey,
+		Bitcoin:                   loadChainConfig(source, "BITCOIN", 2),
+		Ethereum:                  loadChainConfig(source, "ETHEREUM", 12),
+		BSC:                       loadChainConfig(source, "BSC", 15),
+		Tron:                      loadChainConfig(source, "TRON", 19),
+		Watcher: WatcherConfig{
+			PollInterval: durationOrDefault(source, "WATCHER_POLL_INTERVAL", 30*time.Second, &errs),
+		},
+		Sweep: SweepConfig{
+			StableBalanceThreshold: stringOrDefault(source, "SWEEP_STABLE_BALANCE_THRESHOLD", "1000"),
+			StableTimeBackstop:     durationOrDefault(source, "SWEEP_STABLE_TIME_BACKSTOP", 6*time.Hour, &errs),
+		},
 	}
 
 	if len(errs) > 0 {
@@ -174,6 +253,20 @@ func Load(source Source) (*Config, error) {
 		RateEngine:                rateEngine,
 		Treasury:                  treasury,
 	}, nil
+}
+
+// loadChainConfig reads an optional, disabled-by-default self-custody
+// chain's settings — minConfirmationsDefault matches v1's hardcoded
+// per-chain thresholds (BTC 2, ETH 12, BSC 15, TRX 19), now tunable
+// per-environment the same way HMAC_CLOCK_SKEW etc. already are.
+func loadChainConfig(source Source, prefix string, minConfirmationsDefault int) ChainConfig {
+	var errs []string // discarded: a malformed value here safely falls back to the default, same reasoning loadRateProviderConfig uses
+	return ChainConfig{
+		Enabled:          boolOrDefault(source, prefix+"_ENABLED", false),
+		APIURL:           stringOrDefault(source, prefix+"_API_URL", ""),
+		APIKey:           stringOrDefault(source, prefix+"_API_KEY", ""),
+		MinConfirmations: intOrDefault(source, prefix+"_MIN_CONFIRMATIONS", minConfirmationsDefault, &errs),
+	}
 }
 
 // loadRateProviderConfig reads an optional, disabled-by-default external

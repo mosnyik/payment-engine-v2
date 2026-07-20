@@ -113,13 +113,14 @@ func newTestStore(pool *db.Pool, corridorStore *corridor.Store, providers ...*fa
 
 func TestReserveAddress_PicksHighestPriorityProvider(t *testing.T) {
 	pool := openTestPool(t)
+	addr := "addr-primary-" + uniqueAsset(t)
 	primary := &fakeCollectionProvider{
 		name: "primary", enabled: true, custody: CustodyTypePartner,
-		address: ProviderAddress{Address: "addr-primary", ProviderReference: "ref-primary"},
+		address: ProviderAddress{Address: addr, ProviderReference: "ref-primary"},
 	}
 	backup := &fakeCollectionProvider{
 		name: "backup", enabled: true, custody: CustodyTypePartner,
-		address: ProviderAddress{Address: "addr-backup", ProviderReference: "ref-backup"},
+		address: ProviderAddress{Address: "addr-backup-" + uniqueAsset(t), ProviderReference: "ref-backup"},
 	}
 	cs, corridorID := setupCorridor(t, pool,
 		providerBinding{name: "primary", priority: 1},
@@ -131,7 +132,8 @@ func TestReserveAddress_PicksHighestPriorityProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
-	if r.ProviderName != "primary" || r.Address != "addr-primary" {
+	releaseReservationOnCleanup(t, s, r.ID)
+	if r.ProviderName != "primary" || r.Address != addr {
 		t.Fatalf("expected primary provider's address, got provider=%s address=%s", r.ProviderName, r.Address)
 	}
 }
@@ -141,7 +143,7 @@ func TestReserveAddress_FailsOverOnError(t *testing.T) {
 	failing := &fakeCollectionProvider{name: "failing", enabled: true, custody: CustodyTypePartner, err: errors.New("boom")}
 	working := &fakeCollectionProvider{
 		name: "working", enabled: true, custody: CustodyTypePartner,
-		address: ProviderAddress{Address: "addr-working", ProviderReference: "ref-working"},
+		address: ProviderAddress{Address: "addr-working-" + uniqueAsset(t), ProviderReference: "ref-working"},
 	}
 	cs, corridorID := setupCorridor(t, pool,
 		providerBinding{name: "failing", priority: 1},
@@ -153,6 +155,7 @@ func TestReserveAddress_FailsOverOnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
+	releaseReservationOnCleanup(t, s, r.ID)
 	if r.ProviderName != "working" {
 		t.Fatalf("expected failover to working provider, got %s", r.ProviderName)
 	}
@@ -199,7 +202,21 @@ func reserveTestAddress(t *testing.T, s *Store, corridorID uuid.UUID, providerRe
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
+	releaseReservationOnCleanup(t, s, r.ID)
 	return r
+}
+
+// releaseReservationOnCleanup releases a reservation once a test finishes.
+// This package's test addresses are deterministic per test name (via
+// uniqueAsset), not per run, so leaving a reservation 'reserved' would
+// collide with idx_treasury_reservations_open_address (migration 000011)
+// on the next run against the same live database.
+func releaseReservationOnCleanup(t *testing.T, s *Store, reservationID uuid.UUID) {
+	t.Helper()
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(),
+			`UPDATE treasury_address_reservations SET status = 'released', released_at = now() WHERE id = $1`, reservationID)
+	})
 }
 
 func TestHandleDepositWebhook_DetectedThenConfirmed(t *testing.T) {
