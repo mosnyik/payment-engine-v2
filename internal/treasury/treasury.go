@@ -86,6 +86,33 @@ type CustodyBalance struct {
 // values rather than importing platform/config directly.
 type Config struct {
 	Busha CollectionProviderConfig
+
+	Bitcoin  ChainConfig
+	Ethereum ChainConfig
+	BSC      ChainConfig
+	Tron     ChainConfig
+
+	Watcher WatcherConfig
+	Sweep   SweepConfig
+}
+
+// ChainConfig mirrors config.ChainConfig — see watcher.go.
+type ChainConfig struct {
+	Enabled          bool
+	APIURL           string
+	APIKey           string
+	MinConfirmations int
+}
+
+// WatcherConfig mirrors config.WatcherConfig — see watcher.go.
+type WatcherConfig struct {
+	PollInterval time.Duration
+}
+
+// SweepConfig mirrors config.SweepConfig — see sweep.go.
+type SweepConfig struct {
+	StableBalanceThreshold decimal.Decimal
+	StableTimeBackstop     time.Duration
 }
 
 type Store struct {

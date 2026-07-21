@@ -147,14 +147,14 @@ func (s *Store) findReservationByProviderReference(ctx context.Context, provider
 	return id, nil
 }
 
-func (s *Store) insertDepositIfAbsent(ctx context.Context, reservationID uuid.UUID, status string, payload bushaWebhookPayload, detectedAt, confirmedAt *time.Time, rawPayload []byte) (bool, error) {
+func (s *Store) insertDepositIfAbsent(ctx context.Context, reservationID uuid.UUID, status string, amount decimal.Decimal, txReference string, detectedAt, confirmedAt *time.Time, rawPayload []byte) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
 		`INSERT INTO treasury_deposits
 		   (reservation_id, status, crypto_asset, amount, tx_reference, provider_payload, detected_at, confirmed_at)
 		 SELECT $1, $2, r.crypto_asset, $3, $4, $5, $6, $7
 		 FROM treasury_address_reservations r WHERE r.id = $1
 		 ON CONFLICT (reservation_id, tx_reference) DO NOTHING`,
-		reservationID, status, payload.Amount, payload.TxReference, rawPayload, detectedAt, confirmedAt,
+		reservationID, status, amount, txReference, rawPayload, detectedAt, confirmedAt,
 	)
 	if err != nil {
 		return false, fmt.Errorf("treasury: insert deposit: %w", err)
