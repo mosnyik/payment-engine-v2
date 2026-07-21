@@ -87,29 +87,42 @@ func (s *Store) HandleDepositWebhook(ctx context.Context, body []byte, signature
 	}
 
 	status := "detected"
-	var detectedAt, confirmedAt *time.Time
-	now := time.Now()
 	if payload.EventType == DepositEventConfirmed {
 		status = "confirmed"
+	}
+	return s.recordDepositTransition(ctx, reservationID, status, payload.Amount, payload.TxReference, body)
+}
+
+// recordDepositTransition is the shared state-machine step both the Busha
+// webhook handler above and the self-custody watcher (watcher.go) use:
+// idempotent insert (or compare-and-set confirm) for one deposit, keyed on
+// (reservation_id, tx_reference). status must be "detected" or "confirmed".
+// A "confirmed" call with no prior "detected" row lands directly as
+// confirmed (see HandleDepositWebhook's doc comment) — one state machine,
+// two writers.
+func (s *Store) recordDepositTransition(ctx context.Context, reservationID uuid.UUID, status string, amount decimal.Decimal, txReference string, rawPayload []byte) error {
+	var detectedAt, confirmedAt *time.Time
+	now := time.Now()
+	if status == "confirmed" {
 		confirmedAt = &now
 	} else {
 		detectedAt = &now
 	}
 
-	inserted, err := s.insertDepositIfAbsent(ctx, reservationID, status, payload, detectedAt, confirmedAt, body)
+	inserted, err := s.insertDepositIfAbsent(ctx, reservationID, status, amount, txReference, detectedAt, confirmedAt, rawPayload)
 	if err != nil {
 		return err
 	}
-	if inserted || payload.EventType != DepositEventConfirmed {
+	if inserted || status != "confirmed" {
 		return nil
 	}
 
-	// The row already existed (created by an earlier 'detected' webhook)
-	// and this webhook confirms it — compare-and-set, never a blind write.
+	// The row already existed (created by an earlier 'detected' write) and
+	// this call confirms it — compare-and-set, never a blind write.
 	_, err = s.pool.Exec(ctx,
 		`UPDATE treasury_deposits SET status = 'confirmed', confirmed_at = $3, updated_at = now()
 		 WHERE reservation_id = $1 AND tx_reference = $2 AND status = 'detected'`,
-		reservationID, payload.TxReference, now,
+		reservationID, txReference, now,
 	)
 	if err != nil {
 		return fmt.Errorf("treasury: confirm deposit: %w", err)
