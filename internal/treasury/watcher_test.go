@@ -203,9 +203,9 @@ func TestTronGridWatcherClient_TipHeight(t *testing.T) {
 // fakeChainWatcherClient lets pollOnce's orchestration be tested without
 // any network dependency.
 type fakeChainWatcherClient struct {
-	txs  []ChainTransaction
-	tip  int64
-	err  error
+	txs []ChainTransaction
+	tip int64
+	err error
 }
 
 func (f *fakeChainWatcherClient) ListIncomingTransactions(ctx context.Context, address string) ([]ChainTransaction, error) {

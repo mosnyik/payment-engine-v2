@@ -16,13 +16,13 @@ import (
 
 func TestIsStableAsset(t *testing.T) {
 	cases := map[string]bool{
-		"USDT":        true,
-		"usdt":        true,
-		"USDT-TRC20":  true,
-		"BTC":         false,
-		"ETH":         false,
-		"BNB":         false,
-		"TRX":         false,
+		"USDT":       true,
+		"usdt":       true,
+		"USDT-TRC20": true,
+		"BTC":        false,
+		"ETH":        false,
+		"BNB":        false,
+		"TRX":        false,
 	}
 	for asset, want := range cases {
 		if got := isStableAsset(asset); got != want {
@@ -47,6 +47,8 @@ func insertTestReservation(t *testing.T, pool *db.Pool, corridorID uuid.UUID, ch
 	if err != nil {
 		t.Fatalf("insert reservation: %v", err)
 	}
+	s := &Store{pool: pool}
+	releaseReservationOnCleanup(t, s, id)
 	return id
 }
 

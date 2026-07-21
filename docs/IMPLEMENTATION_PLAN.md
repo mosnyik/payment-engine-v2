@@ -48,16 +48,22 @@ Ported from v1 (see `ARCHITECTURE.md` §7): provider adapters, background fetch 
 - ✅ **`LockRate()`** — selects the lowest quote among enabled providers (system rate as ceiling), applies the 1% slippage buffer, prices the crypto asset in USD (CoinMarketCap, USDT hardcoded to 1 — same known gap as v1: no fallback provider for asset pricing, revisit post-pilot), and persists the result to `rate_locks`.
 - No HTTP routes yet — same state as `corridor`: config/Store-level only. Nothing calls `LockRate()` until Phase 5's session module exists; `internal/rate/rate_test.go` exercises the Store directly against a live Postgres.
 
-*Next: Phase 4 — Treasury. Busha (partner-custodied) collection adapter ✅ done; self-custody HD wallets are next.*
+*Next: Phase 4 — Treasury is ✅ complete (Busha adapter + self-custody HD wallets). Phase 5 — Session is next.*
 
-## Phase 4 — Treasury *(sequencing call, not strict dependency order)*
+## Phase 4 — Treasury ✅ complete *(sequencing call, not strict dependency order)*
 
 The highest-stakes module — self-custody HD wallets, KMS-backed key encryption, per-chain watchers, per-asset sweep policy — is also the most complex and, per the v1 audit, the most consequence-heavy if built wrong.
 
 **Build the partner-custodied adapter (Busha) first.** It's simpler (no HD derivation, no KMS integration, no watcher/sweep policy to get right) and the SLA already exists. This gets a working end-to-end pilot (collection → settlement) running fastest, while self-custody gets the time and scrutiny it deserves without blocking everything else behind it.
 
 1. ✅ **`treasury` — Busha (partner-custodied) collection provider adapter.** `treasury_address_reservations`/`treasury_deposits`/`treasury_custody_balances` tables; `CollectionProvider` interface + Busha adapter built the same TODO-stub way rate's Busha/LiquidRamp/Anchor adapters were (real endpoint/response shape/webhook signature scheme unknown — v1 never actually built this integration either, so there was nothing to port). `ReserveAddress`/`GetDepositInstructions` fail over across a corridor's active collection-provider bindings by priority; `HandleDepositWebhook` does signature-verified, compare-and-set (`pending`→`detected`→`confirmed`) deposit-state transitions, idempotent on `(reservation_id, tx_reference)`. Same "config/Store-level only" precedent as `rate`/`corridor` — no HTTP routes wired yet, nothing calls `GetDepositInstructions()` until `session` (Phase 5) exists. Verified against a live Postgres (`go test ./internal/treasury/...`).
-2. **`treasury` — self-custody HD wallet manager** (KMS-backed key encryption), per-chain deposit watchers, confirmation policy, sweep policy execution (volatile-immediate / stable-batched). *Next.*
+2. ✅ **`treasury` — self-custody HD wallet manager, per-chain watchers, confirmation policy, sweep execution.** All four launch chains (BTC, ETH, BNB, TRX + USDT variants) in one pass, per v1 precedent — unlike Busha, v1's self-custody flow (HD wallet + watchers + sweeper) was real, working code, genuinely ported rather than designed from scratch.
+   - **`internal/treasury/wallet`** — BIP39/BIP32 HD derivation (BIP84 for BTC, BIP44 for ETH/BSC/Tron; BSC deliberately shares ETH's derivation/address format), using lightweight primitives (`btcsuite/btcd` family, `tyler-smith/go-bip39`) rather than pulling in go-ethereum — except `fbsobreira/gotron-sdk` for Tron specifically (protobuf tx format; hand-rolling that correctness-critical encoding was judged riskier than the dependency weight, which transitively pulls in go-ethereum anyway via Tron's own signing helper). EIP-1559 RLP encoding is hand-rolled and verified two ways: a from-scratch decoder proving encode/decode round-trips, and signature-recovery proving a produced signature recovers the signer's own address. BTC sweep signing is verified by running the produced witness through `txscript`'s real script-execution engine, not just "no error." A separate HD account index funds gas top-ups, deliberately not sharing the deposit-address account namespace the way v1's merchant-funding wallets did.
+   - **Key storage fixes v1's exact audit gap** (lesson 2, seed ciphertext + key colocated in one `.env`): ciphertext lives in a new `hd_wallet_seed` DB row (provisioned once via `adminctl -init-wallet`, mnemonic printed exactly once), key lives in config (`HD_WALLET_SEED_ENCRYPTION_KEY`), same interim `config.Source` seam already used for `TenantSecretEncryptionKey`.
+   - **Address reuse fixes v1's exact audit gap** (lesson 3, app-level check-then-insert let one deposit fund two sessions): a partial unique index (`treasury_address_reservations(address) WHERE status='reserved'`) makes a second open reservation on one address a DB constraint violation, not a race an app check can lose.
+   - **Watchers** poll only currently-open self-custody reservations (on-demand, like v1 — never a global chain scan) against real, live-verified API shapes: Blockstream (BTC), Etherscan V2 unified API (ETH/BSC, native + ERC20/BEP20 USDT), TronGrid (TRX, native + TRC20 USDT). A shared `recordDepositTransition` helper (factored out of the Busha webhook handler) means both the webhook path and the watcher path drive the same compare-and-set deposit state machine.
+   - **Sweep**: volatile assets (BTC/ETH/BNB/TRX) sweep immediately on confirmation, triggered inline from the watcher; stable assets (USDT-*) batch on a configurable balance threshold or time backstop — a v2-only refinement, confirmed absent from v1, which sweeps everything immediately. `treasury_sweeps` is the outbound-transaction audit trail; sweep destinations are DB-configured (`SetSweepDestination`), not hardcoded.
+   - All bookkeeping/policy logic and the wallet package's crypto are covered by tests verified against a live Postgres; the full chain-broadcast paths (UTXO fetch → sign → broadcast, gas top-up sequencing) are implemented using the same verified signing primitives but have **not** been exercised against real funded testnet/mainnet addresses — that's a manual, ops-supervised step outside automated CI.
 
 ## Phase 5 — Session
 
@@ -91,7 +97,7 @@ Phase 0 (foundation)
    └─▶ Phase 1 (ledger)
           └─▶ Phase 2 (tenant, corridor, compliance — parallel)
                  └─▶ Phase 3 (rate)
-                 └─▶ Phase 4 (treasury: Busha first, then self-custody)
+                 └─▶ Phase 4 (treasury: Busha first, then self-custody) ✅ complete
                         └─▶ Phase 5 (session)
                                └─▶ Phase 6 (settlement)
                                       └─▶ Phase 7 (notification)

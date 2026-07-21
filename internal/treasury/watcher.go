@@ -327,7 +327,7 @@ type etherscanClient struct {
 }
 
 type etherscanTxListResponse struct {
-	Status string             `json:"status"`
+	Status string              `json:"status"`
 	Result []etherscanNativeTx `json:"result"`
 }
 

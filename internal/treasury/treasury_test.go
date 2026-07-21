@@ -89,7 +89,7 @@ type fakeCollectionProvider struct {
 }
 
 func (f *fakeCollectionProvider) Name() string             { return f.name }
-func (f *fakeCollectionProvider) IsEnabled() bool           { return f.enabled }
+func (f *fakeCollectionProvider) IsEnabled() bool          { return f.enabled }
 func (f *fakeCollectionProvider) CustodyType() CustodyType { return f.custody }
 func (f *fakeCollectionProvider) ReserveAddress(_ context.Context, _, _ string) (ProviderAddress, error) {
 	if f.err != nil {

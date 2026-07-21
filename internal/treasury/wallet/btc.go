@@ -38,8 +38,8 @@ func btcP2WPKHAddress(priv *btcec.PrivateKey) (*btcutil.AddressWitnessPubKeyHash
 // BTCUTXO is one spendable output at a deposit address, as reported by a
 // chain explorer (see watcher.go).
 type BTCUTXO struct {
-	TxID     string
-	Vout     uint32
+	TxID       string
+	Vout       uint32
 	AmountSats int64
 }
 
