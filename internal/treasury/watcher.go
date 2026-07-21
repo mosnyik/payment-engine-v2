@@ -54,6 +54,18 @@ type Watcher struct {
 	pollInterval     time.Duration
 	clients          map[wallet.Chain]chainWatcherClient
 	minConfirmations map[wallet.Chain]int
+	// sweeper is optional — when set, a volatile-asset deposit triggers an
+	// immediate sweep as soon as it's confirmed (see pollOnce). Stable
+	// assets never sweep from here; they're picked up by
+	// Sweeper.RunBatchSweep on its own schedule.
+	sweeper *Sweeper
+}
+
+// SetSweeper wires immediate-sweep-on-confirmation for volatile assets.
+// Optional — a Watcher with no Sweeper set just tracks deposit state and
+// never sweeps, same as before this existed.
+func (w *Watcher) SetSweeper(s *Sweeper) {
+	w.sweeper = s
 }
 
 func NewWatcher(store *Store, cfg WatcherConfig, chains map[wallet.Chain]ChainConfig, httpClient *http.Client) *Watcher {
@@ -147,6 +159,12 @@ func (w *Watcher) pollOnce(ctx context.Context) {
 			payload, _ := json.Marshal(tx)
 			if err := w.store.recordDepositTransition(ctx, r.ID, status, tx.Amount, tx.TxID, payload); err != nil {
 				log.Printf("treasury: watcher: record deposit %s: %v", tx.TxID, err)
+				continue
+			}
+			if status == "confirmed" && w.sweeper != nil && !isStableAsset(tx.CryptoAsset) {
+				if err := w.sweeper.ExecuteSweep(ctx, r.ID); err != nil {
+					log.Printf("treasury: watcher: immediate sweep for reservation %s: %v", r.ID, err)
+				}
 			}
 		}
 	}
@@ -228,6 +246,36 @@ func (c *blockstreamClient) ListIncomingTransactions(ctx context.Context, addres
 			Confirmed:   tx.Status.Confirmed,
 			BlockHeight: tx.Status.BlockHeight,
 		})
+	}
+	return out, nil
+}
+
+type blockstreamUTXO struct {
+	TxID   string `json:"txid"`
+	Vout   uint32 `json:"vout"`
+	Value  int64  `json:"value"`
+	Status struct {
+		Confirmed bool `json:"confirmed"`
+	} `json:"status"`
+}
+
+// ListUTXOs returns address's spendable (confirmed) outputs, for sweep.go
+// to build a sweep transaction from.
+func (c *blockstreamClient) ListUTXOs(ctx context.Context, address string) ([]wallet.BTCUTXO, error) {
+	body, err := c.get(ctx, "/address/"+address+"/utxo")
+	if err != nil {
+		return nil, err
+	}
+	var utxos []blockstreamUTXO
+	if err := json.Unmarshal(body, &utxos); err != nil {
+		return nil, fmt.Errorf("treasury: parse blockstream utxo response: %w", err)
+	}
+	var out []wallet.BTCUTXO
+	for _, u := range utxos {
+		if !u.Status.Confirmed {
+			continue
+		}
+		out = append(out, wallet.BTCUTXO{TxID: u.TxID, Vout: u.Vout, AmountSats: u.Value})
 	}
 	return out, nil
 }
@@ -405,6 +453,62 @@ func (c *etherscanClient) getJSON(ctx context.Context, url string, out any) erro
 	return nil
 }
 
+// NonceAt returns address's next transaction count (nonce), for sweep.go
+// to build an EVM sweep transaction.
+func (c *etherscanClient) NonceAt(ctx context.Context, address string) (uint64, error) {
+	url := fmt.Sprintf("%s?chainid=%d&module=proxy&action=eth_getTransactionCount&address=%s&tag=latest&apikey=%s",
+		c.baseURL(), etherscanChainID[c.chain], address, c.apiKey)
+	var resp struct {
+		Result string `json:"result"`
+	}
+	if err := c.getJSON(ctx, url, &resp); err != nil {
+		return 0, err
+	}
+	nonce, err := strconv.ParseUint(strings.TrimPrefix(resp.Result, "0x"), 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("treasury: parse eth_getTransactionCount %q: %w", resp.Result, err)
+	}
+	return nonce, nil
+}
+
+// SuggestedGasPrice returns the network's current gas price (wei), used as
+// a simple (non-EIP-1559-priority-fee-aware) basis for both
+// maxFeePerGas/maxPriorityFeePerGas in sweep.go — adequate for this
+// system's sweep transactions, which aren't latency-sensitive the way a
+// user-facing transaction might be.
+func (c *etherscanClient) SuggestedGasPrice(ctx context.Context) (decimal.Decimal, error) {
+	url := fmt.Sprintf("%s?chainid=%d&module=proxy&action=eth_gasPrice&apikey=%s", c.baseURL(), etherscanChainID[c.chain], c.apiKey)
+	var resp struct {
+		Result string `json:"result"`
+	}
+	if err := c.getJSON(ctx, url, &resp); err != nil {
+		return decimal.Decimal{}, err
+	}
+	wei, ok := new(big.Int).SetString(strings.TrimPrefix(resp.Result, "0x"), 16)
+	if !ok {
+		return decimal.Decimal{}, fmt.Errorf("treasury: parse eth_gasPrice %q", resp.Result)
+	}
+	return decimal.NewFromBigInt(wei, 0), nil
+}
+
+// NativeBalance returns address's native asset balance (ETH/BNB), for
+// sweep.go's gas pre-funding check before a token sweep.
+func (c *etherscanClient) NativeBalance(ctx context.Context, address string) (decimal.Decimal, error) {
+	url := fmt.Sprintf("%s?chainid=%d&module=account&action=balance&address=%s&tag=latest&apikey=%s",
+		c.baseURL(), etherscanChainID[c.chain], address, c.apiKey)
+	var resp struct {
+		Result string `json:"result"` // decimal string, wei
+	}
+	if err := c.getJSON(ctx, url, &resp); err != nil {
+		return decimal.Decimal{}, err
+	}
+	wei, ok := new(big.Int).SetString(resp.Result, 10)
+	if !ok {
+		return decimal.Decimal{}, fmt.Errorf("treasury: parse native balance %q", resp.Result)
+	}
+	return decimal.NewFromBigInt(wei, -18), nil
+}
+
 func (c *etherscanClient) TipHeight(ctx context.Context) (int64, error) {
 	url := fmt.Sprintf("%s?chainid=%d&module=proxy&action=eth_blockNumber&apikey=%s", c.baseURL(), etherscanChainID[c.chain], c.apiKey)
 	var resp struct {
@@ -506,6 +610,39 @@ func (c *tronGridWatcherClient) ListIncomingTransactions(ctx context.Context, ad
 		})
 	}
 	return out, nil
+}
+
+// NativeBalance returns address's TRX balance, for sweep.go's gas
+// pre-funding check before a TRC20 sweep.
+func (c *tronGridWatcherClient) NativeBalance(ctx context.Context, address string) (decimal.Decimal, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL()+"/v1/accounts/"+address, nil)
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("TRON-PRO-API-KEY", c.apiKey)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return decimal.Decimal{}, fmt.Errorf("treasury: call trongrid account: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	var parsed struct {
+		Data []struct {
+			Balance int64 `json:"balance"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return decimal.Decimal{}, fmt.Errorf("treasury: parse trongrid account response: %s: %w", body, err)
+	}
+	if len(parsed.Data) == 0 {
+		return decimal.Zero, nil // account never seen on-chain yet — zero balance
+	}
+	return decimal.New(parsed.Data[0].Balance, -6), nil
 }
 
 func (c *tronGridWatcherClient) TipHeight(ctx context.Context) (int64, error) {

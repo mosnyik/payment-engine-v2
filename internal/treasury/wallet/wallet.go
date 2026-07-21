@@ -157,6 +157,14 @@ func DeriveAddress(seed *Seed, chain Chain, index uint32) (string, error) {
 	return addressForChain(chain, priv)
 }
 
+// DeriveAddressFromKey formats an already-derived private key's address
+// for chain — used where the caller already holds the key (e.g. sweep.go,
+// which derives once and needs the address to look up a nonce/balance
+// before signing) rather than re-deriving from a seed+index.
+func DeriveAddressFromKey(priv *btcec.PrivateKey, chain Chain) (string, error) {
+	return addressForChain(chain, priv)
+}
+
 func addressForChain(chain Chain, priv *btcec.PrivateKey) (string, error) {
 	switch chain {
 	case Bitcoin:
