@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/crypto"
@@ -87,38 +88,86 @@ func (s *Store) Close() {
 	}
 }
 
-// allocateOrReuseAddress returns a self-custody deposit address for chain,
-// reusing a currently-unreserved previously-derived address when one
-// exists (ARCHITECTURE.md §3: "Reuse per end-user") and deriving a new HD
-// index only when none is free. Safe under concurrent callers: the actual
-// safety net is the partial unique index on
-// treasury_address_reservations(address) WHERE status = 'reserved' (see
-// migration 000011) — a race here degrades to a persistReservation error,
-// not a silently double-booked address, which is the actual audit-lesson-3
-// fix; this function's reuse-first check is an optimization on top of it,
-// not the safety mechanism itself.
-func (s *Store) allocateOrReuseAddress(ctx context.Context, chain wallet.Chain) (string, error) {
+// getOrAllocateTenantAccount returns tenantID's assigned HD account number
+// (wallet.TenantAccountOffset and up — accounts 0/1 are reserved for
+// platform-level deposit/gas-funding wallets, never assigned to a tenant),
+// allocating one on first use and returning the same one on every later
+// call. The tenant_id primary key on treasury_tenant_hd_accounts makes a
+// concurrent double-allocation for the same tenant a harmless conflict —
+// the loser just re-reads the winner's row.
+func (s *Store) getOrAllocateTenantAccount(ctx context.Context, tenantID uuid.UUID) (uint32, error) {
+	var account uint64
+	err := s.pool.QueryRow(ctx,
+		`SELECT account_index FROM treasury_tenant_hd_accounts WHERE tenant_id = $1`,
+		tenantID,
+	).Scan(&account)
+	if err == nil {
+		return uint32(account), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("treasury: get tenant hd account: %w", err)
+	}
+
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO treasury_hd_account_counter (id, next_account_index) VALUES (1, 3)
+		 ON CONFLICT (id) DO UPDATE SET next_account_index = treasury_hd_account_counter.next_account_index + 1
+		 RETURNING next_account_index - 1`,
+	).Scan(&account)
+	if err != nil {
+		return 0, fmt.Errorf("treasury: allocate tenant hd account counter: %w", err)
+	}
+
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO treasury_tenant_hd_accounts (tenant_id, account_index) VALUES ($1, $2)`,
+		tenantID, account,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			// Lost the race to a concurrent allocation for the same
+			// tenant — the winner's row is authoritative, use it.
+			return s.getOrAllocateTenantAccount(ctx, tenantID)
+		}
+		return 0, fmt.Errorf("treasury: persist tenant hd account: %w", err)
+	}
+	return uint32(account), nil
+}
+
+// allocateOrReuseAddress returns a self-custody deposit address for
+// tenantID on chain, reusing a currently-unreserved previously-derived
+// address from that tenant's own pool when one exists (ARCHITECTURE.md
+// §3: "Reuse per end-user") and deriving a new HD index only when none is
+// free. Safe under concurrent callers: the actual safety net is the
+// partial unique index on treasury_address_reservations(address) WHERE
+// status = 'reserved' (see migration 000011) — a race here degrades to a
+// persistReservation error, not a silently double-booked address, which
+// is the actual audit-lesson-3 fix; this function's reuse-first check is
+// an optimization on top of it, not the safety mechanism itself.
+func (s *Store) allocateOrReuseAddress(ctx context.Context, tenantID uuid.UUID, chain wallet.Chain) (string, error) {
 	if s.seed == nil {
 		return "", ErrHDWalletNotInitialized
 	}
 
-	if addr, ok, err := s.findFreeDerivedAddress(ctx, chain); err != nil {
+	if addr, ok, err := s.findFreeDerivedAddress(ctx, tenantID, chain); err != nil {
 		return "", err
 	} else if ok {
 		return addr, nil
 	}
 
-	index, err := s.allocateNextIndex(ctx, chain)
+	tenantAccount, err := s.getOrAllocateTenantAccount(ctx, tenantID)
 	if err != nil {
 		return "", err
 	}
-	addr, err := wallet.DeriveAddress(s.seed, chain, index)
+	index, err := s.allocateNextIndex(ctx, tenantID, chain)
+	if err != nil {
+		return "", err
+	}
+	addr, err := wallet.DeriveAddressAtAccount(s.seed, chain, tenantAccount, index)
 	if err != nil {
 		return "", fmt.Errorf("treasury: derive address for %s index %d: %w", chain, index, err)
 	}
 	_, err = s.pool.Exec(ctx,
-		`INSERT INTO derived_addresses (chain, derivation_index, address) VALUES ($1, $2, $3)`,
-		string(chain), index, addr,
+		`INSERT INTO derived_addresses (chain, tenant_id, derivation_index, address) VALUES ($1, $2, $3, $4)`,
+		string(chain), tenantID, index, addr,
 	)
 	if err != nil {
 		return "", fmt.Errorf("treasury: persist derived address: %w", err)
@@ -126,17 +175,17 @@ func (s *Store) allocateOrReuseAddress(ctx context.Context, chain wallet.Chain) 
 	return addr, nil
 }
 
-func (s *Store) findFreeDerivedAddress(ctx context.Context, chain wallet.Chain) (string, bool, error) {
+func (s *Store) findFreeDerivedAddress(ctx context.Context, tenantID uuid.UUID, chain wallet.Chain) (string, bool, error) {
 	var addr string
 	err := s.pool.QueryRow(ctx,
 		`SELECT da.address
 		 FROM derived_addresses da
 		 LEFT JOIN treasury_address_reservations r
 		   ON r.address = da.address AND r.status = 'reserved'
-		 WHERE da.chain = $1 AND r.id IS NULL
+		 WHERE da.chain = $1 AND da.tenant_id = $2 AND r.id IS NULL
 		 ORDER BY da.derivation_index ASC
 		 LIMIT 1`,
-		string(chain),
+		string(chain), tenantID,
 	).Scan(&addr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
@@ -148,17 +197,18 @@ func (s *Store) findFreeDerivedAddress(ctx context.Context, chain wallet.Chain) 
 }
 
 // allocateNextIndex atomically allocates and returns the next unused HD
-// derivation index for chain — a single INSERT ... ON CONFLICT statement,
-// so no explicit row lock/transaction is needed at this call site.
-func (s *Store) allocateNextIndex(ctx context.Context, chain wallet.Chain) (uint32, error) {
+// derivation index for tenantID on chain — a single INSERT ... ON
+// CONFLICT statement, so no explicit row lock/transaction is needed at
+// this call site.
+func (s *Store) allocateNextIndex(ctx context.Context, tenantID uuid.UUID, chain wallet.Chain) (uint32, error) {
 	var next uint64
 	err := s.pool.QueryRow(ctx,
-		`INSERT INTO hd_wallet_indices (chain, next_index) VALUES ($1, 1)
-		 ON CONFLICT (chain) DO UPDATE SET
+		`INSERT INTO hd_wallet_indices (chain, tenant_id, next_index) VALUES ($1, $2, 1)
+		 ON CONFLICT (chain, tenant_id) DO UPDATE SET
 		   next_index = hd_wallet_indices.next_index + 1,
 		   updated_at = now()
 		 RETURNING next_index - 1`,
-		string(chain),
+		string(chain), tenantID,
 	).Scan(&next)
 	if err != nil {
 		return 0, fmt.Errorf("treasury: allocate hd index for %s: %w", chain, err)
@@ -188,7 +238,9 @@ func (p *selfCustodyProvider) CustodyType() CustodyType { return CustodyTypeSelf
 // constants ("bitcoin"/"ethereum"/"bsc"/"tron") — the convention this
 // package establishes for corridor.crypto_network on self-custody-bound
 // corridors, since no other convention was already fixed elsewhere.
-func (p *selfCustodyProvider) ReserveAddress(ctx context.Context, _, cryptoNetwork string) (ProviderAddress, error) {
+// Derives from tenantID's own segregated HD account (see
+// getOrAllocateTenantAccount) — never the platform-level account.
+func (p *selfCustodyProvider) ReserveAddress(ctx context.Context, tenantID uuid.UUID, _, cryptoNetwork string) (ProviderAddress, error) {
 	chain := wallet.Chain(cryptoNetwork)
 	switch chain {
 	case wallet.Bitcoin, wallet.Ethereum, wallet.BSC, wallet.Tron:
@@ -196,7 +248,7 @@ func (p *selfCustodyProvider) ReserveAddress(ctx context.Context, _, cryptoNetwo
 		return ProviderAddress{}, fmt.Errorf("treasury: unsupported self-custody chain %q", cryptoNetwork)
 	}
 
-	addr, err := p.store.allocateOrReuseAddress(ctx, chain)
+	addr, err := p.store.allocateOrReuseAddress(ctx, tenantID, chain)
 	if err != nil {
 		return ProviderAddress{}, err
 	}
