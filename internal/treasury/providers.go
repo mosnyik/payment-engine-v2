@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // CustodyType records which custody model a collection provider uses — a
@@ -36,12 +38,17 @@ type ProviderAddress struct {
 // address is assumed cheap enough to call inline — unlike rate.Provider,
 // there's no cached-read/live-fetch split here because there's nothing to
 // poll ahead of time: an address is requested only when a real caller
-// (Phase 5's session module) needs one.
+// (Phase 5's session module) needs one. tenantID identifies whose deposit
+// this is — self-custody derives from that tenant's own segregated HD
+// account (see hdwallet.go), and the tenant-provided-wallet adapter looks
+// up that tenant's registered address; bushaProvider currently ignores it
+// (a future extension point for a per-tenant Busha sub-account, once
+// Busha's real API is known).
 type CollectionProvider interface {
 	Name() string
 	IsEnabled() bool
 	CustodyType() CustodyType
-	ReserveAddress(ctx context.Context, cryptoAsset, cryptoNetwork string) (ProviderAddress, error)
+	ReserveAddress(ctx context.Context, tenantID uuid.UUID, cryptoAsset, cryptoNetwork string) (ProviderAddress, error)
 }
 
 // CollectionProviderConfig configures one external collection-provider
@@ -86,7 +93,7 @@ func (p *bushaProvider) Name() string             { return "busha" }
 func (p *bushaProvider) IsEnabled() bool          { return p.cfg.Enabled }
 func (p *bushaProvider) CustodyType() CustodyType { return CustodyTypePartner }
 
-func (p *bushaProvider) ReserveAddress(ctx context.Context, cryptoAsset, cryptoNetwork string) (ProviderAddress, error) {
+func (p *bushaProvider) ReserveAddress(ctx context.Context, _ uuid.UUID, cryptoAsset, cryptoNetwork string) (ProviderAddress, error) {
 	req, err := p.buildRequest(ctx, cryptoAsset, cryptoNetwork)
 	if err != nil {
 		return ProviderAddress{}, fmt.Errorf("treasury: build busha request: %w", err)

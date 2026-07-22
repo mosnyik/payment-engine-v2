@@ -33,6 +33,7 @@ var (
 // out for a corridor.
 type AddressReservation struct {
 	ID                uuid.UUID
+	TenantID          uuid.UUID
 	CorridorID        uuid.UUID
 	ProviderName      string
 	CustodyType       CustodyType
@@ -51,6 +52,7 @@ type AddressReservation struct {
 // depositor.
 type DepositInstructions struct {
 	ReservationID uuid.UUID
+	TenantID      uuid.UUID
 	ProviderName  string
 	CryptoAsset   string
 	CryptoNetwork string
@@ -146,8 +148,9 @@ func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 // (corridor.ListActiveProviders, priority order) and reserves an address
 // from the first one with a registered, enabled adapter — failing over to
 // the next binding on error, same failover shape corridor's provider
-// bindings already establish for other provider types.
-func (s *Store) ReserveAddress(ctx context.Context, corridorID uuid.UUID) (*AddressReservation, error) {
+// bindings already establish for other provider types. tenantID is whose
+// deposit this reservation is for — see CollectionProvider's doc comment.
+func (s *Store) ReserveAddress(ctx context.Context, tenantID, corridorID uuid.UUID) (*AddressReservation, error) {
 	corr, err := s.corridorStore.GetCorridorByID(ctx, corridorID)
 	if err != nil {
 		return nil, fmt.Errorf("treasury: reserve address: %w", err)
@@ -164,12 +167,12 @@ func (s *Store) ReserveAddress(ctx context.Context, corridorID uuid.UUID) (*Addr
 		if !ok || !provider.IsEnabled() {
 			continue
 		}
-		addr, err := provider.ReserveAddress(ctx, corr.CryptoAsset, corr.CryptoNetwork)
+		addr, err := provider.ReserveAddress(ctx, tenantID, corr.CryptoAsset, corr.CryptoNetwork)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		return s.persistReservation(ctx, corridorID, provider, corr.CryptoAsset, corr.CryptoNetwork, addr)
+		return s.persistReservation(ctx, tenantID, corridorID, provider, corr.CryptoAsset, corr.CryptoNetwork, addr)
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("%w: last error: %v", ErrNoProviderAvailable, lastErr)
@@ -177,8 +180,9 @@ func (s *Store) ReserveAddress(ctx context.Context, corridorID uuid.UUID) (*Addr
 	return nil, ErrNoProviderAvailable
 }
 
-func (s *Store) persistReservation(ctx context.Context, corridorID uuid.UUID, provider CollectionProvider, cryptoAsset, cryptoNetwork string, addr ProviderAddress) (*AddressReservation, error) {
+func (s *Store) persistReservation(ctx context.Context, tenantID, corridorID uuid.UUID, provider CollectionProvider, cryptoAsset, cryptoNetwork string, addr ProviderAddress) (*AddressReservation, error) {
 	r := &AddressReservation{
+		TenantID:          tenantID,
 		CorridorID:        corridorID,
 		ProviderName:      provider.Name(),
 		CustodyType:       provider.CustodyType(),
@@ -192,11 +196,11 @@ func (s *Store) persistReservation(ctx context.Context, corridorID uuid.UUID, pr
 	}
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO treasury_address_reservations
-		   (corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
 		    address, address_tag, provider_reference, status, reserved_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 RETURNING id`,
-		r.CorridorID, r.ProviderName, string(r.CustodyType), r.CryptoAsset, r.CryptoNetwork,
+		r.TenantID, r.CorridorID, r.ProviderName, string(r.CustodyType), r.CryptoAsset, r.CryptoNetwork,
 		r.Address, r.AddressTag, r.ProviderReference, r.Status, r.ReservedAt,
 	).Scan(&r.ID)
 	if err != nil {
@@ -211,11 +215,11 @@ func (s *Store) GetReservation(ctx context.Context, id uuid.UUID) (*AddressReser
 	var custodyType string
 	r.ID = id
 	err := s.pool.QueryRow(ctx,
-		`SELECT corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
+		`SELECT tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
 		        address, address_tag, provider_reference, status, reserved_at, released_at
 		 FROM treasury_address_reservations WHERE id = $1`,
 		id,
-	).Scan(&r.CorridorID, &r.ProviderName, &custodyType, &r.CryptoAsset, &r.CryptoNetwork,
+	).Scan(&r.TenantID, &r.CorridorID, &r.ProviderName, &custodyType, &r.CryptoAsset, &r.CryptoNetwork,
 		&r.Address, &r.AddressTag, &r.ProviderReference, &r.Status, &r.ReservedAt, &r.ReleasedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrReservationNotFound
@@ -230,13 +234,14 @@ func (s *Store) GetReservation(ctx context.Context, id uuid.UUID) (*AddressReser
 // GetDepositInstructions is the method Phase 5's session module actually
 // calls: reserves an address and formats it into the caller-facing DTO a
 // depositor is shown.
-func (s *Store) GetDepositInstructions(ctx context.Context, corridorID uuid.UUID) (*DepositInstructions, error) {
-	r, err := s.ReserveAddress(ctx, corridorID)
+func (s *Store) GetDepositInstructions(ctx context.Context, tenantID, corridorID uuid.UUID) (*DepositInstructions, error) {
+	r, err := s.ReserveAddress(ctx, tenantID, corridorID)
 	if err != nil {
 		return nil, err
 	}
 	return &DepositInstructions{
 		ReservationID: r.ID,
+		TenantID:      r.TenantID,
 		ProviderName:  r.ProviderName,
 		CryptoAsset:   r.CryptoAsset,
 		CryptoNetwork: r.CryptoNetwork,
