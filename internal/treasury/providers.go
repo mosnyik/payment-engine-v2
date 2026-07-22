@@ -16,6 +16,11 @@ type CustodyType string
 const (
 	CustodyTypeSelf    CustodyType = "self_custody"
 	CustodyTypePartner CustodyType = "partner_custodied"
+	// CustodyTypeTenantProvided is a tenant-supplied deposit address: the
+	// platform monitors it and notifies the tenant on detection/
+	// confirmation, but never holds a key for it and never sweeps it
+	// (see tenant_wallet.go).
+	CustodyTypeTenantProvided CustodyType = "tenant_provided"
 )
 
 // ProviderAddress is what a CollectionProvider hands back for one deposit
