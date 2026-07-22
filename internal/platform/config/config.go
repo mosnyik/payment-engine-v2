@@ -40,14 +40,24 @@ type Config struct {
 
 	// Operational tuning — previously hardcoded constants in their owning
 	// packages, now settable per-environment without a rebuild.
-	HMACClockSkew     time.Duration // default 5m
-	AdminSessionTTL   time.Duration // default 12h
-	EventbusBatchSize int           // default 50
+	HMACClockSkew        time.Duration // default 5m
+	AdminSessionTTL      time.Duration // default 12h
+	EventbusBatchSize    int           // default 50
+	EventbusPollInterval time.Duration // default 2s
 
 	HTTPAddr string // default :3700
 
 	RateEngine RateEngineConfig
 	Treasury   TreasuryConfig
+	Session    SessionConfig
+}
+
+// SessionConfig is Phase 5's session module's operational tuning. The
+// 30-minute TTL/SLA line itself is a fixed design decision (ARCHITECTURE.md
+// §8), not an ops knob — only how often the background sweep checks for it
+// is configurable here, same split rate.slippageBuffer/DefaultLockTTL draws.
+type SessionConfig struct {
+	TTLCheckInterval time.Duration // default 30s
 }
 
 // RateProviderConfig configures one external HTTP rate-provider adapter
@@ -201,7 +211,12 @@ func Load(source Source) (*Config, error) {
 	hmacClockSkew := durationOrDefault(source, "HMAC_CLOCK_SKEW", 5*time.Minute, &errs)
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
+	eventbusPollInterval := durationOrDefault(source, "EVENTBUS_POLL_INTERVAL", 2*time.Second, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
+
+	session := SessionConfig{
+		TTLCheckInterval: durationOrDefault(source, "SESSION_TTL_CHECK_INTERVAL", 30*time.Second, &errs),
+	}
 
 	rateEngine := RateEngineConfig{
 		CoinMarketCapAPIKey: stringOrDefault(source, "COINMARKETCAP_API_KEY", ""),
@@ -259,9 +274,11 @@ func Load(source Source) (*Config, error) {
 		HMACClockSkew:             hmacClockSkew,
 		AdminSessionTTL:           adminSessionTTL,
 		EventbusBatchSize:         eventbusBatchSize,
+		EventbusPollInterval:      eventbusPollInterval,
 		HTTPAddr:                  httpAddr,
 		RateEngine:                rateEngine,
 		Treasury:                  treasury,
+		Session:                   session,
 	}, nil
 }
 
