@@ -56,6 +56,13 @@ const (
 	// identically via the same derivation family. This keeps that
 	// separation real rather than nominal.
 	gasFundingAccount = 1
+	// TenantAccountOffset is where treasury's per-tenant account
+	// allocator (internal/treasury/hdwallet.go) starts assigning tenant
+	// accounts — documented here so the reserved platform-level range
+	// (0, 1 above) is visible in one place, even though this package
+	// doesn't itself allocate tenant accounts (that's treasury's
+	// numbering policy; this package only derives paths).
+	TenantAccountOffset = 2
 )
 
 // Seed wraps a decrypted BIP32 master seed. Only ever lives in process
@@ -134,27 +141,47 @@ func (s *Seed) derivePrivateKey(chain Chain, account, index uint32) (*btcec.Priv
 	return priv, nil
 }
 
+// DerivePrivateKeyAtAccount returns the private key at
+// m/purpose'/coinType'/account'/0/index — the general entry point.
+// DerivePrivateKey/DeriveGasFundingPrivateKey (platform-level accounts)
+// and treasury's per-tenant allocator (tenant-level accounts, starting at
+// tenantAccountOffset) all go through this; the wallet package derives
+// paths, it doesn't own account-numbering policy. Never persisted —
+// callers use the returned key only transiently, at signing time.
+func (s *Seed) DerivePrivateKeyAtAccount(chain Chain, account, index uint32) (*btcec.PrivateKey, error) {
+	return s.derivePrivateKey(chain, account, index)
+}
+
 // DerivePrivateKey returns the deposit-address private key for
-// (chain, index). Never persisted — callers use it only transiently, at
-// signing time.
+// (chain, index) under the platform-level account (0). Never persisted —
+// callers use it only transiently, at signing time.
 func (s *Seed) DerivePrivateKey(chain Chain, index uint32) (*btcec.PrivateKey, error) {
-	return s.derivePrivateKey(chain, depositAccount, index)
+	return s.DerivePrivateKeyAtAccount(chain, depositAccount, index)
 }
 
 // DeriveGasFundingPrivateKey returns the single gas-funding wallet's
 // private key for chain (see gasFundingAccount).
 func (s *Seed) DeriveGasFundingPrivateKey(chain Chain) (*btcec.PrivateKey, error) {
-	return s.derivePrivateKey(chain, gasFundingAccount, 0)
+	return s.DerivePrivateKeyAtAccount(chain, gasFundingAccount, 0)
 }
 
-// DeriveAddress returns the deposit address for (chain, index), formatted
-// per that chain's convention (see btc.go/evm.go/tron.go).
-func DeriveAddress(seed *Seed, chain Chain, index uint32) (string, error) {
-	priv, err := seed.DerivePrivateKey(chain, index)
+// DeriveAddressAtAccount returns the address at
+// m/purpose'/coinType'/account'/0/index, formatted per that chain's
+// convention (see btc.go/evm.go/tron.go) — the general entry point
+// DeriveAddress wraps for the platform-level account.
+func DeriveAddressAtAccount(seed *Seed, chain Chain, account, index uint32) (string, error) {
+	priv, err := seed.DerivePrivateKeyAtAccount(chain, account, index)
 	if err != nil {
 		return "", err
 	}
 	return addressForChain(chain, priv)
+}
+
+// DeriveAddress returns the deposit address for (chain, index) under the
+// platform-level account (0), formatted per that chain's convention (see
+// btc.go/evm.go/tron.go).
+func DeriveAddress(seed *Seed, chain Chain, index uint32) (string, error) {
+	return DeriveAddressAtAccount(seed, chain, depositAccount, index)
 }
 
 // DeriveAddressFromKey formats an already-derived private key's address

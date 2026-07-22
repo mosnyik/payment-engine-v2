@@ -236,21 +236,78 @@ func (s *Store) CheckEntitlement(ctx context.Context, tenantID, corridorID uuid.
 }
 
 // SetWebhookURL validates and stores a tenant's outbound webhook endpoint.
-// This validates at registration time only — re-checking at delivery time
-// (to guard against DNS rebinding between registration and send) is a
-// Phase 7 (notification) concern, not implemented here.
-func (s *Store) SetWebhookURL(ctx context.Context, tenantID uuid.UUID, webhookURL string) error {
+// Validates at registration time; callers that actually deliver to this
+// URL (e.g. treasury's tenant-notification sender) re-validate again
+// immediately before each send via platform/webhookurl.Validate, guarding
+// against DNS rebinding between registration and send.
+//
+// The first call for a tenant also generates a webhook signing secret
+// (returned once, like IssueAPIKey's HMAC secret — never shown again) so
+// the tenant can verify a delivered webhook actually came from this
+// system. A later call to change the URL keeps the existing secret;
+// signingSecret is empty in that case.
+func (s *Store) SetWebhookURL(ctx context.Context, tenantID uuid.UUID, webhookURL string) (signingSecret string, err error) {
 	if err := ValidateWebhookURL(webhookURL); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidWebhookURL, err)
+		return "", fmt.Errorf("%w: %v", ErrInvalidWebhookURL, err)
 	}
-	_, err := s.pool.Exec(ctx,
-		`UPDATE tenants SET webhook_url = $2, updated_at = now() WHERE id = $1`,
-		tenantID, webhookURL,
+
+	var existingSecret *string
+	err = s.pool.QueryRow(ctx, `SELECT webhook_signing_secret_encrypted FROM tenants WHERE id = $1`, tenantID).Scan(&existingSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("tenant: check webhook signing secret: %w", err)
+	}
+
+	var encryptedSecret *string
+	if existingSecret == nil {
+		signingSecret, err = randomHex(32)
+		if err != nil {
+			return "", err
+		}
+		encrypted, err := s.crypto.Encrypt(signingSecret)
+		if err != nil {
+			return "", fmt.Errorf("tenant: encrypt webhook signing secret: %w", err)
+		}
+		encryptedSecret = &encrypted
+	} else {
+		encryptedSecret = existingSecret
+	}
+
+	_, err = s.pool.Exec(ctx,
+		`UPDATE tenants SET webhook_url = $2, webhook_signing_secret_encrypted = $3, updated_at = now() WHERE id = $1`,
+		tenantID, webhookURL, encryptedSecret,
 	)
 	if err != nil {
-		return fmt.Errorf("tenant: set webhook url: %w", err)
+		return "", fmt.Errorf("tenant: set webhook url: %w", err)
 	}
-	return nil
+	return signingSecret, nil
+}
+
+// WebhookConfig returns a tenant's registered webhook URL and (decrypted)
+// signing secret — the lookup treasury's TenantWebhookLookup interface
+// calls through, so treasury never imports this package directly.
+func (s *Store) WebhookConfig(ctx context.Context, tenantID uuid.UUID) (webhookURL, signingSecret string, ok bool, err error) {
+	var url, encryptedSecret *string
+	err = s.pool.QueryRow(ctx,
+		`SELECT webhook_url, webhook_signing_secret_encrypted FROM tenants WHERE id = $1`,
+		tenantID,
+	).Scan(&url, &encryptedSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("tenant: get webhook config: %w", err)
+	}
+	if url == nil || encryptedSecret == nil {
+		return "", "", false, nil
+	}
+	secret, err := s.crypto.Decrypt(*encryptedSecret)
+	if err != nil {
+		return "", "", false, fmt.Errorf("tenant: decrypt webhook signing secret: %w", err)
+	}
+	return *url, secret, true, nil
 }
 
 // ValidateWebhookURL rejects anything unsafe to send a webhook to — see

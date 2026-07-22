@@ -227,9 +227,14 @@ func (h *adminHandlers) setWebhookURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.tenant.SetWebhookURL(r.Context(), tenantID, req.URL); err != nil {
+	signingSecret, err := h.tenant.SetWebhookURL(r.Context(), tenantID, req.URL)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"webhook_url": req.URL})
+	resp := map[string]string{"webhook_url": req.URL}
+	if signingSecret != "" {
+		resp["webhook_signing_secret"] = signingSecret
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
