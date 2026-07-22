@@ -1,6 +1,6 @@
 # Payment Rail v2 — Implementation Plan
 
-> **Resuming in a new session?** Read this file top to bottom — every phase is marked ✅ if done, and each section ends with a `*Next: ...*` line. Then run `git log --oneline -10` and `go test ./...` (with `docker compose up -d postgres` running) to confirm the working tree matches what's documented here before continuing. `ARCHITECTURE.md` has every design decision behind these choices — check it before re-deciding something that's already settled.
+> **Resuming in a new session?** Read this file top to bottom — every phase is marked ✅ if done, and each section ends with a `*Next: ...*` line. Then run `git log --oneline -10` and `go test ./...` (against the externally-connected dev Postgres configured in `.env` — no local container to start) to confirm the working tree matches what's documented here before continuing. `ARCHITECTURE.md` has every design decision behind these choices — check it before re-deciding something that's already settled.
 
 Status: living doc. Companion to `ARCHITECTURE.md` (design decisions, module map, ledger schema, session state machine) — this doc is about *build order and sequencing*, not design. Update as phases complete or sequencing changes.
 
