@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/treasury/wallet"
 )
@@ -94,6 +96,7 @@ func TestAllocateOrReuseAddress_DerivesNewWhenNoneFree(t *testing.T) {
 	s := New(pool, corridor.New(pool), Config{})
 	storeWithSeed(t, s)
 	ctx := context.Background()
+	tenantID := uuid.New()
 
 	// Derivation only accepts real chain values, so this (like the sibling
 	// test below) shares the "ethereum" hd_wallet_indices/derived_addresses
@@ -102,7 +105,7 @@ func TestAllocateOrReuseAddress_DerivesNewWhenNoneFree(t *testing.T) {
 	// address), never a specific value.
 	chain := wallet.Ethereum
 
-	addr, err := s.allocateOrReuseAddress(ctx, chain)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, chain)
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
@@ -112,7 +115,7 @@ func TestAllocateOrReuseAddress_DerivesNewWhenNoneFree(t *testing.T) {
 
 	// No reservation was made against addr, so it's still free — a second
 	// call must reuse it rather than deriving a new one.
-	addr2, err := s.allocateOrReuseAddress(ctx, chain)
+	addr2, err := s.allocateOrReuseAddress(ctx, tenantID, chain)
 	if err != nil {
 		t.Fatalf("allocate again: %v", err)
 	}
@@ -127,9 +130,10 @@ func TestAllocateOrReuseAddress_SkipsReservedAddress(t *testing.T) {
 	storeWithSeed(t, s)
 	ctx := context.Background()
 	chain := wallet.Ethereum
+	tenantID := createTestTenant(t, pool)
 	_, corridorID := setupCorridor(t, pool)
 
-	addr, err := s.allocateOrReuseAddress(ctx, chain)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, chain)
 	if err != nil {
 		t.Fatalf("allocate: %v", err)
 	}
@@ -139,20 +143,81 @@ func TestAllocateOrReuseAddress_SkipsReservedAddress(t *testing.T) {
 	// separately in treasury_test.go's failover tests).
 	_, err = pool.Exec(ctx,
 		`INSERT INTO treasury_address_reservations
-		   (corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
-		 VALUES ($1, 'self_custody_wallet', 'self_custody', 'ETH', $2, $3, 'reserved')`,
-		corridorID, string(chain), addr,
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', $3, $4, 'reserved')`,
+		tenantID, corridorID, string(chain), addr,
 	)
 	if err != nil {
 		t.Fatalf("insert reservation: %v", err)
 	}
 
-	addr2, err := s.allocateOrReuseAddress(ctx, chain)
+	addr2, err := s.allocateOrReuseAddress(ctx, tenantID, chain)
 	if err != nil {
 		t.Fatalf("allocate after reservation: %v", err)
 	}
 	if addr2 == addr {
 		t.Fatalf("expected a new address once the first was reserved, got the same one back: %s", addr2)
+	}
+}
+
+func TestAllocateOrReuseAddress_TenantsAreIsolated(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	storeWithSeed(t, s)
+	ctx := context.Background()
+	chain := wallet.Ethereum
+	tenantA, tenantB := uuid.New(), uuid.New()
+
+	addrA, err := s.allocateOrReuseAddress(ctx, tenantA, chain)
+	if err != nil {
+		t.Fatalf("allocate for tenant A: %v", err)
+	}
+	addrB, err := s.allocateOrReuseAddress(ctx, tenantB, chain)
+	if err != nil {
+		t.Fatalf("allocate for tenant B: %v", err)
+	}
+	if addrA == addrB {
+		t.Fatalf("expected different tenants to never receive the same address, got %s for both", addrA)
+	}
+
+	// Each tenant reusing their own pool must get their own address back,
+	// never see the other tenant's.
+	addrA2, err := s.allocateOrReuseAddress(ctx, tenantA, chain)
+	if err != nil {
+		t.Fatalf("re-allocate for tenant A: %v", err)
+	}
+	if addrA2 != addrA {
+		t.Fatalf("expected tenant A to reuse its own address %s, got %s", addrA, addrA2)
+	}
+}
+
+func TestGetOrAllocateTenantAccount_StableAndUniquePerTenant(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	ctx := context.Background()
+	tenantA, tenantB := uuid.New(), uuid.New()
+
+	accountA1, err := s.getOrAllocateTenantAccount(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("allocate account for tenant A: %v", err)
+	}
+	accountB, err := s.getOrAllocateTenantAccount(ctx, tenantB)
+	if err != nil {
+		t.Fatalf("allocate account for tenant B: %v", err)
+	}
+	if accountA1 == accountB {
+		t.Fatalf("expected different tenants to get different account numbers, got %d for both", accountA1)
+	}
+	if accountA1 < wallet.TenantAccountOffset {
+		t.Fatalf("expected tenant account >= TenantAccountOffset (%d), got %d", wallet.TenantAccountOffset, accountA1)
+	}
+
+	accountA2, err := s.getOrAllocateTenantAccount(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("re-fetch account for tenant A: %v", err)
+	}
+	if accountA2 != accountA1 {
+		t.Fatalf("expected the same tenant to always get the same account number, got %d then %d", accountA1, accountA2)
 	}
 }
 

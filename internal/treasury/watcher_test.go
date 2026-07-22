@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
@@ -226,19 +227,23 @@ func TestWatcher_PollOnce_ConfirmsWhenThresholdMet(t *testing.T) {
 	ctx := context.Background()
 
 	_, corridorID := setupCorridor(t, pool)
-	addr, err := s.allocateOrReuseAddress(ctx, wallet.Ethereum)
+	tenantID := createTestTenant(t, pool)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, wallet.Ethereum)
 	if err != nil {
 		t.Fatalf("allocate address: %v", err)
 	}
-	_, err = pool.Exec(ctx,
+	var reservationID uuid.UUID
+	err = pool.QueryRow(ctx,
 		`INSERT INTO treasury_address_reservations
-		   (corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
-		 VALUES ($1, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $2, 'reserved')`,
-		corridorID, addr,
-	)
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, addr,
+	).Scan(&reservationID)
 	if err != nil {
 		t.Fatalf("insert reservation: %v", err)
 	}
+	releaseReservationOnCleanup(t, s, reservationID)
 
 	w := &Watcher{
 		store:        s,
@@ -255,10 +260,6 @@ func TestWatcher_PollOnce_ConfirmsWhenThresholdMet(t *testing.T) {
 	}
 	w.pollOnce(ctx)
 
-	var reservationID string
-	if err := pool.QueryRow(ctx, `SELECT id FROM treasury_address_reservations WHERE address = $1`, addr).Scan(&reservationID); err != nil {
-		t.Fatalf("find reservation: %v", err)
-	}
 	var status string
 	if err := pool.QueryRow(ctx, `SELECT status FROM treasury_deposits WHERE tx_reference = '0xdeposit1'`).Scan(&status); err != nil {
 		t.Fatalf("find deposit: %v", err)
@@ -276,19 +277,23 @@ func TestWatcher_PollOnce_DetectedBelowThreshold(t *testing.T) {
 	ctx := context.Background()
 
 	_, corridorID := setupCorridor(t, pool)
-	addr, err := s.allocateOrReuseAddress(ctx, wallet.Ethereum)
+	tenantID := createTestTenant(t, pool)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, wallet.Ethereum)
 	if err != nil {
 		t.Fatalf("allocate address: %v", err)
 	}
-	_, err = pool.Exec(ctx,
+	var reservationID uuid.UUID
+	err = pool.QueryRow(ctx,
 		`INSERT INTO treasury_address_reservations
-		   (corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
-		 VALUES ($1, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $2, 'reserved')`,
-		corridorID, addr,
-	)
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, addr,
+	).Scan(&reservationID)
 	if err != nil {
 		t.Fatalf("insert reservation: %v", err)
 	}
+	releaseReservationOnCleanup(t, s, reservationID)
 
 	w := &Watcher{
 		store:        s,
@@ -312,5 +317,70 @@ func TestWatcher_PollOnce_DetectedBelowThreshold(t *testing.T) {
 	// tip 1000 - blockHeight 995 + 1 = 6 confirmations < minConfirmations 12
 	if status != "detected" {
 		t.Fatalf("expected status detected (6 confirmations < 12 required), got %s", status)
+	}
+}
+
+// TestWatcher_PollOnce_NeverSweepsTenantProvidedReservation is the
+// sweep-guard test: a tenant-provided reservation confirming a deposit
+// must never result in a sweep, since the platform holds no key for a
+// tenant-supplied wallet. No seed is loaded here at all — if the guard
+// were ever removed, ExecuteSweep would fail loudly (nil seed / wrong
+// custody type) rather than silently derive a wrong key, but the
+// behavioral contract this test actually cares about is the observable
+// one: no treasury_sweeps row is ever created for this reservation.
+func TestWatcher_PollOnce_NeverSweepsTenantProvidedReservation(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	ctx := context.Background()
+
+	tenantID := createTestTenant(t, pool)
+	if err := s.RegisterTenantCustomWallet(ctx, tenantID, wallet.Ethereum, "0x1111111111111111111111111111111111111111", ""); err != nil {
+		t.Fatalf("register custom wallet: %v", err)
+	}
+	_, corridorID := setupCorridor(t, pool)
+	var reservationID uuid.UUID
+	err := pool.QueryRow(ctx,
+		`INSERT INTO treasury_address_reservations
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'tenant_provided_wallet', 'tenant_provided', 'ETH', 'ethereum', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, "0x1111111111111111111111111111111111111111",
+	).Scan(&reservationID)
+	if err != nil {
+		t.Fatalf("insert reservation: %v", err)
+	}
+	releaseReservationOnCleanup(t, s, reservationID)
+
+	sweeper := NewSweeper(s, SweepConfig{}, nil, nil, nil)
+	w := &Watcher{
+		store:        s,
+		pollInterval: time.Second,
+		sweeper:      sweeper,
+		clients: map[wallet.Chain]chainWatcherClient{
+			wallet.Ethereum: &fakeChainWatcherClient{
+				tip: 1000,
+				txs: []ChainTransaction{
+					{TxID: "0xtenanttx1", CryptoAsset: "ETH", Amount: decimal.New(2, 0), Confirmed: true, BlockHeight: 988},
+				},
+			},
+		},
+		minConfirmations: map[wallet.Chain]int{wallet.Ethereum: 12},
+	}
+	w.pollOnce(ctx)
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM treasury_deposits WHERE tx_reference = '0xtenanttx1'`).Scan(&status); err != nil {
+		t.Fatalf("find deposit: %v", err)
+	}
+	if status != "confirmed" {
+		t.Fatalf("expected the deposit itself to still be recorded as confirmed, got %s", status)
+	}
+
+	var sweepCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM treasury_sweeps ts JOIN treasury_address_reservations r ON r.id = ts.reservation_id WHERE r.tenant_id = $1`, tenantID).Scan(&sweepCount); err != nil {
+		t.Fatalf("count sweeps: %v", err)
+	}
+	if sweepCount != 0 {
+		t.Fatalf("expected zero sweeps for a tenant-provided reservation, got %d", sweepCount)
 	}
 }

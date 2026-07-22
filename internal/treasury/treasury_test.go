@@ -18,7 +18,31 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/tenant"
 )
+
+// testTenantEncryptionKey is a throwaway key for tenant.New in tests —
+// treasury's tests only need a real tenants row to satisfy
+// treasury_address_reservations' tenant_id FK, never a tenant's actual
+// secrets.
+var testTenantEncryptionKey = []byte("01234567890123456789012345678901"[:32])
+
+// createTestTenant inserts a real tenants row so tests can use its id as
+// a valid tenant_id — treasury_address_reservations has a real FK to
+// tenants(id) (migration 000016), so a fabricated uuid.New() no longer
+// satisfies it the way it did before tenant-scoping.
+func createTestTenant(t *testing.T, pool *db.Pool) uuid.UUID {
+	t.Helper()
+	ts, err := tenant.New(pool, testTenantEncryptionKey)
+	if err != nil {
+		t.Fatalf("new tenant store: %v", err)
+	}
+	id, err := ts.CreateTenant(context.Background(), "Test Tenant "+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create test tenant: %v", err)
+	}
+	return id
+}
 
 func openTestPool(t *testing.T) *db.Pool {
 	t.Helper()
@@ -91,7 +115,7 @@ type fakeCollectionProvider struct {
 func (f *fakeCollectionProvider) Name() string             { return f.name }
 func (f *fakeCollectionProvider) IsEnabled() bool          { return f.enabled }
 func (f *fakeCollectionProvider) CustodyType() CustodyType { return f.custody }
-func (f *fakeCollectionProvider) ReserveAddress(_ context.Context, _, _ string) (ProviderAddress, error) {
+func (f *fakeCollectionProvider) ReserveAddress(_ context.Context, _ uuid.UUID, _, _ string) (ProviderAddress, error) {
 	if f.err != nil {
 		return ProviderAddress{}, f.err
 	}
@@ -128,7 +152,7 @@ func TestReserveAddress_PicksHighestPriorityProvider(t *testing.T) {
 	)
 	s := newTestStore(pool, cs, primary, backup)
 
-	r, err := s.ReserveAddress(context.Background(), corridorID)
+	r, err := s.ReserveAddress(context.Background(), createTestTenant(t, pool), corridorID)
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
@@ -151,7 +175,7 @@ func TestReserveAddress_FailsOverOnError(t *testing.T) {
 	)
 	s := newTestStore(pool, cs, failing, working)
 
-	r, err := s.ReserveAddress(context.Background(), corridorID)
+	r, err := s.ReserveAddress(context.Background(), createTestTenant(t, pool), corridorID)
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}
@@ -166,7 +190,7 @@ func TestReserveAddress_NoActiveProvider(t *testing.T) {
 	cs, corridorID := setupCorridor(t, pool) // no bindings at all
 	s := newTestStore(pool, cs)
 
-	_, err := s.ReserveAddress(context.Background(), corridorID)
+	_, err := s.ReserveAddress(context.Background(), createTestTenant(t, pool), corridorID)
 	if !errors.Is(err, ErrNoProviderAvailable) {
 		t.Fatalf("expected ErrNoProviderAvailable, got %v", err)
 	}
@@ -198,7 +222,7 @@ func reserveTestAddress(t *testing.T, s *Store, corridorID uuid.UUID, providerRe
 	if _, err := cs.UpsertProviderBinding(ctx, corridorID, corridor.ProviderTypeCollection, "webhooktest", 1, true, nil); err != nil {
 		t.Fatalf("upsert provider binding: %v", err)
 	}
-	r, err := s.ReserveAddress(ctx, corridorID)
+	r, err := s.ReserveAddress(ctx, createTestTenant(t, s.pool), corridorID)
 	if err != nil {
 		t.Fatalf("reserve address: %v", err)
 	}

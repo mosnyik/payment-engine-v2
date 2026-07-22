@@ -101,6 +101,14 @@ type TreasuryConfig struct {
 
 	Watcher WatcherConfig
 	Sweep   SweepConfig
+
+	// TenantWebhookTimeout/TenantWebhookMaxRetries tune the minimal
+	// tenant-custom-wallet notification sender — see internal/treasury's
+	// tenant_notify.go. Intentionally smaller in scope than Phase 7
+	// (notification) will eventually be: bounded retries, no persistent
+	// delivery log.
+	TenantWebhookTimeout    time.Duration // default 10s
+	TenantWebhookMaxRetries int           // default 3
 }
 
 // ChainConfig configures one self-custody chain watcher/broadcaster. APIURL
@@ -236,6 +244,8 @@ func Load(source Source) (*Config, error) {
 			StableBalanceThreshold: stringOrDefault(source, "SWEEP_STABLE_BALANCE_THRESHOLD", "1000"),
 			StableTimeBackstop:     durationOrDefault(source, "SWEEP_STABLE_TIME_BACKSTOP", 6*time.Hour, &errs),
 		},
+		TenantWebhookTimeout:    durationOrDefault(source, "TENANT_WEBHOOK_TIMEOUT", 10*time.Second, &errs),
+		TenantWebhookMaxRetries: intOrDefault(source, "TENANT_WEBHOOK_MAX_RETRIES", 3, &errs),
 	}
 
 	if len(errs) > 0 {

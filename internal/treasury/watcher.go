@@ -112,12 +112,13 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// pollOnce checks every currently-open self-custody reservation once. A
+// pollOnce checks every currently-open watchable reservation once (both
+// self-custody and tenant-provided — see listOpenWatchableReservations). A
 // failure on one reservation or chain is logged and skipped, never fatal
 // to the loop — matches rate's GetAllQuotes "a failing provider is
 // skipped, not fatal" precedent.
 func (w *Watcher) pollOnce(ctx context.Context) {
-	reservations, err := w.store.listOpenSelfCustodyReservations(ctx)
+	reservations, err := w.store.listOpenWatchableReservations(ctx)
 	if err != nil {
 		log.Printf("treasury: watcher: list open reservations: %v", err)
 		return
@@ -161,24 +162,50 @@ func (w *Watcher) pollOnce(ctx context.Context) {
 				log.Printf("treasury: watcher: record deposit %s: %v", tx.TxID, err)
 				continue
 			}
-			if status == "confirmed" && w.sweeper != nil && !isStableAsset(tx.CryptoAsset) {
-				if err := w.sweeper.ExecuteSweep(ctx, r.ID); err != nil {
-					log.Printf("treasury: watcher: immediate sweep for reservation %s: %v", r.ID, err)
+
+			switch r.CustodyType {
+			case CustodyTypeSelf:
+				// Sweeping calls wallet.DerivePrivateKey — only ever safe
+				// for a self-custody reservation, never tenant-provided
+				// (we hold no key for those). This check is deliberate,
+				// not incidental: once tenant-provided rows started
+				// flowing through this same loop, an unconditional sweep
+				// trigger would have tried to derive a key for an address
+				// this package never derived.
+				if status == "confirmed" && w.sweeper != nil && !isStableAsset(tx.CryptoAsset) {
+					if err := w.sweeper.ExecuteSweep(ctx, r.ID); err != nil {
+						log.Printf("treasury: watcher: immediate sweep for reservation %s: %v", r.ID, err)
+					}
+				}
+			case CustodyTypeTenantProvided:
+				// No sweep, ever — monitoring + webhook confirmation only
+				// (the platform holds no key for a tenant-supplied
+				// wallet). Notify on both a fresh detection and a
+				// confirmation.
+				if w.store.tenantWebhooks != nil {
+					if err := w.store.notifyTenant(ctx, r.TenantID, "deposit."+status, r, tx); err != nil {
+						log.Printf("treasury: watcher: notify tenant for reservation %s: %v", r.ID, err)
+					}
 				}
 			}
 		}
 	}
 }
 
-func (s *Store) listOpenSelfCustodyReservations(ctx context.Context) ([]AddressReservation, error) {
+// listOpenWatchableReservations returns every reservation the watcher
+// should poll on-chain: self-custody (we derived the address, we sweep
+// it) and tenant-provided (we monitor it, we never sweep it — see
+// pollOnce's custody-type switch). Busha (partner_custodied) is excluded
+// — it's webhook-driven from Busha's side, never polled by us.
+func (s *Store) listOpenWatchableReservations(ctx context.Context) ([]AddressReservation, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
+		`SELECT id, tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network,
 		        address, address_tag, provider_reference, status, reserved_at, released_at
 		 FROM treasury_address_reservations
-		 WHERE status = 'reserved' AND custody_type = 'self_custody'`,
+		 WHERE status = 'reserved' AND custody_type IN ('self_custody', 'tenant_provided')`,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("treasury: list open self-custody reservations: %w", err)
+		return nil, fmt.Errorf("treasury: list open watchable reservations: %w", err)
 	}
 	defer rows.Close()
 
@@ -186,7 +213,7 @@ func (s *Store) listOpenSelfCustodyReservations(ctx context.Context) ([]AddressR
 	for rows.Next() {
 		var r AddressReservation
 		var custodyType string
-		if err := rows.Scan(&r.ID, &r.CorridorID, &r.ProviderName, &custodyType, &r.CryptoAsset, &r.CryptoNetwork,
+		if err := rows.Scan(&r.ID, &r.TenantID, &r.CorridorID, &r.ProviderName, &custodyType, &r.CryptoAsset, &r.CryptoNetwork,
 			&r.Address, &r.AddressTag, &r.ProviderReference, &r.Status, &r.ReservedAt, &r.ReleasedAt); err != nil {
 			return nil, fmt.Errorf("treasury: scan reservation: %w", err)
 		}
@@ -194,7 +221,7 @@ func (s *Store) listOpenSelfCustodyReservations(ctx context.Context) ([]AddressR
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("treasury: list open self-custody reservations: %w", err)
+		return nil, fmt.Errorf("treasury: list open watchable reservations: %w", err)
 	}
 	return out, nil
 }

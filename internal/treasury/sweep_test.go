@@ -39,10 +39,10 @@ func insertTestReservation(t *testing.T, pool *db.Pool, corridorID uuid.UUID, ch
 	var id uuid.UUID
 	err := pool.QueryRow(context.Background(),
 		`INSERT INTO treasury_address_reservations
-		   (corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
-		 VALUES ($1, 'self_custody_wallet', 'self_custody', 'ETH', $2, $3, 'reserved')
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', $3, $4, 'reserved')
 		 RETURNING id`,
-		corridorID, string(chain), address,
+		createTestTenant(t, pool), corridorID, string(chain), address,
 	).Scan(&id)
 	if err != nil {
 		t.Fatalf("insert reservation: %v", err)

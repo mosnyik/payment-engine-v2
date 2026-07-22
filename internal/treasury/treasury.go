@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,6 +97,12 @@ type Config struct {
 
 	Watcher WatcherConfig
 	Sweep   SweepConfig
+
+	// TenantWebhookTimeout/TenantWebhookMaxRetries tune the minimal
+	// tenant-notification sender (see tenant_notify.go). Zero values fall
+	// back to sensible defaults in New.
+	TenantWebhookTimeout    time.Duration
+	TenantWebhookMaxRetries int
 }
 
 // ChainConfig mirrors config.ChainConfig — see watcher.go.
@@ -127,14 +134,30 @@ type Store struct {
 	// nil until then — the self-custody provider stays disabled (see
 	// selfCustodyProvider.IsEnabled) until a seed has been loaded.
 	seed *wallet.Seed
+
+	// tenantWebhooks resolves a tenant's webhook URL/signing secret for
+	// tenant-custom-wallet deposit notifications (see tenant_notify.go).
+	// nil-safe — unset means notifications are skipped, not a crash; set
+	// via SetTenantWebhookLookup.
+	tenantWebhooks          TenantWebhookLookup
+	tenantWebhookClient     *http.Client
+	tenantWebhookMaxRetries int
 }
 
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 	busha := newBushaProvider(cfg.Busha)
+	maxRetries := cfg.TenantWebhookMaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
 	s := &Store{
-		pool:               pool,
-		corridorStore:      corridorStore,
-		bushaWebhookSecret: cfg.Busha.WebhookSecret,
+		pool:                    pool,
+		corridorStore:           corridorStore,
+		bushaWebhookSecret:      cfg.Busha.WebhookSecret,
+		tenantWebhookMaxRetries: maxRetries,
+	}
+	if cfg.TenantWebhookTimeout > 0 {
+		s.tenantWebhookClient = &http.Client{Timeout: cfg.TenantWebhookTimeout}
 	}
 	selfCustody := &selfCustodyProvider{store: s}
 	tenantWallet := &tenantProvidedWalletProvider{store: s}
