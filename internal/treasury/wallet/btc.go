@@ -26,6 +26,19 @@ func btcAddress(priv *btcec.PrivateKey) (string, error) {
 	return addr.EncodeAddress(), nil
 }
 
+// validateBTCAddress accepts any well-formed, checksum-valid Bitcoin
+// address type (P2PKH/P2SH/P2WPKH/P2TR...) — a tenant-supplied wallet
+// isn't required to be the same P2WPKH type this package derives, and the
+// watcher's address match (watcher.go) is a plain string compare that
+// works regardless of address type.
+func validateBTCAddress(address string) error {
+	_, err := btcutil.DecodeAddress(address, &chaincfg.MainNetParams)
+	if err != nil {
+		return fmt.Errorf("wallet: invalid bitcoin address %q: %w", address, err)
+	}
+	return nil
+}
+
 func btcP2WPKHAddress(priv *btcec.PrivateKey) (*btcutil.AddressWitnessPubKeyHash, error) {
 	pubKeyHash := btcutil.Hash160(priv.PubKey().SerializeCompressed())
 	addr, err := btcutil.NewAddressWitnessPubKeyHash(pubKeyHash, &chaincfg.MainNetParams)

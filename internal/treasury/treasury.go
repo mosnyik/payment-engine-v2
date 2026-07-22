@@ -137,9 +137,11 @@ func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 		bushaWebhookSecret: cfg.Busha.WebhookSecret,
 	}
 	selfCustody := &selfCustodyProvider{store: s}
+	tenantWallet := &tenantProvidedWalletProvider{store: s}
 	s.providers = map[string]CollectionProvider{
-		busha.Name():       busha,
-		selfCustody.Name(): selfCustody,
+		busha.Name():        busha,
+		selfCustody.Name():  selfCustody,
+		tenantWallet.Name(): tenantWallet,
 	}
 	return s
 }

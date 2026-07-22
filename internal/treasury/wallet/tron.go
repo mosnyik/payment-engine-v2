@@ -16,6 +16,18 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+// validateTronAddress accepts any well-formed Base58Check Tron address.
+func validateTronAddress(addr string) error {
+	a, err := address.Base58ToAddress(addr)
+	if err != nil {
+		return fmt.Errorf("wallet: invalid tron address %q: %w", addr, err)
+	}
+	if !a.IsValid() {
+		return fmt.Errorf("wallet: invalid tron address %q", addr)
+	}
+	return nil
+}
+
 // tronAddress derives priv's Tron Base58Check address (0x41 version byte)
 // — gotron-sdk's address package already implements this directly from a
 // btcec key (same secp256k1 key type this whole package uses), so this

@@ -192,6 +192,25 @@ func DeriveAddressFromKey(priv *btcec.PrivateKey, chain Chain) (string, error) {
 	return addressForChain(chain, priv)
 }
 
+// ValidateAddress reports whether address is well-formed for chain —
+// used to validate a tenant-supplied custom wallet address (see
+// internal/treasury.RegisterTenantCustomWallet) before accepting it,
+// since a malformed address would otherwise silently break monitoring
+// forever. Does not check the address was ever derived by this wallet
+// (a custom wallet is, by definition, one this package never derived).
+func ValidateAddress(chain Chain, address string) error {
+	switch chain {
+	case Bitcoin:
+		return validateBTCAddress(address)
+	case Ethereum, BSC:
+		return validateEVMAddress(address)
+	case Tron:
+		return validateTronAddress(address)
+	default:
+		return fmt.Errorf("wallet: unsupported chain %q", chain)
+	}
+}
+
 func addressForChain(chain Chain, priv *btcec.PrivateKey) (string, error) {
 	switch chain {
 	case Bitcoin:

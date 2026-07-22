@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -30,6 +31,32 @@ func keccak256(data []byte) []byte {
 // — identical for Ethereum and BSC (same secp256k1/Keccak256 addressing).
 func evmAddress(priv *btcec.PrivateKey) (string, error) {
 	return addressFromPubKey(priv.PubKey())
+}
+
+// validateEVMAddress accepts a well-formed 20-byte hex address. If it's
+// mixed-case, the EIP-55 checksum must be correct (mixed case is only ever
+// produced deliberately as a checksum, so a wrong one likely means a typo);
+// all-lowercase or all-uppercase is accepted without a checksum, since
+// plenty of real wallets/exchanges hand out addresses that way.
+func validateEVMAddress(address string) error {
+	hexPart := strings.TrimPrefix(address, "0x")
+	decoded, err := hex.DecodeString(hexPart)
+	if err != nil {
+		return fmt.Errorf("wallet: invalid evm address %q: %w", address, err)
+	}
+	if len(decoded) != 20 {
+		return fmt.Errorf("wallet: evm address %q is not 20 bytes", address)
+	}
+
+	isAllLower := hexPart == strings.ToLower(hexPart)
+	isAllUpper := hexPart == strings.ToUpper(hexPart)
+	if isAllLower || isAllUpper {
+		return nil
+	}
+	if eip55Checksum(decoded) != "0x"+hexPart {
+		return fmt.Errorf("wallet: evm address %q has an invalid checksum", address)
+	}
+	return nil
 }
 
 // addressFromPubKey derives the EIP-55 checksummed address for an
