@@ -163,7 +163,22 @@ func (s *Store) CreateSession(ctx context.Context, tenantID uuid.UUID, cryptoAss
 		return nil, fmt.Errorf("session: create: %w", err)
 	}
 
-	c, err := s.complianceStore.ScreenSession(ctx, sess.ID, tenantID, fiatAmount, corr.TravelRuleThresholdFiat, corr.TravelRuleWindow, corr.ComplianceHoldTimeout, "")
+	// The corridor's highest-priority active compliance provider binding, if
+	// any — empty when none is configured, which compliance.ScreenSession
+	// already treats as "no vendor selected, manual hold" (same convention
+	// ScreenTenant uses). No failover loop here: compliance screening isn't
+	// a failover-eligible operation the way treasury/rate provider lookups
+	// are, since only one decision is made per session.
+	complianceProviderName := ""
+	complianceBindings, err := s.corridorStore.ListActiveProviders(ctx, corr.ID, corridor.ProviderTypeCompliance)
+	if err != nil {
+		return nil, fmt.Errorf("session: list compliance providers: %w", err)
+	}
+	if len(complianceBindings) > 0 {
+		complianceProviderName = complianceBindings[0].ProviderName
+	}
+
+	c, err := s.complianceStore.ScreenSession(ctx, sess.ID, tenantID, fiatAmount, corr.TravelRuleThresholdFiat, corr.TravelRuleWindow, corr.ComplianceHoldTimeout, complianceProviderName)
 	if err != nil {
 		return nil, fmt.Errorf("session: screen: %w", err)
 	}
@@ -172,9 +187,9 @@ func (s *Store) CreateSession(ctx context.Context, tenantID uuid.UUID, cryptoAss
 	case compliance.StatusHold:
 		return s.transitionToHold(ctx, sess.ID, c.ID)
 	case compliance.StatusRejected:
-		return s.transitionToRejected(ctx, sess.ID)
+		return s.transitionToRejected(ctx, sess.ID, StatusScreening)
 	case compliance.StatusApproved:
-		return s.transitionToPending(ctx, sess.ID, tenantID, corr)
+		return s.transitionToPending(ctx, sess.ID, tenantID, corr, StatusScreening)
 	default:
 		return nil, fmt.Errorf("session: unexpected compliance status %q", c.Status)
 	}
@@ -194,12 +209,15 @@ func (s *Store) transitionToHold(ctx context.Context, id, caseID uuid.UUID) (*Se
 	return sess, nil
 }
 
-func (s *Store) transitionToRejected(ctx context.Context, id uuid.UUID) (*Session, error) {
+// transitionToRejected is reached either directly from the initial
+// screening decision or from ResolveComplianceHold's analyst-rejects path
+// (ARCHITECTURE.md §8) — from distinguishes which.
+func (s *Store) transitionToRejected(ctx context.Context, id uuid.UUID, from Status) (*Session, error) {
 	row := s.pool.QueryRow(ctx,
 		`UPDATE sessions SET status = 'rejected', updated_at = now()
-		 WHERE id = $1 AND status = 'screening'
+		 WHERE id = $1 AND status = $2
 		 RETURNING `+sessionColumns,
-		id,
+		id, string(from),
 	)
 	sess, err := scanSession(row)
 	if err != nil {
@@ -211,7 +229,10 @@ func (s *Store) transitionToRejected(ctx context.Context, id uuid.UUID) (*Sessio
 // transitionToPending locks a rate and reserves a deposit address, then
 // commits the pending transition and the session.created event in one
 // transaction — the first real eventbus.Publish call on the request path.
-func (s *Store) transitionToPending(ctx context.Context, id, tenantID uuid.UUID, corr *corridor.Corridor) (*Session, error) {
+// Reached either directly from the initial screening decision or from
+// ResolveComplianceHold's analyst-approves path (ARCHITECTURE.md §8) —
+// from distinguishes which.
+func (s *Store) transitionToPending(ctx context.Context, id, tenantID uuid.UUID, corr *corridor.Corridor, from Status) (*Session, error) {
 	lock, err := s.rateStore.LockRate(ctx, corr.CryptoAsset, corr.FiatCurrency, rate.DefaultLockTTL)
 	if err != nil {
 		return nil, fmt.Errorf("session: lock rate: %w", err)
@@ -229,9 +250,9 @@ func (s *Store) transitionToPending(ctx context.Context, id, tenantID uuid.UUID,
 
 	row := tx.QueryRow(ctx,
 		`UPDATE sessions SET status = 'pending', rate_lock_id = $2, deposit_reservation_id = $3, updated_at = now()
-		 WHERE id = $1 AND status = 'screening'
+		 WHERE id = $1 AND status = $4
 		 RETURNING `+sessionColumns,
-		id, lock.ID, instructions.ReservationID,
+		id, lock.ID, instructions.ReservationID, string(from),
 	)
 	sess, err := scanSession(row)
 	if err != nil {
@@ -273,4 +294,41 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 		return nil, fmt.Errorf("session: get: %w", err)
 	}
 	return sess, nil
+}
+
+// ErrNotInComplianceHold means ResolveComplianceHold was called against a
+// session that isn't currently held — either it never was, or it already
+// moved on (resolved twice, or timed out via the TTL job).
+var ErrNotInComplianceHold = errors.New("session: not in compliance_hold")
+
+// ResolveComplianceHold is the admin-facing counterpart to the TTL job's
+// own "hold TTL exceeded" transition (ttl.go): an analyst approves or
+// rejects a compliance_hold session (ARCHITECTURE.md §8's "analyst
+// approves/rejects" transitions). Approving re-runs the same rate-lock +
+// deposit-instructions path CreateSession's initial approval does;
+// rejecting is a direct compare-and-set. Delegates the underlying
+// compliance_cases resolution to compliance.ResolveHold, which already
+// enforces its own compare-and-set (can't resolve the same case twice).
+func (s *Store) ResolveComplianceHold(ctx context.Context, sessionID, adminID uuid.UUID, approved bool, reason string) (*Session, error) {
+	sess, err := s.GetSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if sess.Status != StatusComplianceHold || sess.ComplianceCaseID == nil {
+		return nil, ErrNotInComplianceHold
+	}
+
+	if _, err := s.complianceStore.ResolveHold(ctx, *sess.ComplianceCaseID, adminID, approved, reason); err != nil {
+		return nil, fmt.Errorf("session: resolve compliance hold: %w", err)
+	}
+
+	if !approved {
+		return s.transitionToRejected(ctx, sessionID, StatusComplianceHold)
+	}
+
+	corr, err := s.corridorStore.GetCorridorByID(ctx, sess.CorridorID)
+	if err != nil {
+		return nil, fmt.Errorf("session: get corridor: %w", err)
+	}
+	return s.transitionToPending(ctx, sessionID, sess.TenantID, corr, StatusComplianceHold)
 }

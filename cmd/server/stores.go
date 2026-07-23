@@ -51,7 +51,16 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		Anchor:              rate.ProviderConfig(cfg.RateEngine.Anchor),
 	})
 
-	stableThreshold, err := decimal.NewFromString(cfg.Treasury.Sweep.StableBalanceThreshold)
+	// A hand-built config.Config (e.g. a test fixture that doesn't go
+	// through config.Load, which always defaults this to "1000") may leave
+	// this as the zero-value empty string — treated as 0, not a startup
+	// failure, since no test exercises real sweep-threshold behavior
+	// through this path.
+	stableThresholdStr := cfg.Treasury.Sweep.StableBalanceThreshold
+	if stableThresholdStr == "" {
+		stableThresholdStr = "0"
+	}
+	stableThreshold, err := decimal.NewFromString(stableThresholdStr)
 	if err != nil {
 		return nil, fmt.Errorf("build stores: invalid SWEEP_STABLE_BALANCE_THRESHOLD: %w", err)
 	}

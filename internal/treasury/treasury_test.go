@@ -18,6 +18,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 	"github.com/sirfi/payment-engine-v2/internal/tenant"
 )
 
@@ -322,6 +323,81 @@ func TestHandleDepositWebhook_ReplayIsNoOp(t *testing.T) {
 	}
 	if d.Status != "detected" {
 		t.Fatalf("expected replay to leave status unchanged at detected, got %s", d.Status)
+	}
+}
+
+func TestHandleDepositWebhook_PublishesEventsOnlyOnRealTransitions(t *testing.T) {
+	pool := openTestPool(t)
+	cs, corridorID := setupCorridor(t, pool)
+	s := newTestStore(pool, cs)
+	bus := eventbus.New(pool, 50)
+	s.SetEventBus(bus)
+	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
+	ctx := context.Background()
+
+	countEvents := func(eventType string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events WHERE event_type = $1 AND aggregate_id = $2`,
+			eventType, r.ID,
+		).Scan(&n); err != nil {
+			t.Fatalf("count %s events: %v", eventType, err)
+		}
+		return n
+	}
+
+	detectedBody := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
+	sig := ComputeWebhookSignature(s.bushaWebhookSecret, detectedBody)
+	if err := s.HandleDepositWebhook(ctx, detectedBody, sig); err != nil {
+		t.Fatalf("handle detected webhook: %v", err)
+	}
+	if n := countEvents("treasury.deposit_detected"); n != 1 {
+		t.Fatalf("expected exactly 1 treasury.deposit_detected event, got %d", n)
+	}
+
+	// A replayed 'detected' webhook is a no-op at the DB level (ON CONFLICT
+	// DO NOTHING) and must not publish a second event for it.
+	if err := s.HandleDepositWebhook(ctx, detectedBody, sig); err != nil {
+		t.Fatalf("replayed detected webhook: %v", err)
+	}
+	if n := countEvents("treasury.deposit_detected"); n != 1 {
+		t.Fatalf("expected replay not to publish a duplicate event, still got %d", n)
+	}
+
+	confirmedBody := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
+	sig = ComputeWebhookSignature(s.bushaWebhookSecret, confirmedBody)
+	if err := s.HandleDepositWebhook(ctx, confirmedBody, sig); err != nil {
+		t.Fatalf("handle confirmed webhook: %v", err)
+	}
+	if n := countEvents("treasury.deposit_confirmed"); n != 1 {
+		t.Fatalf("expected exactly 1 treasury.deposit_confirmed event, got %d", n)
+	}
+
+	// A replayed 'confirmed' webhook hits the CAS's WHERE status='detected'
+	// with no matching row (already confirmed) — must not publish again.
+	if err := s.HandleDepositWebhook(ctx, confirmedBody, sig); err != nil {
+		t.Fatalf("replayed confirmed webhook: %v", err)
+	}
+	if n := countEvents("treasury.deposit_confirmed"); n != 1 {
+		t.Fatalf("expected replay not to publish a duplicate event, still got %d", n)
+	}
+}
+
+// TestHandleDepositWebhook_NoEventBusIsSafe confirms every existing test in
+// this file (none of which call SetEventBus) is unaffected — a Store with
+// no bus configured must keep working exactly as before.
+func TestHandleDepositWebhook_NoEventBusIsSafe(t *testing.T) {
+	pool := openTestPool(t)
+	cs, corridorID := setupCorridor(t, pool)
+	s := newTestStore(pool, cs)
+	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
+	ctx := context.Background()
+
+	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
+	sig := ComputeWebhookSignature(s.bushaWebhookSecret, body)
+	if err := s.HandleDepositWebhook(ctx, body, sig); err != nil {
+		t.Fatalf("handle detected webhook with no event bus configured: %v", err)
 	}
 }
 

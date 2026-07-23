@@ -6,10 +6,10 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
+	"github.com/sirfi/payment-engine-v2/internal/session"
 )
 
 func main() {
@@ -41,24 +41,29 @@ func run() error {
 
 	log.Println("payment-engine-v2: db connected, migrations applied")
 
-	router, err := buildRouter(cfg, pool)
+	// Builds every module Store once, including wiring treasury's
+	// SetEventBus and session's RegisterEventHandlers — both must happen
+	// before bus.Run starts below (see appStores' doc comment).
+	stores, err := buildStores(cfg, pool)
 	if err != nil {
 		return err
 	}
 
-	// eventbus's dispatcher isn't started here yet — no module publishes
-	// real domain events to the outbox to dispatch. It'll start alongside
-	// the first module that does (Phase 5 onward).
+	router, err := buildRouter(cfg, stores)
+	if err != nil {
+		return err
+	}
 
-	rateStore := rate.New(pool, rate.Config{
-		CoinMarketCapAPIKey: cfg.RateEngine.CoinMarketCapAPIKey,
-		Busha:               rate.ProviderConfig(cfg.RateEngine.Busha),
-		LiquidRamp:          rate.ProviderConfig(cfg.RateEngine.LiquidRamp),
-		Anchor:              rate.ProviderConfig(cfg.RateEngine.Anchor),
-	})
-	corridorStore := corridor.New(pool)
-	fetchJob := rate.NewFetchJob(rateStore, corridorStore, cfg.RateEngine.FetchInterval)
+	// The eventbus dispatcher: first real Publish call sites are
+	// treasury's deposit-state transitions and session's CreateSession/
+	// event handlers (Phase 5).
+	go stores.bus.Run(ctx, cfg.EventbusPollInterval)
+
+	fetchJob := rate.NewFetchJob(stores.rate, stores.corridor, cfg.RateEngine.FetchInterval)
 	go fetchJob.Run(ctx)
+
+	ttlJob := session.NewTTLJob(stores.session, cfg.Session.TTLCheckInterval)
+	go ttlJob.Run(ctx)
 
 	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
 	return http.ListenAndServe(cfg.HTTPAddr, router)
