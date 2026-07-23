@@ -22,6 +22,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 	"github.com/sirfi/payment-engine-v2/internal/treasury/wallet"
 )
 
@@ -142,6 +143,19 @@ type Store struct {
 	tenantWebhooks          TenantWebhookLookup
 	tenantWebhookClient     *http.Client
 	tenantWebhookMaxRetries int
+
+	// bus publishes treasury.deposit_detected/treasury.deposit_confirmed
+	// (see recordDepositTransition in webhook.go) for Phase 5's session
+	// module to subscribe to. Optional, nil-safe — a Store with none set
+	// just skips publishing, same convention as tenantWebhooks above; every
+	// existing test constructs a Store without one and is unaffected.
+	bus *eventbus.Bus
+}
+
+// SetEventBus wires this Store to publish deposit-state-transition events.
+// Optional — nil-safe, see the bus field's doc comment.
+func (s *Store) SetEventBus(bus *eventbus.Bus) {
+	s.bus = bus
 }
 
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {

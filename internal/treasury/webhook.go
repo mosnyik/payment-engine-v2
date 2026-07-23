@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 )
 
 var (
@@ -100,6 +102,11 @@ func (s *Store) HandleDepositWebhook(ctx context.Context, body []byte, signature
 // A "confirmed" call with no prior "detected" row lands directly as
 // confirmed (see HandleDepositWebhook's doc comment) — one state machine,
 // two writers.
+//
+// Runs in one transaction so a real state transition and the
+// treasury.deposit_detected/confirmed event describing it (published only
+// when this call actually changed something, never on a redelivered
+// duplicate) are atomic — Phase 5's session module is the consumer.
 func (s *Store) recordDepositTransition(ctx context.Context, reservationID uuid.UUID, status string, amount decimal.Decimal, txReference string, rawPayload []byte) error {
 	var detectedAt, confirmedAt *time.Time
 	now := time.Now()
@@ -109,25 +116,55 @@ func (s *Store) recordDepositTransition(ctx context.Context, reservationID uuid.
 		detectedAt = &now
 	}
 
-	inserted, err := s.insertDepositIfAbsent(ctx, reservationID, status, amount, txReference, detectedAt, confirmedAt, rawPayload)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("treasury: begin deposit transition: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
+	inserted, err := s.insertDepositIfAbsent(ctx, tx, reservationID, status, amount, txReference, detectedAt, confirmedAt, rawPayload)
 	if err != nil {
 		return err
 	}
-	if inserted || status != "confirmed" {
-		return nil
+
+	transitioned := inserted
+	if !inserted && status == "confirmed" {
+		// The row already existed (created by an earlier 'detected' write) and
+		// this call confirms it — compare-and-set, never a blind write.
+		tag, err := tx.Exec(ctx,
+			`UPDATE treasury_deposits SET status = 'confirmed', confirmed_at = $3, updated_at = now()
+			 WHERE reservation_id = $1 AND tx_reference = $2 AND status = 'detected'`,
+			reservationID, txReference, now,
+		)
+		if err != nil {
+			return fmt.Errorf("treasury: confirm deposit: %w", err)
+		}
+		transitioned = tag.RowsAffected() > 0
 	}
 
-	// The row already existed (created by an earlier 'detected' write) and
-	// this call confirms it — compare-and-set, never a blind write.
-	_, err = s.pool.Exec(ctx,
-		`UPDATE treasury_deposits SET status = 'confirmed', confirmed_at = $3, updated_at = now()
-		 WHERE reservation_id = $1 AND tx_reference = $2 AND status = 'detected'`,
-		reservationID, txReference, now,
-	)
-	if err != nil {
-		return fmt.Errorf("treasury: confirm deposit: %w", err)
+	if transitioned && s.bus != nil {
+		eventType := "treasury.deposit_detected"
+		if status == "confirmed" {
+			eventType = "treasury.deposit_confirmed"
+		}
+		payload, err := json.Marshal(map[string]string{
+			"tx_reference": txReference,
+			"amount":       amount.String(),
+		})
+		if err != nil {
+			return fmt.Errorf("treasury: marshal deposit event payload: %w", err)
+		}
+		if err := s.bus.Publish(ctx, tx, eventbus.Event{
+			EventType:     eventType,
+			AggregateType: "treasury_deposit",
+			AggregateID:   reservationID,
+			Payload:       payload,
+		}); err != nil {
+			return fmt.Errorf("treasury: publish deposit event: %w", err)
+		}
 	}
-	return nil
+
+	return tx.Commit(ctx)
 }
 
 func (s *Store) findReservationByProviderReference(ctx context.Context, providerReference, address string) (uuid.UUID, error) {
@@ -147,8 +184,8 @@ func (s *Store) findReservationByProviderReference(ctx context.Context, provider
 	return id, nil
 }
 
-func (s *Store) insertDepositIfAbsent(ctx context.Context, reservationID uuid.UUID, status string, amount decimal.Decimal, txReference string, detectedAt, confirmedAt *time.Time, rawPayload []byte) (bool, error) {
-	tag, err := s.pool.Exec(ctx,
+func (s *Store) insertDepositIfAbsent(ctx context.Context, tx pgx.Tx, reservationID uuid.UUID, status string, amount decimal.Decimal, txReference string, detectedAt, confirmedAt *time.Time, rawPayload []byte) (bool, error) {
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO treasury_deposits
 		   (reservation_id, status, crypto_asset, amount, tx_reference, provider_payload, detected_at, confirmed_at)
 		 SELECT $1, $2, r.crypto_asset, $3, $4, $5, $6, $7
