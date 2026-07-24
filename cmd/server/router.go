@@ -33,8 +33,15 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.Get("/sessions/{sessionID}", sh.getSession)
 
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session}
+	sth := &settlementHandlers{settlement: stores.settlement}
 
 	r.Post("/admin/login", h.login)
+
+	// Self-verified via settlement.VerifyWebhookSignature, not the tenant
+	// gateway's HMAC or adminauth — same unauthenticated tier as
+	// /admin/login, since a settlement provider is neither a tenant nor an
+	// admin.
+	r.Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
 
 	r.Route("/admin", func(admin chi.Router) {
 		admin.Use(adminauth.Middleware(stores.admin))
@@ -47,6 +54,9 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)
+		admin.Get("/settlements", sth.listSettlements)
+		admin.Post("/settlements/{settlementID}/retry", sth.retrySettlement)
+		admin.Post("/settlements/reversals/{reversalID}/resolve", sth.resolveReversal)
 	})
 
 	// Every route above lives under /v2 — the whole app is versioned at

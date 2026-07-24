@@ -10,6 +10,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 	"github.com/sirfi/payment-engine-v2/internal/session"
+	"github.com/sirfi/payment-engine-v2/internal/settlement"
 )
 
 func main() {
@@ -64,6 +65,16 @@ func run() error {
 
 	ttlJob := session.NewTTLJob(stores.session, cfg.Session.TTLCheckInterval)
 	go ttlJob.Run(ctx)
+
+	// settlement's ledger-claim-then-dispatch pipeline (Phase 6) — fired by
+	// session.deposit_confirmed, picked up here rather than inline in that
+	// event's handler since ledger.Post can never run inside an
+	// eventbus.Handler's transaction (see internal/settlement's package doc).
+	dispatchWorker := settlement.NewDispatchWorker(stores.settlement, cfg.Settlement.DispatchPollInterval)
+	go dispatchWorker.Run(ctx)
+
+	timeoutJob := settlement.NewTimeoutJob(stores.settlement, cfg.Settlement.TimeoutCheckPollInterval)
+	go timeoutJob.Run(ctx)
 
 	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
 	return http.ListenAndServe(cfg.HTTPAddr, router)

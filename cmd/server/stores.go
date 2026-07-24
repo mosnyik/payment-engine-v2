@@ -7,12 +7,14 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/compliance"
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
+	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 	"github.com/sirfi/payment-engine-v2/internal/session"
+	"github.com/sirfi/payment-engine-v2/internal/settlement"
 	"github.com/sirfi/payment-engine-v2/internal/tenant"
 	"github.com/sirfi/payment-engine-v2/internal/treasury"
 )
@@ -32,6 +34,8 @@ type appStores struct {
 	rate       *rate.Store
 	treasury   *treasury.Store
 	session    *session.Store
+	ledger     *ledger.Ledger
+	settlement *settlement.Store
 	bus        *eventbus.Bus
 }
 
@@ -89,6 +93,17 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	sessionStore := session.New(pool, corridorStore, complianceStore, rateStore, treasuryStore, tenantStore, bus)
 	sessionStore.RegisterEventHandlers()
 
+	ledgerStore := ledger.New(pool)
+	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, tenantStore, settlement.Config{
+		CNGN:        settlement.SettlementProviderConfig(cfg.Settlement.CNGN),
+		Flutterwave: settlement.SettlementProviderConfig(cfg.Settlement.Flutterwave),
+		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),
+		Monnify:     settlement.SettlementProviderConfig(cfg.Settlement.Monnify),
+		HydrogenPay: settlement.SettlementProviderConfig(cfg.Settlement.HydrogenPay),
+	})
+	settlementStore.SetEventBus(bus)
+	settlementStore.RegisterEventHandlers()
+
 	return &appStores{
 		tenant:     tenantStore,
 		compliance: complianceStore,
@@ -97,6 +112,8 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		rate:       rateStore,
 		treasury:   treasuryStore,
 		session:    sessionStore,
+		ledger:     ledgerStore,
+		settlement: settlementStore,
 		bus:        bus,
 	}, nil
 }
