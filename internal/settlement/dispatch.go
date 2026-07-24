@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -299,11 +300,15 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 		return fmt.Errorf("settlement: claim settlement_payout: %w", err)
 	}
 
+	attemptPayload := st.PendingDestination
+	if attemptPayload == nil {
+		attemptPayload = json.RawMessage("{}")
+	}
 	var attemptID uuid.UUID
 	if err := s.pool.QueryRow(ctx,
-		`INSERT INTO settlement_attempts (settlement_id, attempt_number, provider_name, idempotency_key)
-		 VALUES ($1, $2, $3, $4) RETURNING id`,
-		st.ID, attemptNumber, provider.Name(), idempotencyKey,
+		`INSERT INTO settlement_attempts (settlement_id, attempt_number, provider_name, idempotency_key, provider_payload)
+		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		st.ID, attemptNumber, provider.Name(), idempotencyKey, attemptPayload,
 	).Scan(&attemptID); err != nil {
 		return fmt.Errorf("settlement: insert attempt: %w", err)
 	}
@@ -320,13 +325,19 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 		AttemptIdempotencyKey: idempotencyKey,
 		FiatCurrency:          st.FiatCurrency,
 		Amount:                st.TenantPayableAmount,
-		// Destination: no tenant-level payout-destination schema exists yet
-		// — nil until ops supplies one via RetryPayout's corrected-details
-		// path, or a future tenant-config field feeds it in here.
-		Destination: nil,
+		// Destination: whatever ops supplied via RetryPayout's
+		// corrected-details path, if this is a retry — nil on a first
+		// attempt (no tenant-level payout-destination schema exists yet).
+		Destination: st.PendingDestination,
 	})
 	if err != nil {
 		return fmt.Errorf("settlement: dispatch to %q: %w", provider.Name(), err)
+	}
+	if st.PendingDestination != nil {
+		if _, err := s.pool.Exec(ctx, `UPDATE settlements SET pending_destination = NULL WHERE id = $1`, st.ID); err != nil {
+			return fmt.Errorf("settlement: clear pending destination: %w", err)
+		}
+		st.PendingDestination = nil
 	}
 
 	attempt := &settlementAttempt{ID: attemptID, SettlementID: st.ID, AttemptNumber: attemptNumber, ProviderName: provider.Name(), Status: "dispatched"}

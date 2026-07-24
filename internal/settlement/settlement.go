@@ -14,6 +14,7 @@ package settlement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -54,10 +55,7 @@ const (
 	RetryBackoff         = 60 * time.Second
 )
 
-var (
-	ErrNotFound          = errors.New("settlement: not found")
-	ErrNoProviderAvailable = errors.New("settlement: no active, enabled settlement provider available for this corridor")
-)
+var ErrNotFound = errors.New("settlement: not found")
 
 // Settlement is one session's settlement lifecycle record.
 type Settlement struct {
@@ -75,8 +73,12 @@ type Settlement struct {
 	AttemptCount           int
 	ConfirmationDeadlineAt *time.Time
 	OpsPagedAt             *time.Time
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
+	// PendingDestination is an ops-supplied corrected payout-destination
+	// payload set by RetryPayout, consumed and cleared by the next dispatch
+	// attempt (dispatch.go).
+	PendingDestination json.RawMessage
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // FeeResolver is the one tenant-module capability settlement needs — a
@@ -146,7 +148,7 @@ func (s *Store) SetEventBus(bus *eventbus.Bus) {
 
 const settlementColumns = `id, session_id, tenant_id, corridor_id, status, crypto_asset, crypto_amount,
 	fiat_currency, fiat_value, fee_amount, tenant_payable_amount, attempt_count,
-	confirmation_deadline_at, ops_paged_at, created_at, updated_at`
+	confirmation_deadline_at, ops_paged_at, pending_destination, created_at, updated_at`
 
 func scanSettlement(row pgx.Row) (*Settlement, error) {
 	var st Settlement
@@ -154,7 +156,7 @@ func scanSettlement(row pgx.Row) (*Settlement, error) {
 	err := row.Scan(
 		&st.ID, &st.SessionID, &st.TenantID, &st.CorridorID, &status, &st.CryptoAsset, &st.CryptoAmount,
 		&st.FiatCurrency, &st.FiatValue, &st.FeeAmount, &st.TenantPayableAmount, &st.AttemptCount,
-		&st.ConfirmationDeadlineAt, &st.OpsPagedAt, &st.CreatedAt, &st.UpdatedAt,
+		&st.ConfirmationDeadlineAt, &st.OpsPagedAt, &st.PendingDestination, &st.CreatedAt, &st.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

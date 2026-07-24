@@ -11,15 +11,26 @@ CREATE TABLE settlements (
     status                   TEXT NOT NULL DEFAULT 'pending_dispatch' CHECK (status IN (
         'pending_dispatch','dispatching','settling','settled',
         'settlement_failed','reversed','reversal_resolved')),
-    crypto_asset             TEXT,
-    crypto_amount            NUMERIC(36,18),
-    fiat_currency            TEXT,
-    fiat_value               NUMERIC(36,18),
-    fee_amount               NUMERIC(36,18),
-    tenant_payable_amount    NUMERIC(36,18),
+    -- crypto_asset/fiat_currency are known (from the session) at insert
+    -- time; the amount columns default to 0 until DispatchWorker computes
+    -- them from the actual confirmed deposit + rate lock + fee (dispatch.go)
+    -- — kept NOT NULL throughout rather than nullable so every reader
+    -- (ListSettlements included) can scan a freshly-inserted pending_dispatch
+    -- row without special-casing NULL.
+    crypto_asset             TEXT NOT NULL,
+    crypto_amount            NUMERIC(36,18) NOT NULL DEFAULT 0,
+    fiat_currency            TEXT NOT NULL,
+    fiat_value               NUMERIC(36,18) NOT NULL DEFAULT 0,
+    fee_amount               NUMERIC(36,18) NOT NULL DEFAULT 0,
+    tenant_payable_amount    NUMERIC(36,18) NOT NULL DEFAULT 0,
     attempt_count            INT NOT NULL DEFAULT 0,
     confirmation_deadline_at TIMESTAMPTZ,
     ops_paged_at             TIMESTAMPTZ,
+    -- Set by an ops-triggered retry (RetryPayout) supplying corrected bank
+    -- details; consumed and cleared by the next dispatch attempt. NULL
+    -- means "use whatever the previous attempt used" (opaque either way —
+    -- no tenant-level payout-destination schema exists yet).
+    pending_destination      JSONB,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
