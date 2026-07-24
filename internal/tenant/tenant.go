@@ -235,6 +235,31 @@ func (s *Store) CheckEntitlement(ctx context.Context, tenantID, corridorID uuid.
 	return active, nil
 }
 
+// EffectiveFeeBps resolves the fee (in basis points) settlement should apply
+// for a tenant on a corridor: the corridor entitlement's fee_bps_override if
+// set, else the tenant's flat FeeBps. Requires an entitlement row to exist
+// (i.e. CheckEntitlement must already have passed) — a tenant with no
+// entitlement on this corridor has nothing to fall back to but its own
+// FeeBps, so this deliberately doesn't try to guess a default from a
+// missing row the way CheckEntitlement's "no row = false" does.
+func (s *Store) EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error) {
+	var feeBps int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(e.fee_bps_override, t.fee_bps)
+		 FROM tenants t
+		 JOIN tenant_corridor_entitlements e ON e.tenant_id = t.id AND e.corridor_id = $2
+		 WHERE t.id = $1`,
+		tenantID, corridorID,
+	).Scan(&feeBps)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("tenant: effective fee bps: %w", ErrNotFound)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("tenant: effective fee bps: %w", err)
+	}
+	return feeBps, nil
+}
+
 // SetWebhookURL validates and stores a tenant's outbound webhook endpoint.
 // Validates at registration time; callers that actually deliver to this
 // URL (e.g. treasury's tenant-notification sender) re-validate again

@@ -50,6 +50,7 @@ type Config struct {
 	RateEngine RateEngineConfig
 	Treasury   TreasuryConfig
 	Session    SessionConfig
+	Settlement SettlementConfig
 }
 
 // SessionConfig is Phase 5's session module's operational tuning. The
@@ -119,6 +120,39 @@ type TreasuryConfig struct {
 	// delivery log.
 	TenantWebhookTimeout    time.Duration // default 10s
 	TenantWebhookMaxRetries int           // default 3
+}
+
+// SettlementProviderConfig configures one external fiat-payout adapter (see
+// internal/settlement) — structurally identical to CollectionProviderConfig
+// today, but kept as its own type since it's a different credential surface
+// (a settlement partner's payout API, not treasury's collection API), same
+// reasoning CollectionProviderConfig's doc comment gives for not reusing
+// RateProviderConfig. Default disabled: no real endpoint or webhook
+// signature scheme is wired in yet for any of these.
+type SettlementProviderConfig struct {
+	Enabled       bool
+	APIURL        string
+	APIKey        string
+	WebhookSecret string
+}
+
+// SettlementConfig is settlement's operational tuning — see
+// internal/settlement and ARCHITECTURE.md §8. No settlement partner is
+// integrated yet; CNGN/Flutterwave/Paystack/Monnify/HydrogenPay are the
+// named candidates the business is evaluating, each a disabled-by-default
+// TODO-stub adapter until a real one is chosen. The retry policy's numbers
+// (3-attempt cap, 10-minute confirmation timeout, ~60s backoff) are fixed
+// design constants in internal/settlement, not configured here — only how
+// often the two background jobs poll is an ops knob.
+type SettlementConfig struct {
+	CNGN        SettlementProviderConfig
+	Flutterwave SettlementProviderConfig
+	Paystack    SettlementProviderConfig
+	Monnify     SettlementProviderConfig
+	HydrogenPay SettlementProviderConfig
+
+	DispatchPollInterval     time.Duration // default 3s — settlement must be near-real-time
+	TimeoutCheckPollInterval time.Duration // default 60s
 }
 
 // ChainConfig configures one self-custody chain watcher/broadcaster. APIURL
@@ -263,6 +297,16 @@ func Load(source Source) (*Config, error) {
 		TenantWebhookMaxRetries: intOrDefault(source, "TENANT_WEBHOOK_MAX_RETRIES", 3, &errs),
 	}
 
+	settlement := SettlementConfig{
+		CNGN:                     loadSettlementProviderConfig(source, "CNGN_SETTLEMENT"),
+		Flutterwave:              loadSettlementProviderConfig(source, "FLUTTERWAVE_SETTLEMENT"),
+		Paystack:                 loadSettlementProviderConfig(source, "PAYSTACK_SETTLEMENT"),
+		Monnify:                  loadSettlementProviderConfig(source, "MONNIFY_SETTLEMENT"),
+		HydrogenPay:              loadSettlementProviderConfig(source, "HYDROGENPAY_SETTLEMENT"),
+		DispatchPollInterval:     durationOrDefault(source, "SETTLEMENT_DISPATCH_POLL_INTERVAL", 3*time.Second, &errs),
+		TimeoutCheckPollInterval: durationOrDefault(source, "SETTLEMENT_TIMEOUT_CHECK_POLL_INTERVAL", 60*time.Second, &errs),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -279,6 +323,7 @@ func Load(source Source) (*Config, error) {
 		RateEngine:                rateEngine,
 		Treasury:                  treasury,
 		Session:                   session,
+		Settlement:                settlement,
 	}, nil
 }
 
@@ -314,6 +359,19 @@ func loadRateProviderConfig(source Source, prefix string) RateProviderConfig {
 // real endpoint/webhook scheme wired in yet.
 func loadCollectionProviderConfig(source Source, prefix string) CollectionProviderConfig {
 	return CollectionProviderConfig{
+		Enabled:       boolOrDefault(source, prefix+"_ENABLED", false),
+		APIURL:        stringOrDefault(source, prefix+"_API_URL", ""),
+		APIKey:        stringOrDefault(source, prefix+"_API_KEY", ""),
+		WebhookSecret: stringOrDefault(source, prefix+"_WEBHOOK_SECRET", ""),
+	}
+}
+
+// loadSettlementProviderConfig reads an optional, disabled-by-default
+// external settlement (fiat payout) provider's settings — same
+// malformed-value-defaults-safely reasoning as loadCollectionProviderConfig,
+// since none of these have a real endpoint/webhook scheme wired in yet.
+func loadSettlementProviderConfig(source Source, prefix string) SettlementProviderConfig {
+	return SettlementProviderConfig{
 		Enabled:       boolOrDefault(source, prefix+"_ENABLED", false),
 		APIURL:        stringOrDefault(source, prefix+"_API_URL", ""),
 		APIKey:        stringOrDefault(source, prefix+"_API_KEY", ""),

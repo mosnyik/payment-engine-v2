@@ -310,6 +310,43 @@ func (s *Store) RecordCustodyBalance(ctx context.Context, providerName, cryptoAs
 	return nil
 }
 
+// GetConfirmedDepositTotal sums every confirmed deposit against a
+// reservation, regardless of sweep state — unlike getSweepableDeposits
+// (sweep.go), which excludes already-swept deposits. Settlement fires
+// independently of sweep timing (ARCHITECTURE.md §8 rule 2: "sweep is not a
+// session status") and must see the full confirmed amount even if the
+// watcher already swept it inline.
+func (s *Store) GetConfirmedDepositTotal(ctx context.Context, reservationID uuid.UUID) (decimal.Decimal, error) {
+	var total decimal.Decimal
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount), 0) FROM treasury_deposits
+		 WHERE reservation_id = $1 AND status = 'confirmed'`,
+		reservationID,
+	).Scan(&total)
+	if err != nil {
+		return decimal.Decimal{}, fmt.Errorf("treasury: get confirmed deposit total: %w", err)
+	}
+	return total, nil
+}
+
+// ReleaseReservation marks a reservation released (CAS 'reserved'->'released'),
+// freeing the address for reuse — ARCHITECTURE.md §8 rule 5: only at a
+// terminal state (settled, or settlement_failed with retries exhausted, for
+// settlement's callers). A reservation not currently 'reserved' (already
+// released, or never existed) is not an error — same redelivery-safe
+// convention every CAS transition in this codebase follows.
+func (s *Store) ReleaseReservation(ctx context.Context, reservationID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE treasury_address_reservations SET status = 'released', released_at = now()
+		 WHERE id = $1 AND status = 'reserved'`,
+		reservationID,
+	)
+	if err != nil {
+		return fmt.Errorf("treasury: release reservation: %w", err)
+	}
+	return nil
+}
+
 // GetCustodyBalance returns the latest recorded balance for a
 // provider/asset pair.
 func (s *Store) GetCustodyBalance(ctx context.Context, providerName, cryptoAsset string) (*CustodyBalance, error) {
