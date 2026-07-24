@@ -60,6 +60,11 @@ type SettlementProvider interface {
 	Name() string
 	IsEnabled() bool
 	Dispatch(ctx context.Context, req PayoutRequest) (PayoutResult, error)
+	// webhookSecret returns the secret this provider's inbound webhook
+	// signature is verified against (webhook.go). Unexported: only
+	// meaningful within this package, same discipline other
+	// implementation-detail interface methods here follow.
+	webhookSecret() string
 }
 
 // SettlementProviderConfig configures one external settlement adapter.
@@ -97,8 +102,9 @@ type httpSettlementProvider struct {
 	parseResponse func(body []byte) (PayoutResult, error)
 }
 
-func (p *httpSettlementProvider) Name() string    { return p.name }
-func (p *httpSettlementProvider) IsEnabled() bool { return p.cfg.Enabled }
+func (p *httpSettlementProvider) Name() string          { return p.name }
+func (p *httpSettlementProvider) IsEnabled() bool       { return p.cfg.Enabled }
+func (p *httpSettlementProvider) webhookSecret() string { return p.cfg.WebhookSecret }
 
 func (p *httpSettlementProvider) Dispatch(ctx context.Context, req PayoutRequest) (PayoutResult, error) {
 	httpReq, err := p.buildRequest(p.cfg, req)
