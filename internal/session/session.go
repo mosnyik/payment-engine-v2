@@ -332,3 +332,67 @@ func (s *Store) ResolveComplianceHold(ctx context.Context, sessionID, adminID uu
 	}
 	return s.transitionToPending(ctx, sessionID, sess.TenantID, corr, StatusComplianceHold)
 }
+
+// casTransition is the shared shape for a plain state transition that
+// touches only status/updated_at and never publishes an event — unlike
+// transitionToPending's session.created publish, every settlement-side
+// transition below is driven by the settlement module, which owns
+// publishing its own events per ARCHITECTURE.md §5's module map.
+func (s *Store) casTransition(ctx context.Context, id uuid.UUID, from, to Status, label string) (*Session, error) {
+	row := s.pool.QueryRow(ctx,
+		`UPDATE sessions SET status = $3, updated_at = now()
+		 WHERE id = $1 AND status = $2
+		 RETURNING `+sessionColumns,
+		id, string(from), string(to),
+	)
+	sess, err := scanSession(row)
+	if err != nil {
+		return nil, fmt.Errorf("session: transition to %s: %w", label, err)
+	}
+	return sess, nil
+}
+
+// The settlement-side CAS transitions (ARCHITECTURE.md §8) — called by
+// internal/settlement, never internally triggered here, since session has
+// no visibility into ledger claims or provider dispatch outcomes.
+
+// TransitionToSettling moves deposit_confirmed -> settling, called once the
+// settlement dispatch worker has successfully claimed the settlement_payout
+// ledger idempotency key (the fan-out point after deposit_confirmed).
+func (s *Store) TransitionToSettling(ctx context.Context, id uuid.UUID) (*Session, error) {
+	return s.casTransition(ctx, id, StatusDepositConfirmed, StatusSettling, "settling")
+}
+
+// RetryToSettling re-enters settling for an ops-triggered retry — either
+// from settlement_failed (auto-retry cap exhausted) or from a still-settling
+// row an ops analyst has confirmed genuinely failed (bucket 3, §8). Both
+// share one retry policy, so from is parameterized rather than split into
+// two near-identical methods.
+func (s *Store) RetryToSettling(ctx context.Context, id uuid.UUID, from Status) (*Session, error) {
+	return s.casTransition(ctx, id, from, StatusSettling, "retry to settling")
+}
+
+// TransitionToSettled moves settling -> settled: the provider's
+// signature-verified success webhook has landed (§8 rule 4).
+func (s *Store) TransitionToSettled(ctx context.Context, id uuid.UUID) (*Session, error) {
+	return s.casTransition(ctx, id, StatusSettling, StatusSettled, "settled")
+}
+
+// TransitionToSettlementFailed moves settling -> settlement_failed: bucket 4
+// (terminal rejection) hit immediately, or buckets 1/2's 3-attempt auto-retry
+// cap exhausted.
+func (s *Store) TransitionToSettlementFailed(ctx context.Context, id uuid.UUID) (*Session, error) {
+	return s.casTransition(ctx, id, StatusSettling, StatusSettlementFailed, "settlement_failed")
+}
+
+// TransitionToReversed moves settled -> reversed: a provider/bank return
+// arrived after an initial success (rare, §8).
+func (s *Store) TransitionToReversed(ctx context.Context, id uuid.UUID) (*Session, error) {
+	return s.casTransition(ctx, id, StatusSettled, StatusReversed, "reversed")
+}
+
+// TransitionToReversalResolved moves reversed -> reversal_resolved: ops
+// closed the reversal case outside the automated settlement pipeline.
+func (s *Store) TransitionToReversalResolved(ctx context.Context, id uuid.UUID) (*Session, error) {
+	return s.casTransition(ctx, id, StatusReversed, StatusReversalResolved, "reversal_resolved")
+}
