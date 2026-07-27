@@ -35,6 +35,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session}
 	sth := &settlementHandlers{settlement: stores.settlement}
 	th := &treasuryHandlers{treasury: stores.treasury}
+	nh := &notificationHandlers{notification: stores.notification}
 
 	r.Post("/admin/login", h.login)
 
@@ -65,6 +66,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Get("/settlements", sth.listSettlements)
 		admin.Post("/settlements/{settlementID}/retry", sth.retrySettlement)
 		admin.Post("/settlements/reversals/{reversalID}/resolve", sth.resolveReversal)
+		admin.Get("/notifications/deliveries", nh.listDeliveries)
+		admin.Post("/notifications/deliveries/{deliveryID}/retry", nh.retryDelivery)
 	})
 
 	// Every route above lives under /v2 — the whole app is versioned at

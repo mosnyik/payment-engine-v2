@@ -8,6 +8,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/compliance"
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
+	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
@@ -27,16 +28,17 @@ import (
 // HTTP-facing session-creation path and the started dispatcher must be the
 // same objects, not independent copies.
 type appStores struct {
-	tenant     *tenant.Store
-	compliance *compliance.Store
-	admin      *adminauth.Store
-	corridor   *corridor.Store
-	rate       *rate.Store
-	treasury   *treasury.Store
-	session    *session.Store
-	ledger     *ledger.Ledger
-	settlement *settlement.Store
-	bus        *eventbus.Bus
+	tenant       *tenant.Store
+	compliance   *compliance.Store
+	admin        *adminauth.Store
+	corridor     *corridor.Store
+	rate         *rate.Store
+	treasury     *treasury.Store
+	session      *session.Store
+	ledger       *ledger.Ledger
+	settlement   *settlement.Store
+	notification *notification.Store
+	bus          *eventbus.Bus
 }
 
 func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
@@ -89,6 +91,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	// subscribers happens here, at construction time.
 	bus := eventbus.New(pool, cfg.EventbusBatchSize)
 	treasuryStore.SetEventBus(bus)
+	complianceStore.SetEventBus(bus)
 
 	sessionStore := session.New(pool, corridorStore, complianceStore, rateStore, treasuryStore, tenantStore, bus)
 	sessionStore.RegisterEventHandlers()
@@ -104,16 +107,24 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	settlementStore.SetEventBus(bus)
 	settlementStore.RegisterEventHandlers()
 
+	notificationStore := notification.New(pool, tenantStore, notification.Config{
+		OpsAlertEmail: cfg.Notification.OpsAlertEmail,
+		Email:         notification.EmailProviderConfig(cfg.Notification.Email),
+	})
+	notificationStore.SetEventBus(bus)
+	notificationStore.RegisterEventHandlers()
+
 	return &appStores{
-		tenant:     tenantStore,
-		compliance: complianceStore,
-		admin:      adminStore,
-		corridor:   corridorStore,
-		rate:       rateStore,
-		treasury:   treasuryStore,
-		session:    sessionStore,
-		ledger:     ledgerStore,
-		settlement: settlementStore,
-		bus:        bus,
+		tenant:       tenantStore,
+		compliance:   complianceStore,
+		admin:        adminStore,
+		corridor:     corridorStore,
+		rate:         rateStore,
+		treasury:     treasuryStore,
+		session:      sessionStore,
+		ledger:       ledgerStore,
+		settlement:   settlementStore,
+		notification: notificationStore,
+		bus:          bus,
 	}, nil
 }

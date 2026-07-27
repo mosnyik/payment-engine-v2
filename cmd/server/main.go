@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
@@ -75,6 +76,12 @@ func run() error {
 
 	timeoutJob := settlement.NewTimeoutJob(stores.settlement, cfg.Settlement.TimeoutCheckPollInterval)
 	go timeoutJob.Run(ctx)
+
+	// notification's delivery sender (Phase 7) — same "eventbus handler
+	// claims a local row, this ticker-driven worker does the real network
+	// call" split settlement's DispatchWorker already establishes.
+	notificationDispatchWorker := notification.NewDispatchWorker(stores.notification, cfg.Notification.DispatchPollInterval)
+	go notificationDispatchWorker.Run(ctx)
 
 	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
 	return http.ListenAndServe(cfg.HTTPAddr, router)
