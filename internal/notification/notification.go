@@ -93,15 +93,23 @@ type TenantWebhookLookup interface {
 	WebhookConfig(ctx context.Context, tenantID uuid.UUID) (webhookURL, signingSecret string, ok bool, err error)
 }
 
-// EmailProviderConfig configures the one internal ops-alert email adapter —
-// a TODO-stub, disabled by default, same status as
-// settlement.SettlementProviderConfig's five adapters. Structurally
-// identical to config.EmailProviderConfig (cmd/server converts between them
-// the same way it does for settlement's provider configs).
+// EmailProviderConfig configures the internal ops-alert email adapter.
+// Structurally identical to config.EmailProviderConfig (cmd/server converts
+// between them the same way it does for settlement's provider configs).
+// Disabled by default — Provider selects which vendor adapter New builds
+// (see providers.go's newEmailProvider); an empty/unrecognized value falls
+// back to a stub that reports itself disabled, so a misconfigured
+// deployment fails safe (deliveries dead-letter immediately, ops can see
+// why) rather than panicking at startup.
 type EmailProviderConfig struct {
 	Enabled bool
-	APIURL  string
-	APIKey  string
+	// Provider selects the vendor adapter — "resend" today, more can be
+	// added to providers.go's newEmailProvider without touching anything
+	// else in this package.
+	Provider    string
+	APIURL      string // optional override; each adapter has its own real default
+	APIKey      string
+	FromAddress string
 }
 
 // Config is what main.go builds from *config.Config to construct a Store —
@@ -130,7 +138,7 @@ func New(pool *db.Pool, tenantStore TenantWebhookLookup, cfg Config) *Store {
 		pool:          pool,
 		tenantStore:   tenantStore,
 		cfg:           cfg,
-		emailProvider: newStubEmailProvider(cfg.Email),
+		emailProvider: newEmailProvider(cfg.Email),
 		httpClient:    &http.Client{Timeout: 8 * time.Second},
 	}
 }

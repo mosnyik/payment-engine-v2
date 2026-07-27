@@ -156,15 +156,17 @@ type SettlementConfig struct {
 	TimeoutCheckPollInterval time.Duration // default 60s
 }
 
-// EmailProviderConfig configures the one internal ops-alert email adapter
-// (see internal/notification) — a TODO-stub, same "disabled by default, no
-// real endpoint wired in yet" status as SettlementProviderConfig's five
-// adapters. No WebhookSecret field: unlike the collection/settlement
-// partners, this is outbound-only, nothing calls back into this system.
+// EmailProviderConfig configures the internal ops-alert email adapter (see
+// internal/notification) — disabled by default. Provider selects the
+// vendor adapter ("resend" today); unlike the collection/settlement
+// partners there's no WebhookSecret field, since this is outbound-only,
+// nothing calls back into this system.
 type EmailProviderConfig struct {
-	Enabled bool
-	APIURL  string
-	APIKey  string
+	Enabled     bool
+	Provider    string
+	APIURL      string
+	APIKey      string
+	FromAddress string
 }
 
 // NotificationConfig is Phase 7's operational tuning — see internal/notification
@@ -413,9 +415,11 @@ func loadSettlementProviderConfig(source Source, prefix string) SettlementProvid
 
 func loadEmailProviderConfig(source Source, prefix string) EmailProviderConfig {
 	return EmailProviderConfig{
-		Enabled: boolOrDefault(source, prefix+"_ENABLED", false),
-		APIURL:  stringOrDefault(source, prefix+"_API_URL", ""),
-		APIKey:  stringOrDefault(source, prefix+"_API_KEY", ""),
+		Enabled:     boolOrDefault(source, prefix+"_ENABLED", false),
+		Provider:    stringOrDefault(source, prefix+"_PROVIDER", ""),
+		APIURL:      stringOrDefault(source, prefix+"_API_URL", ""),
+		APIKey:      stringOrDefault(source, prefix+"_API_KEY", ""),
+		FromAddress: stringOrDefault(source, prefix+"_FROM_ADDRESS", ""),
 	}
 }
 
