@@ -34,6 +34,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session}
 	sth := &settlementHandlers{settlement: stores.settlement}
+	th := &treasuryHandlers{treasury: stores.treasury}
 
 	r.Post("/admin/login", h.login)
 
@@ -42,6 +43,13 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// /admin/login, since a settlement provider is neither a tenant nor an
 	// admin.
 	r.Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
+
+	// Same unauthenticated, self-verified tier as the settlement webhook
+	// above — self-custody deposit detection already runs via watcher
+	// polling (treasury/watcher.go), so this is only Busha's partner-
+	// custodied callback path today, hence the static "busha" segment
+	// rather than settlement's {providerName}.
+	r.Post("/webhooks/treasury/busha", th.handleDepositWebhook)
 
 	r.Route("/admin", func(admin chi.Router) {
 		admin.Use(adminauth.Middleware(stores.admin))
