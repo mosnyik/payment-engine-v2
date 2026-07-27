@@ -100,9 +100,20 @@ Grounding this phase in the actual code surfaced two facts that shaped the build
 
 *Still deferred, not fixed: the cross-package eventbus race surfaced while debugging `settlement`'s own test flakiness (`go test ./...` runs each package as a separate process; several independently register only a subset of handlers against the same live `outbox_events` table, so one process's poller can silently "consume" an event meant for another's handler). Never happens in production (`cmd/server` is the only process, with every handler registered) — deliberately left for later rather than fixed as a drive-by.*
 
-## Phase 7 — Notification
+## Phase 7 — Notification ✅ complete
 
-Webhook delivery (signed, retried, dead-lettered) + email, subscribing to session/settlement events. Last — nothing depends on it, it only depends on events existing.
+Grounding this phase in the actual code (not `ARCHITECTURE.md`'s aspirational module map) surfaced two real gaps closed as part of the build, not assumed away: `internal/compliance` had zero eventbus wiring at all (the module map claims it publishes `compliance.hold_created`; it never did), and every settlement event plus session's own two deposit events carried only `session_id`/`reservation_id` in their payload — never `tenant_id`, which this module needs to resolve a delivery destination without depending on `session.Store`/`settlement.Store`.
+
+- ✅ **`tenant_id` backfilled into every event this phase consumes** — `internal/session/events.go`'s `transitionByReservation` (shared by `session.deposit_detected`/`session.deposit_confirmed`) and `internal/settlement/webhook.go`'s `transitionSettlementAndPublish` (shared by all four settlement events) now include it; `session.created` already had it. This is what keeps `notification`'s only real dependency `tenant.Store` — never `session`/`settlement` directly, a clean "terminal consumer" module boundary matching `ARCHITECTURE.md` §5.
+- ✅ **`compliance.hold_created` wired for real** — `compliance.Store` gained a nil-safe `bus`/`SetEventBus` (same convention every other module's bus field uses) and now publishes it, in the same transaction as the case insert, whenever `ScreenTenant`/`ScreenSession` lands a case in the hold queue — never on approve/reject. Payload carries `tenant_id`/`case_type`/`reference_type`/`reference_id`.
+- ✅ **`internal/notification`** — the terminal consumer. `RegisterEventHandlers` subscribes individually to all 8 events (`eventbus.Subscribe` has no wildcard support); one shared handler resolves `tenant_id` straight from each event's payload and inserts a `notification_deliveries` row per applicable channel (`ON CONFLICT (aggregate_id, event_type, channel) DO NOTHING`, defensive against a redelivered underlying event). Channel routing is a compiled-in table, not ops-configurable, same convention as `session.SessionTTL`/`settlement.MaxAutoRetryAttempts`: every `session.*`/`settlement.*` event → the owning tenant's webhook (silent no-op if none configured); `settlement.failed`/`settlement.reversed`/`compliance.hold_created` → a single fixed ops-alert email address, never the tenant's.
+- ✅ **`DispatchWorker`** (`dispatch.go`) — same "eventbus handler claims a local row, a ticker-driven worker does the real network call" split `settlement.DispatchWorker` established, for the identical reason (`eventbus.Handler` must be a fast, local-DB-only write; an HTTP POST/SMTP call never can be). Webhook send re-fetches the tenant's *current* signing secret at send time (not snapshotted, unlike the destination URL — a rotated secret should apply to the very next retry) and HMAC-signs with the same scheme `treasury`/`settlement` already use for their own inbound webhooks, just outbound here (`internal/notification/webhook.go`'s own copy — this codebase already tolerates each package defining its own rather than sharing one). Fixed backoff schedule (30s, 2m, 10m, 1h, 6h — 5 attempts) before `dead_letter`, a compiled-in constant like `settlement.RetryBackoff`.
+- ✅ **Email is a TODO-stub adapter** (`providers.go`), disabled by default, same status as settlement's five named provider adapters — satisfies "webhook delivery... + email" literally without blocking on a real SMTP/SES decision. A disabled provider dead-letters its delivery immediately rather than working through the full backoff ladder first (a disabled provider fails identically every time — the static-config equivalent of settlement's bucket-4 "terminal, no retry").
+- ✅ **Ops surface** (`ops.go`, `cmd/server/notification_handlers.go`) — `GET /admin/notifications/deliveries?status=dead_letter`, `POST /admin/notifications/deliveries/{id}/retry` (resets `attempt_count` for a fresh run through the backoff schedule), both admin-auth-gated, same shape as settlement's ops routes.
+- Verified against a live Postgres: signed webhook delivery end-to-end against a real `httptest.Server` (signature independently recomputed and checked); a tenant with no webhook configured produces zero rows; a disabled email provider dead-letters on the first attempt; the full backoff-to-dead-letter progression (fast-forwarded deterministically in the DB rather than sleeping for real, since the real schedule spans hours); a redelivered underlying event produces exactly one row; `compliance.hold_created` routes to email only, never a tenant webhook; ops-triggered retry resets a dead-lettered row. Extended `internal/compliance`, `internal/session`, `internal/settlement`'s own tests to assert the new `tenant_id` payload field / `compliance.hold_created` publish behavior.
+- Found and fixed a real bug during this work, distinct from the already-known cross-package eventbus race: a test helper's `Cleanup()` cancelled its `bus.Run` goroutine's context but didn't wait for it to actually exit, so a dying goroutine from one test could still be polling the shared `outbox_events`/`notification_deliveries` tables when the next test's fresh one started, silently misattributing deliveries to the wrong test's fake tenant config. Fixed by blocking `Cleanup()` on a `done` channel the goroutine closes.
+
+*Deferred, not fixed (pre-existing, not introduced here): the cross-package eventbus race noted in Phase 6 — now also observable via `internal/notification`'s own tests when run alongside other packages, same mechanism, same "never happens in production" reasoning.*
 
 ## Phase 8 — Ops/observability *(parallel track, not a hard blocker)*
 
@@ -122,11 +133,11 @@ Phase 0 (foundation)
                  └─▶ Phase 3 (rate)
                  └─▶ Phase 4 (treasury: Busha first, then self-custody) ✅ complete
   
-                        └─▶ Phase 5 (session)
-                               └─▶ Phase 6 (settlement)
-                                      └─▶ Phase 7 (notification)
+                        └─▶ Phase 5 (session) ✅ complete
+                               └─▶ Phase 6 (settlement) ✅ complete
+                                      └─▶ Phase 7 (notification) ✅ complete
 
-Phase 8 (ops/observability) — parallel to 5–7, not blocking
+Phase 8 (ops/observability) — parallel to 5–7, not blocking, the only phase left
 ```
 
 ## Open items carried over from ARCHITECTURE.md
