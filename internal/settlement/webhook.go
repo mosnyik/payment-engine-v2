@@ -252,7 +252,13 @@ func (s *Store) transitionSettlementAndPublish(ctx context.Context, st *Settleme
 	}
 
 	if s.bus != nil {
-		payload, err := json.Marshal(map[string]string{"session_id": st.SessionID.String()})
+		// tenant_id lets notification (Phase 7) resolve a delivery
+		// destination straight from the payload, without depending on
+		// internal/settlement.
+		payload, err := json.Marshal(map[string]string{
+			"session_id": st.SessionID.String(),
+			"tenant_id":  st.TenantID.String(),
+		})
 		if err != nil {
 			return false, fmt.Errorf("settlement: marshal %s payload: %w", eventType, err)
 		}

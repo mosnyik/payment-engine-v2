@@ -45,13 +45,13 @@ func (s *Store) handleDepositConfirmed(ctx context.Context, tx pgx.Tx, e eventbu
 // eventbus.Handler's doc comment requires handlers be safe no-ops on
 // redelivery, not just idempotent writes.
 func (s *Store) transitionByReservation(ctx context.Context, tx pgx.Tx, reservationID uuid.UUID, from, to, eventType string) error {
-	var sessionID uuid.UUID
+	var sessionID, tenantID uuid.UUID
 	err := tx.QueryRow(ctx,
 		`UPDATE sessions SET status = $3, updated_at = now()
 		 WHERE deposit_reservation_id = $1 AND status = $2
-		 RETURNING id`,
+		 RETURNING id, tenant_id`,
 		reservationID, from, to,
-	).Scan(&sessionID)
+	).Scan(&sessionID, &tenantID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -62,7 +62,12 @@ func (s *Store) transitionByReservation(ctx context.Context, tx pgx.Tx, reservat
 	if s.bus == nil {
 		return nil
 	}
-	payload, err := json.Marshal(map[string]string{"reservation_id": reservationID.String()})
+	// tenant_id lets notification (Phase 7) resolve a delivery destination
+	// straight from the payload, without depending on internal/session.
+	payload, err := json.Marshal(map[string]string{
+		"reservation_id": reservationID.String(),
+		"tenant_id":      tenantID.String(),
+	})
 	if err != nil {
 		return fmt.Errorf("session: marshal %s payload: %w", eventType, err)
 	}
