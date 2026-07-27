@@ -47,10 +47,11 @@ type Config struct {
 
 	HTTPAddr string // default :3700
 
-	RateEngine RateEngineConfig
-	Treasury   TreasuryConfig
-	Session    SessionConfig
-	Settlement SettlementConfig
+	RateEngine   RateEngineConfig
+	Treasury     TreasuryConfig
+	Session      SessionConfig
+	Settlement   SettlementConfig
+	Notification NotificationConfig
 }
 
 // SessionConfig is Phase 5's session module's operational tuning. The
@@ -153,6 +154,30 @@ type SettlementConfig struct {
 
 	DispatchPollInterval     time.Duration // default 3s — settlement must be near-real-time
 	TimeoutCheckPollInterval time.Duration // default 60s
+}
+
+// EmailProviderConfig configures the one internal ops-alert email adapter
+// (see internal/notification) — a TODO-stub, same "disabled by default, no
+// real endpoint wired in yet" status as SettlementProviderConfig's five
+// adapters. No WebhookSecret field: unlike the collection/settlement
+// partners, this is outbound-only, nothing calls back into this system.
+type EmailProviderConfig struct {
+	Enabled bool
+	APIURL  string
+	APIKey  string
+}
+
+// NotificationConfig is Phase 7's operational tuning — see internal/notification
+// and ARCHITECTURE.md's module map. The retry backoff schedule (30s, 2m,
+// 10m, 1h, 6h before dead_letter) is a fixed design constant in
+// internal/notification, not configured here, same split
+// SettlementConfig's doc comment draws for its own retry policy. OpsAlertEmail
+// is a single fixed destination for the email channel (settlement.failed/
+// reversed, compliance.hold_created) — not a per-tenant concept.
+type NotificationConfig struct {
+	DispatchPollInterval time.Duration // default 15s
+	OpsAlertEmail        string
+	Email                EmailProviderConfig
 }
 
 // ChainConfig configures one self-custody chain watcher/broadcaster. APIURL
@@ -307,6 +332,12 @@ func Load(source Source) (*Config, error) {
 		TimeoutCheckPollInterval: durationOrDefault(source, "SETTLEMENT_TIMEOUT_CHECK_POLL_INTERVAL", 60*time.Second, &errs),
 	}
 
+	notification := NotificationConfig{
+		DispatchPollInterval: durationOrDefault(source, "NOTIFICATION_DISPATCH_POLL_INTERVAL", 15*time.Second, &errs),
+		OpsAlertEmail:        stringOrDefault(source, "NOTIFICATION_OPS_ALERT_EMAIL", ""),
+		Email:                loadEmailProviderConfig(source, "NOTIFICATION_EMAIL"),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -324,6 +355,7 @@ func Load(source Source) (*Config, error) {
 		Treasury:                  treasury,
 		Session:                   session,
 		Settlement:                settlement,
+		Notification:              notification,
 	}, nil
 }
 
@@ -376,6 +408,14 @@ func loadSettlementProviderConfig(source Source, prefix string) SettlementProvid
 		APIURL:        stringOrDefault(source, prefix+"_API_URL", ""),
 		APIKey:        stringOrDefault(source, prefix+"_API_KEY", ""),
 		WebhookSecret: stringOrDefault(source, prefix+"_WEBHOOK_SECRET", ""),
+	}
+}
+
+func loadEmailProviderConfig(source Source, prefix string) EmailProviderConfig {
+	return EmailProviderConfig{
+		Enabled: boolOrDefault(source, prefix+"_ENABLED", false),
+		APIURL:  stringOrDefault(source, prefix+"_API_URL", ""),
+		APIKey:  stringOrDefault(source, prefix+"_API_KEY", ""),
 	}
 }
 
