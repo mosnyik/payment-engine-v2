@@ -34,6 +34,7 @@ A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, d
 | Hosting | VPS for now (cost-conscious, pre-revenue); hard migration gate to a proper cloud provider (managed Postgres w/ PITR, real KMS, VPC isolation) before the first bank partner goes live — bank infra/security due-diligence will not pass on a shared VPS |
 | Go stack | `chi`/`net-http`, `pgx` + `sqlc` (no ORM — full control over ledger transaction/lock behavior), `golang-migrate`, goroutine+ticker background workers coordinated via `SELECT ... FOR UPDATE SKIP LOCKED` |
 | Assets (launch) | BTC, ETH, BNB, TRX, and USDT on those chains |
+| Payout destination | Per-session, tenant-supplied at `CreateSession` — never a static tenant-level field, since one tenant can hold entitlements across multiple corridors/currencies at once. Corridor defines which destination fields are required for its fiat currency; validated immediately after the corridor lookup, before screening/rate-lock/address-reservation proceed |
 
 ## 4. Lessons carried forward from the v1 security audit
 
@@ -53,8 +54,8 @@ Nine business bounded contexts + one shared platform layer. Each module owns its
 |---|---|---|---|---|
 | **tenant** | Tenant profile, fee schedule, corridor entitlements, API keys/HMAC secrets, mTLS cert refs, webhook config | `GetTenant`, `ValidateCredentials`, `CheckEntitlement` | `tenant.onboarded`, `tenant.suspended` | `compliance.kyb_decision` |
 | **compliance** | KYB cases, transaction screening cases, provider registry (by corridor/currency), hold queue, rolling Travel Rule volume aggregates | `ScreenTenant()`, `ScreenSession()` — both sync, blocking | `compliance.kyb_decision`, `compliance.session_decision`, `compliance.hold_created/resolved` | `session.deposit_confirmed` (updates rolling volume) |
-| **corridor** | Corridor definitions (asset+network × fiat currency), provider bindings + priority/failover, limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor) | `GetCorridor`, `ListActiveProviders()` | `corridor.updated` | — |
-| **session** | Session state machine, deposit-address reference, rate-lock reference, compliance-decision reference | `CreateSession`, `GetSession` | `session.created`, `session.deposit_detected`, `session.deposit_confirmed`, `session.expired` | `treasury.deposit_detected/confirmed` |
+| **corridor** | Corridor definitions (asset+network × fiat currency), provider bindings + priority/failover, limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor), payout-destination field requirements per fiat currency | `GetCorridor`, `ListActiveProviders()` | `corridor.updated` | — |
+| **session** | Session state machine, deposit-address reference, rate-lock reference, compliance-decision reference, tenant-supplied payout destination | `CreateSession`, `GetSession` | `session.created`, `session.deposit_detected`, `session.deposit_confirmed`, `session.expired` | `treasury.deposit_detected/confirmed` |
 | **treasury** | Collection provider adapters (self-custody HD wallet + partner-custodied), address reservations, watcher state, sweep execution, custody balances | `GetDepositInstructions()`, `ReserveAddress()` | `treasury.deposit_detected`, `treasury.deposit_confirmed`, `treasury.swept` | `session.created` |
 | **rate** | Rate provider registry, aggregated snapshots, session-scoped rate locks | `LockRate()` — sync | `rate.locked`, `rate.expired` | — |
 | **settlement** | Settlement provider adapters, payout dispatch records, provider failover state | (internally triggered) | `settlement.dispatched`, `settlement.completed`, `settlement.failed` | `session.deposit_confirmed` |
@@ -243,6 +244,18 @@ Once the 3-attempt cap is exhausted on buckets 1/2, or immediately on bucket 4: 
 5. **The reserved deposit address is only released for reuse once the session reaches a terminal state** (`rejected`, `expired`, `settled`, or `settlement_failed` with exhausted retries) — consistent with the DB-enforced one-open-session-per-address constraint. `reversed` does **not** release the address either (it's a post-`settled` event; the address's reuse question was already resolved when the session first reached `settled`).
 6. **A reversal never unwinds the crypto side.** Deposit confirmation, sweep, and the crypto-side ledger entries are untouched by a reversal — only the fiat leg (`tenant_payable` liability, the settlement payout entry) is compensated. Re-settlement, when ops triggers it, reuses the already-collected crypto's value; it never asks the depositor to send crypto again.
 7. **Reversal retries are ops-triggered, never automatic** — same as terminal/bucket-3 settlement failures. A human supplies corrected bank details and approves the retry; the system never re-attempts a payout against the same failed details on its own.
+
+### Payout destination
+
+Not part of the original design pass — added after grounding Phase 6 in the actual code surfaced that nothing defined this at all: `settlement`'s first dispatch attempt passed `Destination: nil` unconditionally, and the only place a real destination ever entered the system was an ops-supplied correction on a `settlement_failed`/`reversed` retry (rule 7 above). There was no first-attempt path.
+
+**Per-session, not per-tenant.** A tenant can hold entitlements across multiple corridors at once (e.g. both an NGN and a ZMW corridor), and it's the corridor picked at session creation — not the tenant — that determines the settlement currency/country. The payout destination is therefore necessarily a property of *the session*: supplied by the tenant in the `CreateSession` request body, never a static field on the tenant record.
+
+**Corridor owns the requirement, not just the currency.** Corridor already determines the system rate (keyed by fiat currency), the effective fee (tenant's per-corridor override), and the settlement-provider failover list. Extending it to also define which destination fields a valid payout needs for that corridor (e.g. an NGN corridor requires account number + bank code; a ZMW corridor requires different fields) keeps one module as the single source of truth for "what does this corridor need to settle," instead of splitting that knowledge between `session` and whichever settlement provider adapter happens to run.
+
+**Validated at `CreateSession`, immediately after the corridor lookup** — before compliance screening, rate lock, or deposit-address reservation ever run. An invalid or incomplete destination fails fast with a 400 there, rather than silently proceeding through the whole pipeline and only surfacing as a dispatch failure at settlement time, after crypto has already been collected.
+
+**Carried, not re-entered, through to settlement.** `session.deposit_confirmed`'s subscriber (`settlement.handleDepositConfirmed`) copies the session's stored destination into the new `settlements` row as its `pending_destination` at creation, so the first dispatch attempt has a real destination instead of `nil`. This doesn't change the existing ops-correction path (rule 7): ops can still overwrite `pending_destination` with corrected details on a `settlement_failed`/`reversed` retry — the only change is that a value already exists on attempt 1, rather than the field sitting unused until the first failure.
 
 ### Open follow-ups
 

@@ -28,9 +28,14 @@ func (s *Store) RegisterEventHandlers() {
 // session/events.go's transitionByReservation, which publishes this event
 // with AggregateID: sessionID).
 func (s *Store) handleDepositConfirmed(ctx context.Context, tx pgx.Tx, e eventbus.Event) error {
+	// pending_destination starts as the session's tenant-supplied payout
+	// destination (ARCHITECTURE.md §8 "Payout destination") — carried, not
+	// re-entered, so the first dispatch attempt has a real destination
+	// instead of nil. An ops-triggered retry (RetryPayout) overwrites it
+	// with corrected details same as before.
 	_, err := tx.Exec(ctx,
-		`INSERT INTO settlements (session_id, tenant_id, corridor_id, status, crypto_asset, fiat_currency)
-		 SELECT id, tenant_id, corridor_id, 'pending_dispatch', crypto_asset, fiat_currency FROM sessions WHERE id = $1
+		`INSERT INTO settlements (session_id, tenant_id, corridor_id, status, crypto_asset, fiat_currency, pending_destination)
+		 SELECT id, tenant_id, corridor_id, 'pending_dispatch', crypto_asset, fiat_currency, payout_destination FROM sessions WHERE id = $1
 		 ON CONFLICT (session_id) DO NOTHING`,
 		e.AggregateID,
 	)

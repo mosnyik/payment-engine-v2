@@ -232,7 +232,7 @@ func (e *testEnv) createDepositConfirmedSession(t *testing.T, fiatAmount, crypto
 	t.Helper()
 	ctx := context.Background()
 
-	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount)
+	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount, nil)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}

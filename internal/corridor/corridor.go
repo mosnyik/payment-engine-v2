@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,19 +19,59 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 )
 
-var ErrNotFound = errors.New("corridor: not found")
+var (
+	ErrNotFound = errors.New("corridor: not found")
+	// ErrDestinationInvalid is returned by ValidateDestination when a
+	// tenant-supplied payout destination is missing a field this corridor
+	// requires (ARCHITECTURE.md §8 "Payout destination").
+	ErrDestinationInvalid = errors.New("corridor: payout destination invalid")
+)
 
 type Corridor struct {
-	ID                      uuid.UUID
-	CryptoAsset             string
-	CryptoNetwork           string
-	FiatCurrency            string
-	Active                  bool
-	MinAmountFiat           *decimal.Decimal
-	MaxAmountFiat           *decimal.Decimal
-	TravelRuleThresholdFiat *decimal.Decimal
-	TravelRuleWindow        time.Duration
-	ComplianceHoldTimeout   time.Duration
+	ID                        uuid.UUID
+	CryptoAsset               string
+	CryptoNetwork             string
+	FiatCurrency              string
+	Active                    bool
+	MinAmountFiat             *decimal.Decimal
+	MaxAmountFiat             *decimal.Decimal
+	TravelRuleThresholdFiat   *decimal.Decimal
+	TravelRuleWindow          time.Duration
+	ComplianceHoldTimeout     time.Duration
+	RequiredDestinationFields []string
+}
+
+// ValidateDestination checks that dest (the tenant-supplied payout
+// destination from CreateSession) carries every field this corridor
+// requires, each with a non-empty string value. dest is otherwise opaque —
+// corridors only declare which keys must be present, not the full shape,
+// since that varies by settlement provider.
+func (c *Corridor) ValidateDestination(dest json.RawMessage) error {
+	if len(c.RequiredDestinationFields) == 0 {
+		return nil
+	}
+	var fields map[string]any
+	if len(dest) > 0 {
+		if err := json.Unmarshal(dest, &fields); err != nil {
+			return fmt.Errorf("%w: not a JSON object: %v", ErrDestinationInvalid, err)
+		}
+	}
+	var missing []string
+	for _, req := range c.RequiredDestinationFields {
+		v, ok := fields[req]
+		if !ok {
+			missing = append(missing, req)
+			continue
+		}
+		s, ok := v.(string)
+		if !ok || s == "" {
+			missing = append(missing, req)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing or empty field(s): %s", ErrDestinationInvalid, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 type ProviderType string
@@ -62,7 +103,7 @@ func New(pool *db.Pool) *Store {
 
 const corridorColumns = `id, crypto_asset, crypto_network, fiat_currency, active,
 	min_amount_fiat, max_amount_fiat, travel_rule_threshold_fiat,
-	travel_rule_window_seconds, compliance_hold_timeout_seconds`
+	travel_rule_window_seconds, compliance_hold_timeout_seconds, required_destination_fields`
 
 func scanCorridor(row pgx.Row) (*Corridor, error) {
 	var c Corridor
@@ -70,7 +111,7 @@ func scanCorridor(row pgx.Row) (*Corridor, error) {
 	err := row.Scan(
 		&c.ID, &c.CryptoAsset, &c.CryptoNetwork, &c.FiatCurrency, &c.Active,
 		&c.MinAmountFiat, &c.MaxAmountFiat, &c.TravelRuleThresholdFiat,
-		&travelRuleWindowSec, &holdTimeoutSec,
+		&travelRuleWindowSec, &holdTimeoutSec, &c.RequiredDestinationFields,
 	)
 	if err != nil {
 		return nil, err
@@ -113,28 +154,34 @@ func (s *Store) GetCorridorByID(ctx context.Context, id uuid.UUID) (*Corridor, e
 }
 
 type UpsertCorridorInput struct {
-	CryptoAsset             string
-	CryptoNetwork           string
-	FiatCurrency            string
-	Active                  bool
-	MinAmountFiat           *decimal.Decimal
-	MaxAmountFiat           *decimal.Decimal
-	TravelRuleThresholdFiat *decimal.Decimal
-	TravelRuleWindow        time.Duration
-	ComplianceHoldTimeout   time.Duration
+	CryptoAsset               string
+	CryptoNetwork             string
+	FiatCurrency              string
+	Active                    bool
+	MinAmountFiat             *decimal.Decimal
+	MaxAmountFiat             *decimal.Decimal
+	TravelRuleThresholdFiat   *decimal.Decimal
+	TravelRuleWindow          time.Duration
+	ComplianceHoldTimeout     time.Duration
+	RequiredDestinationFields []string
 }
 
 // UpsertCorridor creates or updates the corridor matching (crypto_asset,
 // crypto_network, fiat_currency) — this is the config-driven mechanism for
 // adding/adjusting a corridor without a redeploy.
 func (s *Store) UpsertCorridor(ctx context.Context, in UpsertCorridorInput) (uuid.UUID, error) {
+	fields := in.RequiredDestinationFields
+	if fields == nil {
+		fields = []string{}
+	}
 	var id uuid.UUID
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO corridors (
 			crypto_asset, crypto_network, fiat_currency, active,
 			min_amount_fiat, max_amount_fiat, travel_rule_threshold_fiat,
-			travel_rule_window_seconds, compliance_hold_timeout_seconds
-		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			travel_rule_window_seconds, compliance_hold_timeout_seconds,
+			required_destination_fields
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT (crypto_asset, crypto_network, fiat_currency) DO UPDATE SET
 			active = EXCLUDED.active,
 			min_amount_fiat = EXCLUDED.min_amount_fiat,
@@ -142,11 +189,13 @@ func (s *Store) UpsertCorridor(ctx context.Context, in UpsertCorridorInput) (uui
 			travel_rule_threshold_fiat = EXCLUDED.travel_rule_threshold_fiat,
 			travel_rule_window_seconds = EXCLUDED.travel_rule_window_seconds,
 			compliance_hold_timeout_seconds = EXCLUDED.compliance_hold_timeout_seconds,
+			required_destination_fields = EXCLUDED.required_destination_fields,
 			updated_at = now()
 		 RETURNING id`,
 		in.CryptoAsset, in.CryptoNetwork, in.FiatCurrency, in.Active,
 		in.MinAmountFiat, in.MaxAmountFiat, in.TravelRuleThresholdFiat,
 		int(in.TravelRuleWindow.Seconds()), int(in.ComplianceHoldTimeout.Seconds()),
+		fields,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("corridor: upsert corridor: %w", err)

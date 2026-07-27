@@ -57,6 +57,10 @@ var (
 	ErrNotFound             = errors.New("session: not found")
 	ErrCorridorNotSupported = errors.New("session: corridor not supported")
 	ErrNotEntitled          = errors.New("session: tenant not entitled to this corridor")
+	// ErrInvalidDestination wraps corridor.ErrDestinationInvalid so callers
+	// can errors.Is against this package alone, same convention as the two
+	// errors above.
+	ErrInvalidDestination = errors.New("session: payout destination invalid")
 )
 
 // EntitlementChecker is the one tenant-module capability session needs —
@@ -80,8 +84,13 @@ type Session struct {
 	RateLockID           *uuid.UUID
 	DepositReservationID *uuid.UUID
 	SLABreachedAt        *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// PayoutDestination is tenant-supplied at CreateSession, validated
+	// against the corridor's RequiredDestinationFields (ARCHITECTURE.md §8
+	// "Payout destination") — never a tenant-level field, since one tenant
+	// can hold entitlements across multiple corridors/currencies at once.
+	PayoutDestination json.RawMessage
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type Store struct {
@@ -114,7 +123,7 @@ func New(pool *db.Pool, corridorStore *corridor.Store, complianceStore *complian
 
 const sessionColumns = `id, tenant_id, corridor_id, status, fiat_currency, fiat_amount,
 	crypto_asset, crypto_network, compliance_case_id, rate_lock_id,
-	deposit_reservation_id, sla_breached_at, created_at, updated_at`
+	deposit_reservation_id, sla_breached_at, payout_destination, created_at, updated_at`
 
 func scanSession(row pgx.Row) (*Session, error) {
 	var sess Session
@@ -122,7 +131,7 @@ func scanSession(row pgx.Row) (*Session, error) {
 	err := row.Scan(
 		&sess.ID, &sess.TenantID, &sess.CorridorID, &status, &sess.FiatCurrency, &sess.FiatAmount,
 		&sess.CryptoAsset, &sess.CryptoNetwork, &sess.ComplianceCaseID, &sess.RateLockID,
-		&sess.DepositReservationID, &sess.SLABreachedAt, &sess.CreatedAt, &sess.UpdatedAt,
+		&sess.DepositReservationID, &sess.SLABreachedAt, &sess.PayoutDestination, &sess.CreatedAt, &sess.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -135,13 +144,24 @@ func scanSession(row pgx.Row) (*Session, error) {
 // entitlement check -> compliance.ScreenSession() -> (approved:
 // rate.LockRate() + treasury.GetDepositInstructions()) -> pending, or hold/
 // rejected per the compliance decision.
-func (s *Store) CreateSession(ctx context.Context, tenantID uuid.UUID, cryptoAsset, cryptoNetwork, fiatCurrency string, fiatAmount decimal.Decimal) (*Session, error) {
+func (s *Store) CreateSession(ctx context.Context, tenantID uuid.UUID, cryptoAsset, cryptoNetwork, fiatCurrency string, fiatAmount decimal.Decimal, payoutDestination json.RawMessage) (*Session, error) {
 	corr, err := s.corridorStore.GetCorridor(ctx, cryptoAsset, cryptoNetwork, fiatCurrency)
 	if errors.Is(err, corridor.ErrNotFound) {
 		return nil, ErrCorridorNotSupported
 	}
 	if err != nil {
 		return nil, fmt.Errorf("session: get corridor: %w", err)
+	}
+
+	// Validated immediately after the corridor lookup, before entitlement,
+	// compliance, rate-lock, or address-reservation ever run — an invalid
+	// destination should fail fast, not surface as a dispatch failure at
+	// settlement time after crypto has already been collected.
+	if err := corr.ValidateDestination(payoutDestination); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidDestination, err)
+	}
+	if payoutDestination == nil {
+		payoutDestination = json.RawMessage("{}")
 	}
 
 	entitled, err := s.entitlement.CheckEntitlement(ctx, tenantID, corr.ID)
@@ -153,10 +173,10 @@ func (s *Store) CreateSession(ctx context.Context, tenantID uuid.UUID, cryptoAss
 	}
 
 	row := s.pool.QueryRow(ctx,
-		`INSERT INTO sessions (tenant_id, corridor_id, status, fiat_currency, fiat_amount, crypto_asset, crypto_network)
-		 VALUES ($1, $2, 'screening', $3, $4, $5, $6)
+		`INSERT INTO sessions (tenant_id, corridor_id, status, fiat_currency, fiat_amount, crypto_asset, crypto_network, payout_destination)
+		 VALUES ($1, $2, 'screening', $3, $4, $5, $6, $7)
 		 RETURNING `+sessionColumns,
-		tenantID, corr.ID, fiatCurrency, fiatAmount, cryptoAsset, cryptoNetwork,
+		tenantID, corr.ID, fiatCurrency, fiatAmount, cryptoAsset, cryptoNetwork, payoutDestination,
 	)
 	sess, err := scanSession(row)
 	if err != nil {

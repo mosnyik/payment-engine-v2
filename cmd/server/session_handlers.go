@@ -59,10 +59,11 @@ func (h *sessionHandlers) createSession(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		CryptoAsset   string `json:"crypto_asset"`
-		CryptoNetwork string `json:"crypto_network"`
-		FiatCurrency  string `json:"fiat_currency"`
-		FiatAmount    string `json:"fiat_amount"`
+		CryptoAsset       string          `json:"crypto_asset"`
+		CryptoNetwork     string          `json:"crypto_network"`
+		FiatCurrency      string          `json:"fiat_currency"`
+		FiatAmount        string          `json:"fiat_amount"`
+		PayoutDestination json.RawMessage `json:"payout_destination"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -75,9 +76,9 @@ func (h *sessionHandlers) createSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sess, err := h.session.CreateSession(r.Context(), tenantID, req.CryptoAsset, req.CryptoNetwork, req.FiatCurrency, fiatAmount)
+	sess, err := h.session.CreateSession(r.Context(), tenantID, req.CryptoAsset, req.CryptoNetwork, req.FiatCurrency, fiatAmount, req.PayoutDestination)
 	switch {
-	case errors.Is(err, session.ErrCorridorNotSupported), errors.Is(err, session.ErrNotEntitled):
+	case errors.Is(err, session.ErrCorridorNotSupported), errors.Is(err, session.ErrNotEntitled), errors.Is(err, session.ErrInvalidDestination):
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	case err != nil:

@@ -154,7 +154,7 @@ func setupTestEnv(t *testing.T, providerName string, decision compliance.Decisio
 
 func (e *testEnv) createSession(t *testing.T, fiatAmount decimal.Decimal) *session.Session {
 	t.Helper()
-	sess, err := e.session.CreateSession(context.Background(), e.tenantID, "USDT", string(wallet.Ethereum), e.fiatCurrency(t), fiatAmount)
+	sess, err := e.session.CreateSession(context.Background(), e.tenantID, "USDT", string(wallet.Ethereum), e.fiatCurrency(t), fiatAmount, nil)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestCreateSession_NotEntitledCorridor(t *testing.T) {
 		t.Fatalf("create tenant: %v", err)
 	}
 
-	_, err = env.session.CreateSession(context.Background(), otherTenantID, "USDT", string(wallet.Ethereum), env.fiatCurrency(t), decimal.NewFromInt(100))
+	_, err = env.session.CreateSession(context.Background(), otherTenantID, "USDT", string(wallet.Ethereum), env.fiatCurrency(t), decimal.NewFromInt(100), nil)
 	if err != session.ErrNotEntitled {
 		t.Fatalf("expected ErrNotEntitled, got %v", err)
 	}
@@ -253,7 +253,7 @@ func TestCreateSession_NotEntitledCorridor(t *testing.T) {
 func TestCreateSession_UnsupportedCorridor(t *testing.T) {
 	env := setupTestEnv(t, "always-approve", compliance.Decision{Approved: true, Reason: "ok"})
 
-	_, err := env.session.CreateSession(context.Background(), env.tenantID, "BTC", "bitcoin", "NOSUCHCURRENCY", decimal.NewFromInt(100))
+	_, err := env.session.CreateSession(context.Background(), env.tenantID, "BTC", "bitcoin", "NOSUCHCURRENCY", decimal.NewFromInt(100), nil)
 	if err != session.ErrCorridorNotSupported {
 		t.Fatalf("expected ErrCorridorNotSupported, got %v", err)
 	}
