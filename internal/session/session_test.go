@@ -193,18 +193,9 @@ func TestCreateSession_ApprovedReachesPendingWithDepositInstructions(t *testing.
 
 	// session.created must have been published in the same transaction as
 	// the pending transition — the first real Publish call on this
-	// request path.
-	var count int
-	err := env.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM outbox_events WHERE event_type = 'session.created' AND aggregate_id = $1`,
-		sess.ID,
-	).Scan(&count)
-	if err != nil {
-		t.Fatalf("query outbox: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("expected exactly one session.created event, got %d", count)
-	}
+	// request path. assertOutboxEvent also verifies tenant_id is in the
+	// payload, the shape notification (Phase 7) depends on.
+	assertOutboxEvent(t, env, "session.created", sess.ID)
 }
 
 func TestCreateSession_ComplianceRejectionReachesRejected(t *testing.T) {
@@ -351,14 +342,34 @@ func waitForStatus(t *testing.T, env *testEnv, sessionID uuid.UUID, want session
 func assertOutboxEvent(t *testing.T, env *testEnv, eventType string, aggregateID uuid.UUID) {
 	t.Helper()
 	var count int
-	err := env.pool.QueryRow(context.Background(),
+	if err := env.pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM outbox_events WHERE event_type = $1 AND aggregate_id = $2`,
 		eventType, aggregateID,
-	).Scan(&count)
-	if err != nil {
+	).Scan(&count); err != nil {
 		t.Fatalf("query outbox for %s: %v", eventType, err)
 	}
 	if count != 1 {
 		t.Fatalf("expected exactly one %s event for %s, got %d", eventType, aggregateID, count)
+	}
+
+	var payload []byte
+	if err := env.pool.QueryRow(context.Background(),
+		`SELECT payload FROM outbox_events WHERE event_type = $1 AND aggregate_id = $2`,
+		eventType, aggregateID,
+	).Scan(&payload); err != nil {
+		t.Fatalf("query outbox payload for %s: %v", eventType, err)
+	}
+
+	// Notification (Phase 7) depends on every session.* event carrying
+	// tenant_id directly in its payload — see internal/session/events.go's
+	// transitionByReservation.
+	var decoded struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode %s payload: %v", eventType, err)
+	}
+	if decoded.TenantID != env.tenantID.String() {
+		t.Fatalf("expected %s payload tenant_id %s, got %q", eventType, env.tenantID, decoded.TenantID)
 	}
 }

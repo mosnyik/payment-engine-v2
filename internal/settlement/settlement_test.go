@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -539,5 +540,43 @@ func TestWebhook_SucceededReplayIsNoOp(t *testing.T) {
 	// before ever trying).
 	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sig); err != nil {
 		t.Fatalf("replayed webhook should be a no-op, got error: %v", err)
+	}
+}
+
+// TestSettlementEvents_PayloadCarriesTenantID verifies the Phase 7 wiring:
+// every settlement.* event's payload carries tenant_id (transitionSettlementAndPublish,
+// webhook.go), the shape notification's routing depends on so it never has
+// to depend on internal/session or internal/settlement itself to resolve a
+// delivery destination.
+func TestSettlementEvents_PayloadCarriesTenantID(t *testing.T) {
+	provider := &fakeSettlementProvider{name: "tenantidtest", enabled: true, outcome: OutcomeAccepted, ref: "ref-" + uuid.NewString()}
+	env := setupTestEnv(t, provider)
+	defer env.Cleanup()
+
+	sess := env.createDepositConfirmedSession(t, decimal.NewFromInt(99000), decimal.NewFromInt(100))
+	env.runDispatchOnce(t)
+
+	assertOutboxEventTenantID(t, env, "settlement.dispatched", sess.ID, env.tenantID)
+}
+
+func assertOutboxEventTenantID(t *testing.T, env *testEnv, eventType string, sessionID, wantTenantID uuid.UUID) {
+	t.Helper()
+	var payload []byte
+	if err := env.pool.QueryRow(context.Background(),
+		`SELECT oe.payload FROM outbox_events oe
+		 JOIN settlements s ON s.id = oe.aggregate_id
+		 WHERE oe.event_type = $1 AND s.session_id = $2`,
+		eventType, sessionID,
+	).Scan(&payload); err != nil {
+		t.Fatalf("query outbox payload for %s: %v", eventType, err)
+	}
+	var decoded struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode %s payload: %v", eventType, err)
+	}
+	if decoded.TenantID != wantTenantID.String() {
+		t.Fatalf("expected %s payload tenant_id %s, got %q", eventType, wantTenantID, decoded.TenantID)
 	}
 }
