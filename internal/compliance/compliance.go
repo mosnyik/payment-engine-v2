@@ -20,6 +20,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 )
 
 type CaseType string
@@ -98,10 +99,22 @@ func (r *Registry) Get(name string) (ScreeningProvider, bool) {
 type Store struct {
 	pool     *db.Pool
 	registry *Registry
+
+	// bus publishes compliance.hold_created for notification (Phase 7) to
+	// alert ops the moment a case is held. Nil-safe — a Store built without
+	// one just skips publishing, same convention treasury/settlement/session
+	// already establish for their own bus fields.
+	bus *eventbus.Bus
 }
 
 func New(pool *db.Pool, registry *Registry) *Store {
 	return &Store{pool: pool, registry: registry}
+}
+
+// SetEventBus wires this Store to publish compliance.hold_created. Optional
+// — nil-safe, see the bus field's doc comment.
+func (s *Store) SetEventBus(bus *eventbus.Bus) {
+	s.bus = bus
 }
 
 const caseColumns = `id, case_type, reference_type, reference_id, status,
@@ -163,7 +176,13 @@ func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedD
 		resolvedAt = &now
 	}
 
-	row := s.pool.QueryRow(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("compliance: begin create kyb case: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
+	row := tx.QueryRow(ctx,
 		`INSERT INTO compliance_cases (case_type, reference_type, reference_id, status, provider_name, decision_reason, submitted_data, resolved_at)
 		 VALUES ($1, 'tenant', $2, $3, $4, $5, $6, $7)
 		 RETURNING `+caseColumns,
@@ -172,6 +191,13 @@ func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedD
 	c, err := scanCase(row)
 	if err != nil {
 		return nil, fmt.Errorf("compliance: create kyb case: %w", err)
+	}
+
+	if err := s.publishIfHold(ctx, tx, c, tenantID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("compliance: commit create kyb case: %w", err)
 	}
 	return c, nil
 }
@@ -229,7 +255,13 @@ func (s *Store) ScreenSession(ctx context.Context, sessionID, tenantID uuid.UUID
 		holdExpiresAt = &t
 	}
 
-	row := s.pool.QueryRow(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("compliance: begin create session case: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
+	row := tx.QueryRow(ctx,
 		`INSERT INTO compliance_cases (case_type, reference_type, reference_id, status, provider_name, decision_reason, submitted_data, hold_expires_at, resolved_at)
 		 VALUES ($1, 'session', $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `+caseColumns,
@@ -239,7 +271,45 @@ func (s *Store) ScreenSession(ctx context.Context, sessionID, tenantID uuid.UUID
 	if err != nil {
 		return nil, fmt.Errorf("compliance: create session case: %w", err)
 	}
+
+	if err := s.publishIfHold(ctx, tx, c, tenantID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("compliance: commit create session case: %w", err)
+	}
 	return c, nil
+}
+
+// publishIfHold publishes compliance.hold_created in the same transaction
+// as the case insert above when the case landed in the manual hold queue —
+// the moment ops actually needs to know about it, not KYB/session
+// approval or rejection. tenant_id is a parameter (not read off c) because
+// ScreenTenant's reference_id already *is* the tenant id, while
+// ScreenSession's reference_id is the session id — both callers already
+// have the tenant id in hand regardless.
+func (s *Store) publishIfHold(ctx context.Context, tx pgx.Tx, c *Case, tenantID uuid.UUID) error {
+	if s.bus == nil || c.Status != StatusHold {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]string{
+		"tenant_id":      tenantID.String(),
+		"case_type":      string(c.CaseType),
+		"reference_type": c.ReferenceType,
+		"reference_id":   c.ReferenceID.String(),
+	})
+	if err != nil {
+		return fmt.Errorf("compliance: marshal compliance.hold_created payload: %w", err)
+	}
+	if err := s.bus.Publish(ctx, tx, eventbus.Event{
+		EventType:     "compliance.hold_created",
+		AggregateType: "compliance_case",
+		AggregateID:   c.ID,
+		Payload:       payload,
+	}); err != nil {
+		return fmt.Errorf("compliance: publish compliance.hold_created: %w", err)
+	}
+	return nil
 }
 
 // travelRuleThresholdExceeded reports whether fiatAmount plus the tenant's
