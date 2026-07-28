@@ -80,6 +80,14 @@ func TestTTLJob_DoesNotExpireInFlightDepositButMarksSLABreach(t *testing.T) {
 	if got.SLABreachedAt == nil {
 		t.Fatal("expected sla_breached_at to be set once the 30-minute mark passes, even though status is untouched")
 	}
+	assertOutboxEvent(t, env, "session.sla_breached", sess.ID)
+
+	// A second sweep must not re-publish — sla_breached_at IS NULL in
+	// markSLABreaches' WHERE clause already excludes this session the second
+	// time around, same redelivery-safety reasoning as every other
+	// publish-on-transition path in this package.
+	runTTLSweep(t, env)
+	assertOutboxEvent(t, env, "session.sla_breached", sess.ID)
 }
 
 func TestTTLJob_ExpiresTimedOutComplianceHoldWithoutClosingTheCase(t *testing.T) {

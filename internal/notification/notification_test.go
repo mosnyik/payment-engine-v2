@@ -456,3 +456,85 @@ func TestRetryDelivery_ResetsDeadLetteredRowForAnotherAttempt(t *testing.T) {
 	// row, exactly the failure mode this whole test file is written to avoid.
 	env.runDispatchOnce(t)
 }
+
+// TestSLABreached_RoutesToEmailOnlyNotWebhook covers Phase 8's SLA-breach
+// alerting (internal/session/ttl.go's markSLABreaches): the tenant already
+// sees the session's real pipeline stage untouched, so this is ops-only,
+// same treatment as compliance.hold_created.
+func TestSLABreached_RoutesToEmailOnlyNotWebhook(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("session.sla_breached must never deliver a tenant webhook")
+	}))
+	defer server.Close()
+
+	env := setupTestEnv(t, &fakeTenantWebhookLookup{url: server.URL, secret: "unused", ok: true}, Config{OpsAlertEmail: "ops@sirfi.test"})
+	defer env.Cleanup()
+
+	env.publish(t, "session.sla_breached", nil)
+	env.waitForDeliveryCount(t, ChannelEmail, 1)
+
+	var webhookCount int
+	if err := env.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM notification_deliveries WHERE tenant_id = $1 AND event_type = 'session.sla_breached' AND channel = 'webhook'`,
+		env.tenantID,
+	).Scan(&webhookCount); err != nil {
+		t.Fatalf("count webhook deliveries: %v", err)
+	}
+	if webhookCount != 0 {
+		t.Fatalf("expected zero webhook deliveries for session.sla_breached, got %d", webhookCount)
+	}
+
+	env.runDispatchOnce(t)
+}
+
+// TestLedgerDriftDetected_RoutesToEmailEvenWithoutTenantID covers Phase 8's
+// reconciliation job (internal/ledger/reconcile.go): unlike every other
+// event this package handles, a platform/omnibus ledger account genuinely
+// has no owning tenant — tenant_id must come through as NULL, not error out
+// or silently get dropped.
+func TestLedgerDriftDetected_RoutesToEmailEvenWithoutTenantID(t *testing.T) {
+	env := setupTestEnv(t, &fakeTenantWebhookLookup{ok: false}, Config{OpsAlertEmail: "ops@sirfi.test"})
+	defer env.Cleanup()
+
+	accountID := uuid.New()
+	ctx := context.Background()
+	tx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"tenant_id":    nil,
+		"account_id":   accountID.String(),
+		"drift_amount": "12.5",
+	})
+	if err := env.bus.Publish(ctx, tx, eventbus.Event{
+		EventType: "ledger.drift_detected", AggregateType: "ledger_account", AggregateID: accountID, Payload: payload,
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var deliveryID uuid.UUID
+	var tenantID *uuid.UUID
+	for time.Now().Before(deadline) {
+		err := env.pool.QueryRow(context.Background(),
+			`SELECT id, tenant_id FROM notification_deliveries WHERE aggregate_id = $1 AND event_type = 'ledger.drift_detected' AND channel = 'email'`,
+			accountID,
+		).Scan(&deliveryID, &tenantID)
+		if err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if deliveryID == uuid.Nil {
+		t.Fatal("expected an email delivery row for ledger.drift_detected")
+	}
+	if tenantID != nil {
+		t.Fatalf("expected a NULL tenant_id for a platform-account drift, got %s", *tenantID)
+	}
+
+	env.runDispatchOnce(t)
+}
