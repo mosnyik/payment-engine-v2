@@ -17,16 +17,16 @@ type notificationHandlers struct {
 }
 
 type deliveryResponse struct {
-	ID            uuid.UUID `json:"id"`
-	TenantID      uuid.UUID `json:"tenant_id"`
-	EventType     string    `json:"event_type"`
-	Channel       string    `json:"channel"`
-	Destination   string    `json:"destination"`
-	Status        string    `json:"status"`
-	AttemptCount  int       `json:"attempt_count"`
-	LastError     *string   `json:"last_error,omitempty"`
-	NextAttemptAt string    `json:"next_attempt_at"`
-	CreatedAt     string    `json:"created_at"`
+	ID            uuid.UUID  `json:"id"`
+	TenantID      *uuid.UUID `json:"tenant_id,omitempty"`
+	EventType     string     `json:"event_type"`
+	Channel       string     `json:"channel"`
+	Destination   string     `json:"destination"`
+	Status        string     `json:"status"`
+	AttemptCount  int        `json:"attempt_count"`
+	LastError     *string    `json:"last_error,omitempty"`
+	NextAttemptAt string     `json:"next_attempt_at"`
+	CreatedAt     string     `json:"created_at"`
 }
 
 func toDeliveryResponse(d *notification.Delivery) deliveryResponse {

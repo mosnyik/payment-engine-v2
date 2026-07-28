@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
@@ -82,6 +83,12 @@ func run() error {
 	// call" split settlement's DispatchWorker already establishes.
 	notificationDispatchWorker := notification.NewDispatchWorker(stores.notification, cfg.Notification.DispatchPollInterval)
 	go notificationDispatchWorker.Run(ctx)
+
+	// Phase 8's reconciliation job — flags a ledger_balances cache that
+	// disagrees with a fresh sum of ledger_entries, never auto-repairs it
+	// (see internal/ledger/reconcile.go's package doc comment).
+	reconcileJob := ledger.NewReconcileJob(stores.ledger, cfg.Ledger.ReconcileInterval)
+	go reconcileJob.Run(ctx)
 
 	log.Printf("payment-engine-v2: listening on %s", cfg.HTTPAddr)
 	return http.ListenAndServe(cfg.HTTPAddr, router)

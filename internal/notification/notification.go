@@ -66,10 +66,15 @@ var backoffSteps = []time.Duration{
 
 var ErrNotFound = errors.New("notification: not found")
 
-// Delivery is one outbound notification attempt record.
+// Delivery is one outbound notification attempt record. TenantID is nullable
+// — ledger.drift_detected (Phase 8) can be about a platform/omnibus account
+// with no owning tenant at all, unlike every other event this package
+// routes, which are always tenant-scoped. Only ChannelEmail deliveries can
+// have a nil TenantID; sendWebhook (webhook.go) always has a real one, since
+// webhookEvents only ever contains tenant-scoped event types.
 type Delivery struct {
 	ID            uuid.UUID
-	TenantID      uuid.UUID
+	TenantID      *uuid.UUID
 	EventType     string
 	AggregateType string
 	AggregateID   uuid.UUID

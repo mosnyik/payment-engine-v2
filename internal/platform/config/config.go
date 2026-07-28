@@ -52,6 +52,15 @@ type Config struct {
 	Session      SessionConfig
 	Settlement   SettlementConfig
 	Notification NotificationConfig
+	Ledger       LedgerConfig
+}
+
+// LedgerConfig is Phase 8's reconciliation job's operational tuning — see
+// internal/ledger/reconcile.go. A background integrity check, not
+// latency-sensitive, so the default poll interval is far coarser than
+// settlement/notification's near-real-time jobs.
+type LedgerConfig struct {
+	ReconcileInterval time.Duration // default 5m
 }
 
 // SessionConfig is Phase 5's session module's operational tuning. The
@@ -340,6 +349,10 @@ func Load(source Source) (*Config, error) {
 		Email:                loadEmailProviderConfig(source, "NOTIFICATION_EMAIL"),
 	}
 
+	ledger := LedgerConfig{
+		ReconcileInterval: durationOrDefault(source, "LEDGER_RECONCILE_INTERVAL", 5*time.Minute, &errs),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -358,6 +371,7 @@ func Load(source Source) (*Config, error) {
 		Session:                   session,
 		Settlement:                settlement,
 		Notification:              notification,
+		Ledger:                    ledger,
 	}, nil
 }
 

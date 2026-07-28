@@ -97,6 +97,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	sessionStore.RegisterEventHandlers()
 
 	ledgerStore := ledger.New(pool)
+	ledgerStore.SetEventBus(bus)
 	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, tenantStore, settlement.Config{
 		CNGN:        settlement.SettlementProviderConfig(cfg.Settlement.CNGN),
 		Flutterwave: settlement.SettlementProviderConfig(cfg.Settlement.Flutterwave),

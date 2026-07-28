@@ -2,9 +2,14 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 )
 
 // TTLJob is the background sweep implementing ARCHITECTURE.md §8's
@@ -91,17 +96,72 @@ func (s *Store) expireTimedOutHolds(ctx context.Context) error {
 // never touched here — a session with a deposit already detected keeps
 // progressing through its real pipeline exactly as normal after breaching,
 // per §8 rule 1.
+//
+// Runs inside a transaction and publishes session.sla_breached once per
+// breaching session, in the same transaction as the UPDATE — same atomicity
+// discipline transitionByReservation (events.go) already uses. A bulk
+// UPDATE ... RETURNING can return one row per affected session, so no
+// separate SELECT ... FOR UPDATE pass is needed first. The
+// `sla_breached_at IS NULL` clause is what keeps a redelivered/duplicate
+// sweep from re-publishing for a session already marked.
 func (s *Store) markSLABreaches(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("session: mark sla breaches: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
 	cutoff := time.Now().Add(-SessionTTL)
-	_, err := s.pool.Exec(ctx,
+	rows, err := tx.Query(ctx,
 		`UPDATE sessions SET sla_breached_at = now()
 		 WHERE sla_breached_at IS NULL
 		   AND status NOT IN ('settled', 'expired', 'rejected')
-		   AND created_at < $1`,
+		   AND created_at < $1
+		 RETURNING id, tenant_id`,
 		cutoff,
 	)
 	if err != nil {
 		return fmt.Errorf("session: mark sla breaches: %w", err)
+	}
+	type breach struct {
+		sessionID uuid.UUID
+		tenantID  uuid.UUID
+	}
+	var breached []breach
+	for rows.Next() {
+		var b breach
+		if err := rows.Scan(&b.sessionID, &b.tenantID); err != nil {
+			rows.Close()
+			return fmt.Errorf("session: mark sla breaches: scan: %w", err)
+		}
+		breached = append(breached, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("session: mark sla breaches: %w", err)
+	}
+
+	if s.bus != nil {
+		for _, b := range breached {
+			payload, err := json.Marshal(map[string]string{
+				"tenant_id": b.tenantID.String(),
+			})
+			if err != nil {
+				return fmt.Errorf("session: marshal session.sla_breached payload: %w", err)
+			}
+			if err := s.bus.Publish(ctx, tx, eventbus.Event{
+				EventType:     "session.sla_breached",
+				AggregateType: "session",
+				AggregateID:   b.sessionID,
+				Payload:       payload,
+			}); err != nil {
+				return fmt.Errorf("session: publish session.sla_breached: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("session: mark sla breaches: commit: %w", err)
 	}
 	return nil
 }

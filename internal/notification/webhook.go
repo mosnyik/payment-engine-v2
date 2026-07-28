@@ -33,12 +33,15 @@ func ComputeWebhookSignature(secret string, body []byte) string {
 // an in-flight retry), a rotated signing secret should apply to the very
 // next attempt, not lag behind until a new event arrives.
 func (s *Store) sendWebhook(ctx context.Context, d *Delivery) error {
-	_, secret, ok, err := s.tenantStore.WebhookConfig(ctx, d.TenantID)
+	if d.TenantID == nil {
+		return fmt.Errorf("notification: webhook delivery %s has no tenant_id", d.ID)
+	}
+	_, secret, ok, err := s.tenantStore.WebhookConfig(ctx, *d.TenantID)
 	if err != nil {
 		return fmt.Errorf("notification: lookup webhook config: %w", err)
 	}
 	if !ok || secret == "" {
-		return fmt.Errorf("notification: tenant %s no longer has a webhook configured", d.TenantID)
+		return fmt.Errorf("notification: tenant %s no longer has a webhook configured", *d.TenantID)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Destination, bytes.NewReader(d.Payload))

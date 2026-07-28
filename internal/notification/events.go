@@ -36,6 +36,18 @@ var emailEvents = map[string]bool{
 	"settlement.failed":       true,
 	"settlement.reversed":     true,
 	"compliance.hold_created": true,
+	// session.sla_breached: an internal "this session is stuck" signal
+	// (ARCHITECTURE.md §8) — the tenant already sees the session's real
+	// pipeline stage untouched, so this is ops-only, same treatment as
+	// compliance.hold_created.
+	"session.sla_breached": true,
+	// ledger.drift_detected: Phase 8's reconciliation job (internal/ledger/
+	// reconcile.go) flagging a ledger_balances cache that disagrees with a
+	// fresh sum of ledger_entries. Ops-only — there's no tenant-facing
+	// concept of this at all, and the account it's about may be a
+	// platform/omnibus account with no tenant (tenant_id NULL) in the first
+	// place.
+	"ledger.drift_detected": true,
 }
 
 // RegisterEventHandlers subscribes to every event this package routes
@@ -89,12 +101,16 @@ func (s *Store) handleEvent(ctx context.Context, tx pgx.Tx, e eventbus.Event) er
 	return nil
 }
 
-func tenantIDFromPayload(payload json.RawMessage) (uuid.UUID, error) {
+// tenantIDFromPayload returns nil when the payload has no tenant_id (or it's
+// explicitly null) — real for ledger.drift_detected on a platform/omnibus
+// account, not a parse error. Every other event this package handles always
+// carries a real one.
+func tenantIDFromPayload(payload json.RawMessage) (*uuid.UUID, error) {
 	var p struct {
-		TenantID uuid.UUID `json:"tenant_id"`
+		TenantID *uuid.UUID `json:"tenant_id"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
-		return uuid.Nil, fmt.Errorf("notification: parse tenant_id from event payload: %w", err)
+		return nil, fmt.Errorf("notification: parse tenant_id from event payload: %w", err)
 	}
 	return p.TenantID, nil
 }
@@ -102,11 +118,18 @@ func tenantIDFromPayload(payload json.RawMessage) (uuid.UUID, error) {
 // insertDelivery resolves channel's destination and inserts one row, or
 // silently does nothing when there's nowhere to send it — a tenant with no
 // webhook configured, or no ops alert address configured, is not an error.
-func (s *Store) insertDelivery(ctx context.Context, tx pgx.Tx, e eventbus.Event, tenantID uuid.UUID, channel Channel) error {
+func (s *Store) insertDelivery(ctx context.Context, tx pgx.Tx, e eventbus.Event, tenantID *uuid.UUID, channel Channel) error {
 	var destination string
 	switch channel {
 	case ChannelWebhook:
-		url, _, ok, err := s.tenantStore.WebhookConfig(ctx, tenantID)
+		// webhookEvents only ever contains tenant-scoped event types, so a
+		// nil tenantID here would mean a publisher bug, not a real "no
+		// destination" case — treated as a no-op rather than a crash, same
+		// fail-safe spirit as every other branch here.
+		if tenantID == nil {
+			return nil
+		}
+		url, _, ok, err := s.tenantStore.WebhookConfig(ctx, *tenantID)
 		if err != nil {
 			return fmt.Errorf("notification: lookup webhook config: %w", err)
 		}
