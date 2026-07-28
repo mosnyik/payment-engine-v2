@@ -1,0 +1,58 @@
+# Three independent services sharing one Postgres. ratefetcher deliberately
+# depends only on postgres, never on server — it's a genuinely separate
+# deployable unit that never needs the main app to be running (see
+# cmd/ratefetcher/main.go's package doc comment).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment_engine
+      POSTGRES_PASSWORD: local_dev_only
+      POSTGRES_DB: 2settle
+    ports:
+      # Host port 5433, not 5432 — a native Postgres install commonly
+      # already occupies 5432 on the host machine (matches .env.example's
+      # own local-dev DATABASE_URL). Irrelevant to server/ratefetcher, which
+      # reach this container over the compose network at postgres:5432.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_engine -d 2settle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: cmd/server/Dockerfile
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever DATABASE_URL .env has (that file's default points
+      # at localhost:5433 for running the binary directly on the host) —
+      # inside the compose network the Postgres container is reached by
+      # service name on its container-internal port.
+      DATABASE_URL: postgres://payment_engine:local_dev_only@postgres:5432/2settle?sslmode=disable
+    ports:
+      - "3700:3700"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ratefetcher:
+    build:
+      context: .
+      dockerfile: cmd/ratefetcher/Dockerfile
+    environment:
+      DATABASE_URL: postgres://payment_engine:local_dev_only@postgres:5432/2settle?sslmode=disable
+      COINGECKO_FIAT_CURRENCY: NGN
+      COINGECKO_FETCH_INTERVAL: 20m
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
