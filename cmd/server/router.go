@@ -37,8 +37,13 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}
 	lh := &ledgerHandlers{ledger: stores.ledger}
+	rh := &rateHandlers{rate: stores.rate}
 
 	r.Post("/admin/login", h.login)
+
+	// Public, unauthenticated — same tier as /admin/login, deliberately not
+	// behind the tenant gateway's HMAC (see rate_handlers.go's doc comment).
+	r.Get("/rate/{fiatCurrency}", rh.getRate)
 
 	// Self-verified via settlement.VerifyWebhookSignature, not the tenant
 	// gateway's HMAC or adminauth — same unauthenticated tier as

@@ -26,6 +26,11 @@ var (
 	ErrLockNotFound      = errors.New("rate: lock not found")
 )
 
+// ProviderCoinGecko names the provider_rates rows cmd/ratefetcher writes —
+// shared between that binary's writes and GetProviderRate's reads so the
+// string can't drift between the two.
+const ProviderCoinGecko = "coingecko"
+
 // slippageBuffer is subtracted from the selected quote before locking (see
 // ARCHITECTURE.md §7). Not an operational config knob like the tunables in
 // platform/config — it's a fixed design decision, not something ops vary
@@ -213,6 +218,27 @@ func (s *Store) GetLock(ctx context.Context, id uuid.UUID) (*Lock, error) {
 
 func (s *Store) upsertProviderRate(ctx context.Context, quote Quote, fiatCurrency string) error {
 	return UpsertProviderRate(ctx, s.pool, quote, fiatCurrency)
+}
+
+// GetProviderRate returns the latest rate a specific external provider has
+// published for fiatCurrency — a direct provider_rates read, not run
+// through GetBestQuote's system-rate-ceiling selection (ARCHITECTURE.md
+// §7's LockRate logic). The public GET /v2/rate/{fiatCurrency} endpoint
+// uses this to publish exactly what cmd/ratefetcher writes, independent of
+// system_rates or any other provider.
+func (s *Store) GetProviderRate(ctx context.Context, provider, fiatCurrency string) (Quote, error) {
+	q := Quote{Provider: provider}
+	err := s.pool.QueryRow(ctx,
+		`SELECT rate, fetched_at FROM provider_rates WHERE provider = $1 AND fiat_currency = $2`,
+		provider, fiatCurrency,
+	).Scan(&q.Rate, &q.FetchedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Quote{}, fmt.Errorf("%w: no %s rate for %s", ErrNoQuotesAvailable, provider, fiatCurrency)
+	}
+	if err != nil {
+		return Quote{}, fmt.Errorf("rate: get provider rate: %w", err)
+	}
+	return q, nil
 }
 
 // UpsertProviderRate records one provider's fiat-per-USD quote into

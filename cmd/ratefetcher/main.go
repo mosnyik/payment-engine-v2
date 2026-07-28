@@ -130,7 +130,7 @@ func fetchOnce(ctx context.Context, pool *db.Pool, client *coinGeckoClient, fiat
 
 	fetchedAt := time.Now()
 	err = rate.UpsertProviderRate(ctx, pool, rate.Quote{
-		Provider:  "coingecko",
+		Provider:  rate.ProviderCoinGecko,
 		Rate:      rateValue,
 		FetchedAt: fetchedAt,
 	}, fiatCurrency)
