@@ -115,14 +115,13 @@ Grounding this phase in the actual code (not `ARCHITECTURE.md`'s aspirational mo
 
 *Deferred, not fixed (pre-existing, not introduced here): the cross-package eventbus race noted in Phase 6 — now also observable via `internal/notification`'s own tests when run alongside other packages, same mechanism, same "never happens in production" reasoning.*
 
-## Phase 8 — Ops/observability *(parallel track, not a hard blocker)*
+## Phase 8 — Ops/observability ✅ complete
 
-Can be built incrementally alongside Phases 5–7 rather than as a discrete blocking phase:
+Grounding this phase in the actual code (not this list's original aspirational form) surfaced that two of the four originally-listed items already existed from earlier phases, built ahead of schedule as part of their owning module: **manual settlement-retry tooling** (`POST /admin/settlements/{id}/retry`, `POST /admin/settlements/reversals/{id}/resolve` — Phase 6) and the **hold-queue review surface** (`GET/POST /admin/compliance/holds...` — Phase 2/5, `compliance.Store.ListHolds`/`ResolveHold`). Real remaining scope was just the other two:
 
-- Reconciliation job (ledger balance drift detection against summed entries).
-- SLA-breach alerting.
-- Hold-queue review surface for compliance analysts.
-- Manual settlement-retry tooling.
+- ✅ **Reconciliation job** (`internal/ledger/reconcile.go`) — `ledger_balances`' own comment (migration 000004) said this wasn't built yet, and it wasn't. `ReconcileJob` (ticker-driven, same shape as `session.TTLJob`/`rate.FetchJob`) compares every account's cached balance against a fresh `SUM(ledger_entries)` in one grouped query, flags a mismatch as a `ledger_discrepancies` row (migration 000023) and publishes `ledger.drift_detected` — flag-only, it never rewrites `ledger_balances` itself, per that table's own "never the source of truth" comment. An account already carrying an unresolved discrepancy isn't re-flagged every poll interval. Ops reviews and closes findings manually via `GET /admin/ledger/discrepancies` / `POST /admin/ledger/discrepancies/{id}/resolve`.
+- ✅ **SLA-breach alerting** — `session.markSLABreaches` (`internal/session/ttl.go`) set `sla_breached_at` via a bulk `UPDATE` with no event published, so nothing ever notified ops. Reworked to run inside a transaction and publish `session.sla_breached` once per breaching session (via `UPDATE ... RETURNING`, one round trip), same atomicity discipline `transitionByReservation` already uses. Routes to the ops email channel only (`internal/notification/events.go`'s `emailEvents`), same treatment as `compliance.hold_created` — the tenant already sees the session's real pipeline stage untouched.
+- **Notable ripple**: `ledger.drift_detected` is the first event this system publishes that isn't tenant-scoped — a platform/omnibus ledger account genuinely has no owning tenant. `notification_deliveries.tenant_id` was `NOT NULL` (migration 000022 dropped that), and `notification.Delivery.TenantID` became `*uuid.UUID` throughout the package (`events.go`'s `tenantIDFromPayload`, `webhook.go`'s `sendWebhook` nil-guard, the admin handler's JSON response).
 
 ## Dependency summary
 
@@ -136,8 +135,9 @@ Phase 0 (foundation)
                         └─▶ Phase 5 (session) ✅ complete
                                └─▶ Phase 6 (settlement) ✅ complete
                                       └─▶ Phase 7 (notification) ✅ complete
+                                             └─▶ Phase 8 (ops/observability) ✅ complete
 
-Phase 8 (ops/observability) — parallel to 5–7, not blocking, the only phase left
+Every phase in the original build order is complete.
 ```
 
 ## Open items carried over from ARCHITECTURE.md
@@ -150,4 +150,4 @@ Phase 8 (ops/observability) — parallel to 5–7, not blocking, the only phase 
 All open items from the original design pass are resolved.
 
 ---
-*Next: no open design blockers remain across Phases 0–8. Ready to execute from Phase 0, or continue detailing a specific module's internals (e.g. the corridor config schema) before writing code.*
+*Next: every phase in the original build order (0–8) is complete. No open design blockers remain.*
