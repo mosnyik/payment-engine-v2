@@ -212,7 +212,17 @@ func (s *Store) GetLock(ctx context.Context, id uuid.UUID) (*Lock, error) {
 }
 
 func (s *Store) upsertProviderRate(ctx context.Context, quote Quote, fiatCurrency string) error {
-	_, err := s.pool.Exec(ctx,
+	return UpsertProviderRate(ctx, s.pool, quote, fiatCurrency)
+}
+
+// UpsertProviderRate records one provider's fiat-per-USD quote into
+// provider_rates — the shared write path for both the in-process FetchJob
+// (via Store.upsertProviderRate above) and any standalone rate-fetcher
+// service (e.g. cmd/ratefetcher) that only has a *db.Pool, not a full
+// Store — Store also wires up every other provider/CoinMarketCap, which a
+// single-purpose fetcher has no business touching.
+func UpsertProviderRate(ctx context.Context, pool *db.Pool, quote Quote, fiatCurrency string) error {
+	_, err := pool.Exec(ctx,
 		`INSERT INTO provider_rates (provider, fiat_currency, rate, fetched_at)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (provider, fiat_currency) DO UPDATE SET
