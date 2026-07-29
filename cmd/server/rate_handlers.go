@@ -14,11 +14,11 @@ import (
 
 // rateHandlers implements a public, unauthenticated rate-quote endpoint —
 // no gateway HMAC, no admin auth, same unauthenticated tier as /admin/login
-// and the inbound webhook routes. Publishes exactly what cmd/ratefetcher
-// writes (rate.ProviderCoinGecko in provider_rates) via rate.GetProviderRate
-// — a direct read, not run through GetBestQuote's system-rate-ceiling
-// selection, since this is an informational published rate, not a real
-// reservation a transaction is committed to.
+// and the inbound webhook routes. Publishes exactly the persisted current
+// rate (internal/rate/currentrate.go's CurrentRateJob — system_rates
+// ceiling vs. every enabled provider's quote, recomputed periodically) —
+// the same value LockRate locks transactions against, not a live
+// recomputation per request.
 type rateHandlers struct {
 	rate *rate.Store
 }
@@ -35,8 +35,8 @@ func (h *rateHandlers) getRate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	quote, err := h.rate.GetProviderRate(r.Context(), rate.ProviderCoinGecko, currency)
-	if errors.Is(err, rate.ErrNoQuotesAvailable) {
+	current, err := h.rate.GetCurrentRate(r.Context(), currency)
+	if errors.Is(err, rate.ErrCurrentRateNotComputed) {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("rate: no rate available for %s", currency))
 		return
 	}
@@ -45,7 +45,7 @@ func (h *rateHandlers) getRate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, rateResponse{Rate: formatWithCommas(quote.Rate)})
+	writeJSON(w, http.StatusOK, rateResponse{Rate: formatWithCommas(current.Rate)})
 }
 
 // formatWithCommas renders d as a comma-grouped decimal string —

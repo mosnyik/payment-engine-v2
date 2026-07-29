@@ -65,6 +65,14 @@ func run() error {
 	fetchJob := rate.NewFetchJob(stores.rate, stores.corridor, cfg.RateEngine.FetchInterval)
 	go fetchJob.Run(ctx)
 
+	// The downstream selection step: persists GetBestQuote's result
+	// (system_rates ceiling vs. every enabled provider's quote, including
+	// CoinGecko via cmd/ratefetcher's provider_rates writes) into
+	// current_rates — the one value LockRate and the public
+	// GET /v2/rate/{fiatCurrency} endpoint both read.
+	currentRateJob := rate.NewCurrentRateJob(stores.rate, stores.corridor, cfg.RateEngine.CurrentRateInterval)
+	go currentRateJob.Run(ctx)
+
 	ttlJob := session.NewTTLJob(stores.session, cfg.Session.TTLCheckInterval)
 	go ttlJob.Run(ctx)
 

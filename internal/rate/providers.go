@@ -18,8 +18,14 @@ import (
 )
 
 // maxStaleAge rejects a cached provider rate older than this — the fetch
-// job has either stopped running or that provider has been failing.
-const maxStaleAge = 5 * time.Minute
+// job has either stopped running or that provider has been failing. 25
+// minutes, not 5: cmd/ratefetcher (readOnlyProvider/CoinGecko, below)
+// writes on a 20-minute cadence, so this must comfortably exceed that or a
+// perfectly healthy CoinGecko row would spend most of its life looking
+// stale between two of its own writes. Busha/LiquidRamp/Anchor's
+// in-process 30s FetchJob cadence is unaffected either way — they're
+// disabled TODO stubs today.
+const maxStaleAge = 25 * time.Minute
 
 // Quote is one provider's fiat-per-USD rate.
 type Quote struct {
@@ -96,22 +102,52 @@ func (p *httpProvider) IsEnabled() bool { return p.cfg.Enabled }
 // it never makes a live call itself, so this provider's latency/downtime
 // never sits on the transaction path.
 func (p *httpProvider) FetchRate(ctx context.Context, fiatCurrency string) (Quote, error) {
+	return fetchCachedProviderRate(ctx, p.pool, p.name, fiatCurrency)
+}
+
+// fetchCachedProviderRate reads provider_rates for (name, fiatCurrency),
+// rejecting a row older than maxStaleAge — shared by httpProvider (whose
+// own FetchLiveRate is what keeps the row warm) and readOnlyProvider (whose
+// row is kept warm by an entirely separate process, e.g. cmd/ratefetcher).
+func fetchCachedProviderRate(ctx context.Context, pool *db.Pool, name, fiatCurrency string) (Quote, error) {
 	var rate decimal.Decimal
 	var fetchedAt time.Time
-	err := p.pool.QueryRow(ctx,
+	err := pool.QueryRow(ctx,
 		`SELECT rate, fetched_at FROM provider_rates WHERE provider = $1 AND fiat_currency = $2`,
-		p.name, fiatCurrency,
+		name, fiatCurrency,
 	).Scan(&rate, &fetchedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Quote{}, fmt.Errorf("rate: no cached rate for provider %q — fetch job hasn't run yet", p.name)
+		return Quote{}, fmt.Errorf("rate: no cached rate for provider %q — nothing has written it yet", name)
 	}
 	if err != nil {
-		return Quote{}, fmt.Errorf("rate: fetch cached rate for %q: %w", p.name, err)
+		return Quote{}, fmt.Errorf("rate: fetch cached rate for %q: %w", name, err)
 	}
 	if age := time.Since(fetchedAt); age > maxStaleAge {
-		return Quote{}, fmt.Errorf("rate: cached rate for %q is stale (%s old)", p.name, age.Round(time.Second))
+		return Quote{}, fmt.Errorf("rate: cached rate for %q is stale (%s old)", name, age.Round(time.Second))
 	}
-	return Quote{Provider: p.name, Rate: rate, FetchedAt: fetchedAt}, nil
+	return Quote{Provider: name, Rate: rate, FetchedAt: fetchedAt}, nil
+}
+
+// readOnlyProvider surfaces a provider_rates row into GetBestQuote's
+// selection without ever attempting its own live fetch — deliberately does
+// NOT implement LiveFetcher, unlike httpProvider, so FetchJob (which only
+// drives LiveFetcher-implementing providers) never tries to duplicate a
+// live HTTP call this provider's data-gathering already happens elsewhere
+// for (cmd/ratefetcher, a wholly separate process/container, for
+// ProviderCoinGecko). Always enabled: if nothing has written its row yet,
+// FetchRate fails the same way any other provider's does, and
+// GetAllQuotes already treats a single failing provider as skippable, not
+// fatal.
+type readOnlyProvider struct {
+	name string
+	pool *db.Pool
+}
+
+func (p *readOnlyProvider) Name() string    { return p.name }
+func (p *readOnlyProvider) IsEnabled() bool { return true }
+
+func (p *readOnlyProvider) FetchRate(ctx context.Context, fiatCurrency string) (Quote, error) {
+	return fetchCachedProviderRate(ctx, p.pool, p.name, fiatCurrency)
 }
 
 // FetchLiveRate makes the actual HTTP call — invoked only by the

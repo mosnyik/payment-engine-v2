@@ -2,7 +2,7 @@
 // (rate_handlers.go) — over the actual HTTP router, proving it's reachable
 // with no auth header at all (unlike every other route except
 // /admin/login and the inbound webhooks), not just that
-// rate.Store.GetProviderRate works in isolation (already covered by
+// rate.Store.GetCurrentRate works in isolation (already covered by
 // internal/rate's own tests).
 package main
 
@@ -47,8 +47,8 @@ func newRateTestServer(t *testing.T) (*httptest.Server, *appStores, *db.Pool) {
 	return srv, stores, pool
 }
 
-func TestGetRate_PublicEndpointReturnsCoinGeckoRate(t *testing.T) {
-	srv, _, pool := newRateTestServer(t)
+func TestGetRate_PublicEndpointReturnsPersistedCurrentRate(t *testing.T) {
+	srv, stores, pool := newRateTestServer(t)
 	client := srv.Client()
 	ctx := context.Background()
 
@@ -57,13 +57,17 @@ func TestGetRate_PublicEndpointReturnsCoinGeckoRate(t *testing.T) {
 	// colliding with data left over from a previous run against the same
 	// live dev database.
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
-	err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
+	if err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
 		Provider:  rate.ProviderCoinGecko,
 		Rate:      decimal.RequireFromString("1354.735"),
 		FetchedAt: time.Now(),
-	}, fiatCurrency)
-	if err != nil {
+	}, fiatCurrency); err != nil {
 		t.Fatalf("upsert provider rate: %v", err)
+	}
+	// The endpoint reads current_rates, not provider_rates directly — seed
+	// it the same way rate.CurrentRateJob's periodic tick would.
+	if _, err := stores.rate.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
 	}
 
 	var got struct {
@@ -81,19 +85,46 @@ func TestGetRate_PublicEndpointReturnsCoinGeckoRate(t *testing.T) {
 	}
 }
 
-func TestGetRate_CurrencyLowercaseIsNormalized(t *testing.T) {
-	srv, _, pool := newRateTestServer(t)
+func TestGetRate_SystemRateWinsWhenNoExternalProviderAvailable(t *testing.T) {
+	// Proves the full pipeline end to end over HTTP: system_rates is a
+	// legitimate winning input to GetBestQuote (the "ceiling" — see
+	// ARCHITECTURE.md §7), not just CoinGecko, and CurrentRateJob's compute
+	// step is what makes that selection visible to this public endpoint.
+	srv, stores, _ := newRateTestServer(t)
 	client := srv.Client()
 	ctx := context.Background()
 
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
-	err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
-		Provider:  rate.ProviderCoinGecko,
-		Rate:      decimal.NewFromInt(1650),
-		FetchedAt: time.Now(),
-	}, fiatCurrency)
-	if err != nil {
-		t.Fatalf("upsert provider rate: %v", err)
+	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1650), decimal.Zero, decimal.Zero); err != nil {
+		t.Fatalf("set system rate: %v", err)
+	}
+	if _, err := stores.rate.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
+
+	var got struct {
+		Rate string `json:"rate"`
+	}
+	resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/rate/"+fiatCurrency, "", nil, &got)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if got.Rate != "1,650" {
+		t.Fatalf("expected 1,650, got %q", got.Rate)
+	}
+}
+
+func TestGetRate_CurrencyLowercaseIsNormalized(t *testing.T) {
+	srv, stores, _ := newRateTestServer(t)
+	client := srv.Client()
+	ctx := context.Background()
+
+	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1650), decimal.Zero, decimal.Zero); err != nil {
+		t.Fatalf("set system rate: %v", err)
+	}
+	if _, err := stores.rate.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
 	}
 
 	var got struct {
@@ -118,16 +149,14 @@ func TestGetRate_UnknownCurrencyReturns404(t *testing.T) {
 	unseeded := "TST" + strings.ToUpper(uuid.NewString()[:8])
 	resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/rate/"+unseeded, "", nil, &struct{}{})
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 for a currency with no coingecko rate, got %d", resp.StatusCode)
+		t.Fatalf("expected 404 for a currency with no data at all, got %d", resp.StatusCode)
 	}
 }
 
-func TestGetRate_SystemRateAloneIsNotEnough(t *testing.T) {
-	// This endpoint reads specifically the coingecko-published rate
-	// (rate.ProviderCoinGecko in provider_rates) — a system_rate alone
-	// (ops-configured ceiling, no external provider data) must NOT satisfy
-	// it, since that's a different concept read via a different path
-	// (rate.GetBestQuote, used by LockRate, not this endpoint).
+func TestGetRate_SetButNotYetComputedReturns404(t *testing.T) {
+	// system_rates having a row is not enough on its own — the endpoint
+	// reads current_rates, populated only once CurrentRateJob (or a test's
+	// direct ComputeAndPersistCurrentRate call) has actually run.
 	srv, stores, _ := newRateTestServer(t)
 	client := srv.Client()
 	ctx := context.Background()
@@ -139,6 +168,6 @@ func TestGetRate_SystemRateAloneIsNotEnough(t *testing.T) {
 
 	resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/rate/"+fiatCurrency, "", nil, &struct{}{})
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 (system rate alone isn't a coingecko rate), got %d", resp.StatusCode)
+		t.Fatalf("expected 404 (current rate not computed yet), got %d", resp.StatusCode)
 	}
 }

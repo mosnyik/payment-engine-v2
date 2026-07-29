@@ -88,6 +88,14 @@ type RateEngineConfig struct {
 	Busha               RateProviderConfig
 	LiquidRamp          RateProviderConfig
 	Anchor              RateProviderConfig
+
+	// CurrentRateInterval tunes rate.CurrentRateJob — how often the
+	// persisted "best rate" (current_rates, read by both LockRate and the
+	// public GET /v2/rate/{fiatCurrency} endpoint) is recomputed. A
+	// separate knob from FetchInterval: that one keeps provider_rates warm
+	// for external HTTP-fetched providers, this one is the downstream
+	// selection step.
+	CurrentRateInterval time.Duration // default 15m
 }
 
 // CollectionProviderConfig configures one external crypto-collection
@@ -294,6 +302,7 @@ func Load(source Source) (*Config, error) {
 		Busha:               loadRateProviderConfig(source, "BUSHA"),
 		LiquidRamp:          loadRateProviderConfig(source, "LIQUIDRAMP"),
 		Anchor:              loadRateProviderConfig(source, "ANCHOR"),
+		CurrentRateInterval: durationOrDefault(source, "RATE_CURRENT_RATE_INTERVAL", 15*time.Minute, &errs),
 	}
 
 	// Optional, unlike TENANT_SECRET_ENCRYPTION_KEY — self-custody has no

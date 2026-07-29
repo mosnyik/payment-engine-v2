@@ -94,6 +94,12 @@ func TestSessionCreateAndDepositFlowOverHTTP(t *testing.T) {
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
+	// LockRate (via session.CreateSession) reads the persisted current_rates
+	// snapshot, not GetBestQuote live — seed it the same way
+	// rate.CurrentRateJob would.
+	if _, err := stores.rate.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
 	if err := stores.treasury.RegisterTenantCustomWallet(ctx, tenantID, wallet.Ethereum, uniqueEVMAddress(t), ""); err != nil {
 		t.Fatalf("register tenant custom wallet: %v", err)
 	}

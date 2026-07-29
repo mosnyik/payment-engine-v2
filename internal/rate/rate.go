@@ -27,8 +27,8 @@ var (
 )
 
 // ProviderCoinGecko names the provider_rates rows cmd/ratefetcher writes —
-// shared between that binary's writes and GetProviderRate's reads so the
-// string can't drift between the two.
+// shared between that binary's writes and readOnlyProvider's reads
+// (providers.go) so the string can't drift between the two.
 const ProviderCoinGecko = "coingecko"
 
 // slippageBuffer is subtracted from the selected quote before locking (see
@@ -114,6 +114,7 @@ func New(pool *db.Pool, cfg Config) *Store {
 			newBushaProvider(pool, cfg.Busha),
 			newLiquidRampProvider(pool, cfg.LiquidRamp),
 			newAnchorProvider(pool, cfg.Anchor),
+			&readOnlyProvider{name: ProviderCoinGecko, pool: pool},
 		},
 	}
 }
@@ -156,12 +157,19 @@ func (s *Store) SetSystemRate(ctx context.Context, fiatCurrency string, currentR
 	return nil
 }
 
-// LockRate combines the selected fiat/USD quote with the crypto asset's
-// USD price into a persisted lock (see ARCHITECTURE.md §7). ttl is the
-// caller's responsibility — Phase 5's session module ties it to
-// session/corridor policy; DefaultLockTTL exists only as a convenience.
+// LockRate combines the persisted current rate (CurrentRateJob's periodic
+// GetBestQuote computation, internal/rate/currentrate.go — not re-derived
+// live per call) with the crypto asset's USD price into a persisted lock
+// (see ARCHITECTURE.md §7). ttl is the caller's responsibility — Phase 5's
+// session module ties it to session/corridor policy; DefaultLockTTL exists
+// only as a convenience. Returns ErrCurrentRateNotComputed if the job
+// hasn't computed this currency yet — a fresh corridor's currency between
+// app start and the job's first tick, self-resolving within one interval;
+// deliberately not a trigger for a live fallback computation here, since
+// the persisted value is meant to be the single source of truth every
+// caller (this and the public rate endpoint) agrees on.
 func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, ttl time.Duration) (*Lock, error) {
-	quote, err := s.GetBestQuote(ctx, fiatCurrency)
+	current, err := s.GetCurrentRate(ctx, fiatCurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -170,8 +178,8 @@ func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, 
 		return nil, err
 	}
 
-	adjustment := slippageBuffer.Mul(quote.Rate)
-	adjustedRate := quote.Rate.Sub(adjustment)
+	adjustment := slippageBuffer.Mul(current.Rate)
+	adjustedRate := current.Rate.Sub(adjustment)
 
 	now := time.Now()
 	lock := &Lock{
@@ -179,7 +187,7 @@ func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, 
 		FiatCurrency:  fiatCurrency,
 		Rate:          adjustedRate,
 		AssetPriceUSD: assetPrice,
-		Provider:      quote.Provider,
+		Provider:      current.Provider,
 		LockedAt:      now,
 		ExpiresAt:     now.Add(ttl),
 	}
@@ -218,27 +226,6 @@ func (s *Store) GetLock(ctx context.Context, id uuid.UUID) (*Lock, error) {
 
 func (s *Store) upsertProviderRate(ctx context.Context, quote Quote, fiatCurrency string) error {
 	return UpsertProviderRate(ctx, s.pool, quote, fiatCurrency)
-}
-
-// GetProviderRate returns the latest rate a specific external provider has
-// published for fiatCurrency — a direct provider_rates read, not run
-// through GetBestQuote's system-rate-ceiling selection (ARCHITECTURE.md
-// §7's LockRate logic). The public GET /v2/rate/{fiatCurrency} endpoint
-// uses this to publish exactly what cmd/ratefetcher writes, independent of
-// system_rates or any other provider.
-func (s *Store) GetProviderRate(ctx context.Context, provider, fiatCurrency string) (Quote, error) {
-	q := Quote{Provider: provider}
-	err := s.pool.QueryRow(ctx,
-		`SELECT rate, fetched_at FROM provider_rates WHERE provider = $1 AND fiat_currency = $2`,
-		provider, fiatCurrency,
-	).Scan(&q.Rate, &q.FetchedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Quote{}, fmt.Errorf("%w: no %s rate for %s", ErrNoQuotesAvailable, provider, fiatCurrency)
-	}
-	if err != nil {
-		return Quote{}, fmt.Errorf("rate: get provider rate: %w", err)
-	}
-	return q, nil
 }
 
 // UpsertProviderRate records one provider's fiat-per-USD quote into

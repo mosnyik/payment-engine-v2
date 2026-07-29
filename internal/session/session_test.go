@@ -123,6 +123,12 @@ func setupTestEnv(t *testing.T, providerName string, decision compliance.Decisio
 	if err := rateStore.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
+	// LockRate (via CreateSession) reads the persisted current_rates
+	// snapshot, not GetBestQuote live — seed it the same way
+	// rate.CurrentRateJob would.
+	if _, err := rateStore.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
 
 	treasuryStore := treasury.New(pool, corridorStore, treasury.Config{})
 	// A unique address per test — treasury enforces a partial unique index

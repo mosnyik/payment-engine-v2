@@ -160,6 +160,12 @@ func setupTestEnv(t *testing.T, providers ...*fakeSettlementProvider) *testEnv {
 	if err := rateStore.SetSystemRate(ctx, fiat, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
+	// LockRate (via session.CreateSession) reads the persisted current_rates
+	// snapshot, not GetBestQuote live — seed it the same way
+	// rate.CurrentRateJob would.
+	if _, err := rateStore.ComputeAndPersistCurrentRate(ctx, fiat); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
 
 	treasuryStore := treasury.New(pool, corridorStore, treasury.Config{})
 	if err := treasuryStore.RegisterTenantCustomWallet(ctx, tenantID, wallet.Ethereum, uniqueEVMAddress(t), ""); err != nil {
