@@ -102,7 +102,11 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	router, err := buildRouter(cfg, pool)
+	stores, err := buildStores(cfg, pool)
+	if err != nil {
+		t.Fatalf("build stores: %v", err)
+	}
+	router, err := buildRouter(cfg, stores)
 	if err != nil {
 		t.Fatalf("build router: %v", err)
 	}

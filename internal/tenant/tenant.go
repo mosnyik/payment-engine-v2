@@ -11,8 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +19,7 @@ import (
 	pcrypto "github.com/sirfi/payment-engine-v2/internal/platform/crypto"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/platform/gateway"
+	"github.com/sirfi/payment-engine-v2/internal/platform/webhookurl"
 )
 
 // Compile-time proof that Store satisfies gateway.CredentialLookup —
@@ -236,63 +235,113 @@ func (s *Store) CheckEntitlement(ctx context.Context, tenantID, corridorID uuid.
 	return active, nil
 }
 
-// SetWebhookURL validates and stores a tenant's outbound webhook endpoint.
-// This validates at registration time only — re-checking at delivery time
-// (to guard against DNS rebinding between registration and send) is a
-// Phase 7 (notification) concern, not implemented here.
-func (s *Store) SetWebhookURL(ctx context.Context, tenantID uuid.UUID, webhookURL string) error {
-	if err := ValidateWebhookURL(webhookURL); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidWebhookURL, err)
+// EffectiveFeeBps resolves the fee (in basis points) settlement should apply
+// for a tenant on a corridor: the corridor entitlement's fee_bps_override if
+// set, else the tenant's flat FeeBps. Requires an entitlement row to exist
+// (i.e. CheckEntitlement must already have passed) — a tenant with no
+// entitlement on this corridor has nothing to fall back to but its own
+// FeeBps, so this deliberately doesn't try to guess a default from a
+// missing row the way CheckEntitlement's "no row = false" does.
+func (s *Store) EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error) {
+	var feeBps int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(e.fee_bps_override, t.fee_bps)
+		 FROM tenants t
+		 JOIN tenant_corridor_entitlements e ON e.tenant_id = t.id AND e.corridor_id = $2
+		 WHERE t.id = $1`,
+		tenantID, corridorID,
+	).Scan(&feeBps)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("tenant: effective fee bps: %w", ErrNotFound)
 	}
-	_, err := s.pool.Exec(ctx,
-		`UPDATE tenants SET webhook_url = $2, updated_at = now() WHERE id = $1`,
-		tenantID, webhookURL,
+	if err != nil {
+		return 0, fmt.Errorf("tenant: effective fee bps: %w", err)
+	}
+	return feeBps, nil
+}
+
+// SetWebhookURL validates and stores a tenant's outbound webhook endpoint.
+// Validates at registration time; callers that actually deliver to this
+// URL (e.g. treasury's tenant-notification sender) re-validate again
+// immediately before each send via platform/webhookurl.Validate, guarding
+// against DNS rebinding between registration and send.
+//
+// The first call for a tenant also generates a webhook signing secret
+// (returned once, like IssueAPIKey's HMAC secret — never shown again) so
+// the tenant can verify a delivered webhook actually came from this
+// system. A later call to change the URL keeps the existing secret;
+// signingSecret is empty in that case.
+func (s *Store) SetWebhookURL(ctx context.Context, tenantID uuid.UUID, webhookURL string) (signingSecret string, err error) {
+	if err := ValidateWebhookURL(webhookURL); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidWebhookURL, err)
+	}
+
+	var existingSecret *string
+	err = s.pool.QueryRow(ctx, `SELECT webhook_signing_secret_encrypted FROM tenants WHERE id = $1`, tenantID).Scan(&existingSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("tenant: check webhook signing secret: %w", err)
+	}
+
+	var encryptedSecret *string
+	if existingSecret == nil {
+		signingSecret, err = randomHex(32)
+		if err != nil {
+			return "", err
+		}
+		encrypted, err := s.crypto.Encrypt(signingSecret)
+		if err != nil {
+			return "", fmt.Errorf("tenant: encrypt webhook signing secret: %w", err)
+		}
+		encryptedSecret = &encrypted
+	} else {
+		encryptedSecret = existingSecret
+	}
+
+	_, err = s.pool.Exec(ctx,
+		`UPDATE tenants SET webhook_url = $2, webhook_signing_secret_encrypted = $3, updated_at = now() WHERE id = $1`,
+		tenantID, webhookURL, encryptedSecret,
 	)
 	if err != nil {
-		return fmt.Errorf("tenant: set webhook url: %w", err)
+		return "", fmt.Errorf("tenant: set webhook url: %w", err)
 	}
-	return nil
+	return signingSecret, nil
 }
 
-// ValidateWebhookURL rejects anything that isn't https, and anything whose
-// hostname resolves to a loopback/private/link-local address — including
-// cloud metadata endpoints (169.254.169.254 falls under IsLinkLocalUnicast).
-// This is the direct fix for the v1 audit's SSRF-via-webhook-URL finding,
-// which only checked URL syntax and accepted internal addresses outright.
+// WebhookConfig returns a tenant's registered webhook URL and (decrypted)
+// signing secret — the lookup treasury's TenantWebhookLookup interface
+// calls through, so treasury never imports this package directly.
+func (s *Store) WebhookConfig(ctx context.Context, tenantID uuid.UUID) (webhookURL, signingSecret string, ok bool, err error) {
+	var url, encryptedSecret *string
+	err = s.pool.QueryRow(ctx,
+		`SELECT webhook_url, webhook_signing_secret_encrypted FROM tenants WHERE id = $1`,
+		tenantID,
+	).Scan(&url, &encryptedSecret)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, fmt.Errorf("tenant: get webhook config: %w", err)
+	}
+	if url == nil || encryptedSecret == nil {
+		return "", "", false, nil
+	}
+	secret, err := s.crypto.Decrypt(*encryptedSecret)
+	if err != nil {
+		return "", "", false, fmt.Errorf("tenant: decrypt webhook signing secret: %w", err)
+	}
+	return *url, secret, true, nil
+}
+
+// ValidateWebhookURL rejects anything unsafe to send a webhook to — see
+// platform/webhookurl.Validate (shared with treasury's tenant-notification
+// sender, so the SSRF check exists in exactly one place). This is the
+// direct fix for the v1 audit's SSRF-via-webhook-URL finding, which only
+// checked URL syntax and accepted internal addresses outright.
 func ValidateWebhookURL(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid url: %w", err)
-	}
-	if u.Scheme != "https" {
-		return fmt.Errorf("must use https")
-	}
-	host := u.Hostname()
-	if host == "" {
-		return fmt.Errorf("missing host")
-	}
-
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return fmt.Errorf("could not resolve host: %w", err)
-	}
-	if len(ips) == 0 {
-		return fmt.Errorf("host resolved to no addresses")
-	}
-	for _, ip := range ips {
-		if isDisallowedIP(ip) {
-			return fmt.Errorf("resolves to a private/internal address (%s)", ip)
-		}
-	}
-	return nil
-}
-
-func isDisallowedIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified()
+	return webhookurl.Validate(rawURL)
 }
 
 func randomHex(n int) (string, error) {

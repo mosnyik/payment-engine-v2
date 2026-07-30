@@ -23,6 +23,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 )
 
 type Direction string
@@ -67,10 +68,22 @@ type Transaction struct {
 
 type Ledger struct {
 	pool *db.Pool
+
+	// bus is nil-safe, same convention every other module's bus field
+	// already establishes — used only by Phase 8's reconciliation job
+	// (reconcile.go) to publish ledger.drift_detected. Post itself never
+	// needed to publish anything.
+	bus *eventbus.Bus
 }
 
 func New(pool *db.Pool) *Ledger {
 	return &Ledger{pool: pool}
+}
+
+// SetEventBus wires this Ledger to publish domain events. Optional —
+// nil-safe, see the bus field's doc comment.
+func (l *Ledger) SetEventBus(bus *eventbus.Bus) {
+	l.bus = bus
 }
 
 // Post is the only write path into the ledger. It validates that entries

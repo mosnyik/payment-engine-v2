@@ -159,6 +159,11 @@ func TestLockRate(t *testing.T) {
 	if err := s.SetSystemRate(ctx, fiat, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
+	// LockRate reads the persisted current_rates snapshot (CurrentRateJob's
+	// job), not GetBestQuote live — seed it the same way the job would.
+	if _, err := s.ComputeAndPersistCurrentRate(ctx, fiat); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
 
 	lock, err := s.LockRate(ctx, "USDT", fiat, rate.DefaultLockTTL)
 	if err != nil {
@@ -213,6 +218,9 @@ func TestLockRate_TTLExpiry(t *testing.T) {
 	fiat := uniqueFiat(t)
 	if err := s.SetSystemRate(ctx, fiat, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
+	}
+	if _, err := s.ComputeAndPersistCurrentRate(ctx, fiat); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
 	}
 
 	lock, err := s.LockRate(ctx, "USDT", fiat, -1*time.Second)

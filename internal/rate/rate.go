@@ -26,6 +26,11 @@ var (
 	ErrLockNotFound      = errors.New("rate: lock not found")
 )
 
+// ProviderCoinGecko names the provider_rates rows cmd/ratefetcher writes —
+// shared between that binary's writes and readOnlyProvider's reads
+// (providers.go) so the string can't drift between the two.
+const ProviderCoinGecko = "coingecko"
+
 // slippageBuffer is subtracted from the selected quote before locking (see
 // ARCHITECTURE.md §7). Not an operational config knob like the tunables in
 // platform/config — it's a fixed design decision, not something ops vary
@@ -109,6 +114,7 @@ func New(pool *db.Pool, cfg Config) *Store {
 			newBushaProvider(pool, cfg.Busha),
 			newLiquidRampProvider(pool, cfg.LiquidRamp),
 			newAnchorProvider(pool, cfg.Anchor),
+			&readOnlyProvider{name: ProviderCoinGecko, pool: pool},
 		},
 	}
 }
@@ -151,12 +157,19 @@ func (s *Store) SetSystemRate(ctx context.Context, fiatCurrency string, currentR
 	return nil
 }
 
-// LockRate combines the selected fiat/USD quote with the crypto asset's
-// USD price into a persisted lock (see ARCHITECTURE.md §7). ttl is the
-// caller's responsibility — Phase 5's session module ties it to
-// session/corridor policy; DefaultLockTTL exists only as a convenience.
+// LockRate combines the persisted current rate (CurrentRateJob's periodic
+// GetBestQuote computation, internal/rate/currentrate.go — not re-derived
+// live per call) with the crypto asset's USD price into a persisted lock
+// (see ARCHITECTURE.md §7). ttl is the caller's responsibility — Phase 5's
+// session module ties it to session/corridor policy; DefaultLockTTL exists
+// only as a convenience. Returns ErrCurrentRateNotComputed if the job
+// hasn't computed this currency yet — a fresh corridor's currency between
+// app start and the job's first tick, self-resolving within one interval;
+// deliberately not a trigger for a live fallback computation here, since
+// the persisted value is meant to be the single source of truth every
+// caller (this and the public rate endpoint) agrees on.
 func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, ttl time.Duration) (*Lock, error) {
-	quote, err := s.GetBestQuote(ctx, fiatCurrency)
+	current, err := s.GetCurrentRate(ctx, fiatCurrency)
 	if err != nil {
 		return nil, err
 	}
@@ -165,8 +178,8 @@ func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, 
 		return nil, err
 	}
 
-	adjustment := slippageBuffer.Mul(quote.Rate)
-	adjustedRate := quote.Rate.Sub(adjustment)
+	adjustment := slippageBuffer.Mul(current.Rate)
+	adjustedRate := current.Rate.Sub(adjustment)
 
 	now := time.Now()
 	lock := &Lock{
@@ -174,7 +187,7 @@ func (s *Store) LockRate(ctx context.Context, cryptoAsset, fiatCurrency string, 
 		FiatCurrency:  fiatCurrency,
 		Rate:          adjustedRate,
 		AssetPriceUSD: assetPrice,
-		Provider:      quote.Provider,
+		Provider:      current.Provider,
 		LockedAt:      now,
 		ExpiresAt:     now.Add(ttl),
 	}
@@ -212,7 +225,17 @@ func (s *Store) GetLock(ctx context.Context, id uuid.UUID) (*Lock, error) {
 }
 
 func (s *Store) upsertProviderRate(ctx context.Context, quote Quote, fiatCurrency string) error {
-	_, err := s.pool.Exec(ctx,
+	return UpsertProviderRate(ctx, s.pool, quote, fiatCurrency)
+}
+
+// UpsertProviderRate records one provider's fiat-per-USD quote into
+// provider_rates — the shared write path for both the in-process FetchJob
+// (via Store.upsertProviderRate above) and any standalone rate-fetcher
+// service (e.g. cmd/ratefetcher) that only has a *db.Pool, not a full
+// Store — Store also wires up every other provider/CoinMarketCap, which a
+// single-purpose fetcher has no business touching.
+func UpsertProviderRate(ctx context.Context, pool *db.Pool, quote Quote, fiatCurrency string) error {
+	_, err := pool.Exec(ctx,
 		`INSERT INTO provider_rates (provider, fiat_currency, rate, fetched_at)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (provider, fiat_currency) DO UPDATE SET

@@ -11,18 +11,21 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/compliance"
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
+	"github.com/sirfi/payment-engine-v2/internal/session"
 	"github.com/sirfi/payment-engine-v2/internal/tenant"
 )
 
 // adminHandlers implements the onboarding workflow's admin-facing actions:
 // registration -> KYB submission -> review -> credential issuance ->
-// corridor entitlement -> webhook config (ARCHITECTURE.md §5). Every
-// handler except login sits behind adminauth.Middleware, never the tenant
-// gateway's auth.
+// corridor entitlement -> webhook config (ARCHITECTURE.md §5) -- plus
+// Phase 5's compliance_hold session resolution (ARCHITECTURE.md §8's
+// "analyst approves/rejects" transitions). Every handler except login sits
+// behind adminauth.Middleware, never the tenant gateway's auth.
 type adminHandlers struct {
 	tenant     *tenant.Store
 	compliance *compliance.Store
 	admin      *adminauth.Store
+	session    *session.Store
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -163,6 +166,39 @@ func (h *adminHandlers) resolveHold(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
+// POST /admin/sessions/{sessionID}/resolve {"approved": true, "reason": "..."} —
+// the analyst-driven counterpart to a compliance_hold session's timeout
+// path (ARCHITECTURE.md §8): approves re-runs the rate-lock + deposit-
+// instructions path into pending, rejects is a direct transition.
+func (h *adminHandlers) resolveSessionHold(w http.ResponseWriter, r *http.Request) {
+	sessionID, err := uuid.Parse(chi.URLParam(r, "sessionID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	adminID, ok := adminauth.AdminIDFromContext(r.Context())
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing admin identity"))
+		return
+	}
+
+	var req struct {
+		Approved bool   `json:"approved"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	sess, err := h.session.ResolveComplianceHold(r.Context(), sessionID, adminID, req.Approved, req.Reason)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toSessionResponse(sess))
+}
+
 // POST /admin/tenants/{tenantID}/api-keys — step 4, credential issuance.
 // Refused by tenant.IssueAPIKey unless the tenant is already active (i.e.
 // KYB-approved) — nothing is issued before KYB clears.
@@ -227,9 +263,14 @@ func (h *adminHandlers) setWebhookURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.tenant.SetWebhookURL(r.Context(), tenantID, req.URL); err != nil {
+	signingSecret, err := h.tenant.SetWebhookURL(r.Context(), tenantID, req.URL)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"webhook_url": req.URL})
+	resp := map[string]string{"webhook_url": req.URL}
+	if signingSecret != "" {
+		resp["webhook_signing_secret"] = signingSecret
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

@@ -300,7 +300,7 @@ func TestSetWebhookURL_RejectsSSRFAttempt(t *testing.T) {
 		t.Fatalf("create tenant: %v", err)
 	}
 
-	err = s.SetWebhookURL(ctx, id, "https://169.254.169.254/latest/meta-data/iam/security-credentials/")
+	_, err = s.SetWebhookURL(ctx, id, "https://169.254.169.254/latest/meta-data/iam/security-credentials/")
 	if !errors.Is(err, tenant.ErrInvalidWebhookURL) {
 		t.Fatalf("expected ErrInvalidWebhookURL for a cloud-metadata SSRF attempt, got %v", err)
 	}
