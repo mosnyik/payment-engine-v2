@@ -83,5 +83,14 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	versioned := chi.NewRouter()
 	versioned.Mount("/v2", r)
 
+	// Dev/staging-only: browse docs/openapi.yaml at /docs. Unversioned
+	// (it's tooling, not an API endpoint) and skipped in production since
+	// it reads the spec straight off disk rather than embedding it.
+	if !cfg.IsProduction() {
+		d := docsHandlers{}
+		versioned.Get("/docs", d.ui)
+		versioned.Get("/docs/openapi.yaml", d.spec)
+	}
+
 	return versioned, nil
 }

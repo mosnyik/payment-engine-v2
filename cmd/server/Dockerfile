@@ -19,5 +19,6 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /out/server ./server
 COPY migrations ./migrations
+COPY docs ./docs
 EXPOSE 3700
 ENTRYPOINT ["./server"]

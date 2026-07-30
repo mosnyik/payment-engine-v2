@@ -104,6 +104,16 @@ All routes are versioned under `/v2`.
 - **Admin-authenticated** (`POST /v2/admin/login` to get a token): tenant onboarding/KYB, corridor entitlements, compliance hold review, settlement retry/reversal, notification dead-letter queue, ledger reconciliation — see `cmd/server/router.go` for the full list.
 - **Inbound webhooks** (self-verified by signature, not tenant/admin auth): settlement provider callbacks, Busha deposit notifications.
 
+Full OpenAPI 3.0 spec: [`docs/openapi.yaml`](docs/openapi.yaml) — hand-maintained, update it alongside any route change in `cmd/server/router.go`.
+
+With the server running (`APP_ENV` unset or not `production`), browse it live at **http://localhost:3700/docs** (Swagger UI, raw spec at `/docs/openapi.yaml`). This route is skipped entirely in production. Without a running server, view it with:
+
+```
+npx @redocly/cli preview-docs docs/openapi.yaml
+```
+
+or paste its contents into [editor.swagger.io](https://editor.swagger.io).
+
 ## Testing
 
 Tests are integration tests against a real Postgres (no mocks for the database) — set `DATABASE_URL` (`.env` is loaded automatically) and run:
