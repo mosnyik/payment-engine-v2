@@ -32,9 +32,9 @@ func testConfig(t *testing.T) *config.Config {
 	t.Helper()
 	_ = godotenv.Load("../../.env")
 
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
-		t.Skip("DATABASE_URL not set — skipping integration test")
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
 	}
 
 	key := make([]byte, 32)

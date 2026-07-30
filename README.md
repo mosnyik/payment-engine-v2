@@ -116,13 +116,15 @@ or paste its contents into [editor.swagger.io](https://editor.swagger.io).
 
 ## Testing
 
-Tests are integration tests against a real Postgres (no mocks for the database) — set `DATABASE_URL` (`.env` is loaded automatically) and run:
+Tests are integration tests against a real Postgres (no mocks for the database) — set `TEST_DATABASE_URL` (`.env` is loaded automatically; see `.env.example`) and run:
 
 ```
 go test ./...
 ```
 
-Some tests share state across packages against the same live database; if you see flakiness running the full suite in parallel, run serially instead:
+`TEST_DATABASE_URL` is intentionally separate from `DATABASE_URL` — tests write real rows and don't all clean up after themselves, so pointing them at your dev database lets fixture data pile up there. Point it at any Postgres database (dockerized or native) reachable from your machine, and run migrations against it once (any binary in `cmd/` applies them automatically on startup) before running tests the first time.
+
+Some tests share state across packages against the same test database; if you see flakiness running the full suite in parallel, run serially instead:
 
 ```
 go test -p 1 ./...

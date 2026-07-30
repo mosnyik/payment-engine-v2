@@ -35,7 +35,7 @@ var testTenantEncryptionKey = []byte("01234567890123456789012345678901"[:32])
 // unrelated later test's own row.
 func TestMain(m *testing.M) {
 	_ = godotenv.Load("../../.env")
-	if url := os.Getenv("DATABASE_URL"); url != "" {
+	if url := os.Getenv("TEST_DATABASE_URL"); url != "" {
 		if pool, err := db.Open(context.Background(), url); err == nil {
 			_, _ = pool.Exec(context.Background(), `TRUNCATE notification_deliveries`)
 			pool.Close()
@@ -48,9 +48,9 @@ func openTestPool(t *testing.T) *db.Pool {
 	t.Helper()
 	_ = godotenv.Load("../../.env")
 
-	url := os.Getenv("DATABASE_URL")
+	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("DATABASE_URL not set — skipping integration test")
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
 	}
 
 	pool, err := db.Open(context.Background(), url)
