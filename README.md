@@ -2,7 +2,7 @@
 
 A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, designed for banks and fintechs to plug into as a settlement rail: collect crypto, settle fiat to bank accounts. Every fiat currency, crypto asset, collection partner, settlement partner, and compliance provider is addable via configuration, without a redeploy.
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design (module map, ledger schema, session state machine, corridor/provider config) and [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for build order and current status.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design (module map, ledger schema, session state machine, corridor/provider config).
 
 ## Stack
 
@@ -68,6 +68,12 @@ go run ./cmd/server
 ```
 
 Requires `DATABASE_URL` and `TENANT_SECRET_ENCRYPTION_KEY` set (see `.env.example`) — migrations apply automatically on startup.
+
+For a live-reloading dev server (rebuilds and restarts on every `.go` change), use [air](https://github.com/air-verse/air) — configured in `.air.toml`, pinned as a Go tool dependency in `go.mod`, no separate install needed:
+
+```
+go tool air
+```
 
 ## Configuration
 
