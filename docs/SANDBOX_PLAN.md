@@ -55,16 +55,13 @@ Confirmed compatible with Phase 2: chi's router matches paths, not hostnames, so
 - Kubernetes → an `Ingress` with host-based routing rules.
 - PaaS (Fly.io / Railway / Render) → each app gets its own domain; mostly a "add custom domain" step per app, no proxy config to write.
 
-## Phase 4 — Validation ✅
+## Phase 4 — Validation
 
-- [x] Brought up `docker-compose.sandbox.yml` for real (`docker compose -f docker-compose.sandbox.yml up -d --build`).
-- [x] Ran the full sequence manually over real HTTP against the running sandbox server: register tenant → KYB (auto-approved via the forced sandbox provider) → issue API key → set corridor entitlement → create session (HMAC-signed, `internal/platform/gateway.Sign`).
-- [x] Confirmed the session reaches `settled` with no real provider ever called: `treasury_deposits` row confirmed by the sandbox job (amount computed from the locked rate, matching `rate.Lock.FiatToCrypto`'s formula), `settlement_attempts` row `succeeded` with `provider_name = 'sandbox'`, `settlements.status = 'settled'`, `sessions.status = 'settled'`.
-- [x] `ratefetcher-sandbox` confirmed writing real CoinGecko quotes into the sandbox DB independent of the main stack.
-- [ ] Confirm the real `api.2settle.io` deployment's data is untouched — not yet applicable, no production deployment exists yet.
-
-Torn down after validation (`docker compose -f docker-compose.sandbox.yml down`, volume preserved) — bring back up the same way when needed.
+- [ ] Bring up `docker-compose.sandbox.yml`.
+- [ ] Run the same sequence `cmd/server/onboarding_test.go` already exercises against it manually: register tenant → KYB (auto-approved via the forced sandbox provider) → issue API key → set corridor entitlement → create session.
+- [ ] Confirm the session reaches `settled` with no real provider ever called (check logs / DB rows for the sandbox provider names, not the real ones).
+- [ ] Confirm the real `api.2settle.io` deployment's data is untouched throughout.
 
 ## Rough size
 
-Grew somewhat from the original estimate once seeding and validation surfaced real gaps: ~250–300 lines of new/changed Go across `config.go`, 3 `sandbox_provider.go` files, `cmd/server/sandbox.go` (new), `cmd/server/handlers.go` (sandbox force + the `submitKYB` tenant-activation bridge fix), `stores.go`/`main.go` (ctx-threading, job wiring), `dispatch.go`, plus one new compose file and one new env file. Domain/TLS/proxy work (Phase 3) is separate and gated on a hosting decision.
+~150–200 lines of new/changed Go across 4 files (`config.go` + 3 new `sandbox_provider.go` files) plus small edits to `treasury.New`/`settlement.New`/`stores.go`/`handlers.go`, one new compose file, one new env file. Domain/TLS/proxy work is separate and gated on a hosting decision.
