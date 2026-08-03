@@ -1,6 +1,6 @@
 # Sandbox Environment — Implementation Plan
 
-Status: not started. Companion to `ARCHITECTURE.md`/`IMPLEMENTATION_PLAN.md` but describes an *operational* addition (a second, tenant-facing environment), not a new business module in the Phase 0–8 module map.
+Status: Phase 1 (fake providers) done. Companion to `ARCHITECTURE.md`/`IMPLEMENTATION_PLAN.md` but describes an *operational* addition (a second, tenant-facing environment), not a new business module in the Phase 0–8 module map.
 
 ## Goal
 
@@ -15,20 +15,17 @@ Two options were considered:
 
 **(B) is the chosen approach.** It is not literally zero-code: `treasury.Store.providers` and `settlement.Store.providers` are hardcoded maps built in `New()` (see `internal/treasury/providers.go:47-52`, `internal/settlement/providers.go:59-68`) with no dynamic `Register`, and `SettlementProvider` has an unexported `webhookSecret()` method — so a fake provider must live inside those packages, not bolt on from outside. `compliance.Registry` (`internal/compliance/compliance.go:77-97`) is already pluggable and needs no core changes.
 
-## Phase 1 — Fake providers (code)
+## Phase 1 — Fake providers (code) ✅
 
-- [ ] **`internal/platform/config`** — add `SandboxMode bool`, read from `SANDBOX_MODE` (default `false`), same pattern as every other config flag.
-- [ ] **`internal/compliance/sandbox_provider.go`** (new) — a `ScreeningProvider` (`Name() string`, `Screen(ctx, Case) (Decision, error)`) that always returns `Decision{Approved: true}`. Registered into the `Registry` in `cmd/server/stores.go` only when `cfg.SandboxMode`.
-- [ ] **`internal/treasury/sandbox_provider.go`** (new) — a `CollectionProvider` (`Name`, `IsEnabled`, `CustodyType`, `ReserveAddress`) returning a deterministic fake deposit address. `treasury.New()` registers it into `providers` when `cfg.SandboxMode`. **Open decision — how deposits get confirmed (see below).**
-- [ ] **`internal/settlement/sandbox_provider.go`** (new) — a `SettlementProvider` (`Name`, `IsEnabled`, `Dispatch`, `webhookSecret`) whose `Dispatch` returns immediate success. `settlement.New()` registers it when `cfg.SandboxMode`; `DispatchWorker` settles on its next tick with no real payout API involved.
-- [ ] **`cmd/server/handlers.go` (`submitKYB`)** — when `cfg.SandboxMode`, force `provider_name` to the sandbox compliance provider's name regardless of what's submitted, so sandbox tenants don't need to know a magic string to skip the manual hold queue.
+- [x] **`internal/platform/config`** — added `SandboxMode bool`, read from `SANDBOX_MODE` (default `false`), same pattern as every other config flag.
+- [x] **`internal/compliance/sandbox_provider.go`** — a `ScreeningProvider` (`SandboxProvider`) that always returns `Decision{Approved: true}`. Registered into the `Registry` in `cmd/server/stores.go` only when `cfg.SandboxMode`.
+- [x] **`internal/treasury/sandbox_provider.go`** — a `CollectionProvider` (`sandboxCollectionProvider`) returning a fake deposit address/reference. `treasury.New()` registers it into `providers` when `cfg.SandboxMode`. Deposit confirmation resolved as **timer-based auto-confirm** (see below).
+- [x] **`internal/settlement/sandbox_provider.go`** — a `SettlementProvider` (`sandboxSettlementProvider`) whose `Dispatch` returns immediate `OutcomeAccepted`. `settlement.New()` registers it when `cfg.SandboxMode`; `DispatchWorker.Run` calls `confirmSandboxDispatches` every tick to settle dispatched sandbox attempts with no real payout API or webhook involved.
+- [x] **`cmd/server/handlers.go` (`submitKYB`)** — when `cfg.SandboxMode`, forces `provider_name` to `compliance.SandboxProviderName` regardless of what's submitted.
 
-### Open decision: deposit confirmation mechanism
+### Deposit confirmation mechanism: timer-based auto-confirm (decided)
 
-- **Timer-based auto-confirm** — a ticker (same shape as `session.TTLJob`/`settlement.DispatchWorker`) flips a sandbox reservation to confirmed N seconds after `ReserveAddress`. Tenants watch the full session lifecycle play out unattended — closest to a real integration test, no extra route.
-- **Manual trigger endpoint** — e.g. `POST /v2/sandbox/deposits/{id}/confirm`, letting a tenant's test suite decide exactly when to simulate the deposit — closer to how Stripe's test-mode webhook simulator works, but is a new authenticated route to design and document.
-
-*Decide before starting Phase 1's treasury provider — the two aren't a small variation on each other, they're different code (a background job vs. a new route).*
+`internal/treasury/sandbox_provider.go`'s `SandboxConfirmJob` (started from `main.go` only when `cfg.SandboxMode`) ticks every 3s and, for any sandbox reservation older than 10s with no deposit recorded yet, computes the crypto amount that exactly covers the owning session's locked fiat amount (joined straight from `sessions`/`rate_locks` by SQL) and confirms it via the same `recordDepositTransition` entrypoint the real Busha webhook uses. No new route — a sandbox tenant's test suite just waits and watches the session progress on its own.
 
 ## Phase 2 — Deployment wiring (config, no new code)
 
