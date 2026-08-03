@@ -34,7 +34,7 @@ func newRateTestServer(t *testing.T) (*httptest.Server, *appStores, *db.Pool) {
 	}
 	t.Cleanup(pool.Close)
 
-	stores, err := buildStores(cfg, pool)
+	stores, err := buildStores(ctx, cfg, pool)
 	if err != nil {
 		t.Fatalf("build stores: %v", err)
 	}

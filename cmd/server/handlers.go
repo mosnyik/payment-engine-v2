@@ -22,10 +22,11 @@ import (
 // "analyst approves/rejects" transitions). Every handler except login sits
 // behind adminauth.Middleware, never the tenant gateway's auth.
 type adminHandlers struct {
-	tenant     *tenant.Store
-	compliance *compliance.Store
-	admin      *adminauth.Store
-	session    *session.Store
+	tenant      *tenant.Store
+	compliance  *compliance.Store
+	admin       *adminauth.Store
+	session     *session.Store
+	sandboxMode bool
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -101,11 +102,31 @@ func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sandbox tenants shouldn't need to know a magic provider name to skip
+	// the manual hold queue — force it regardless of what was submitted
+	// (docs/SANDBOX_PLAN.md).
+	if h.sandboxMode {
+		req.ProviderName = compliance.SandboxProviderName
+	}
+
 	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.ProviderName)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+
+	// Bridge: a case a registered provider approved outright (never touching
+	// the hold queue) activates its tenant here — same bridge resolveHold
+	// applies for a case an analyst approves after a hold. Unreachable until
+	// a ScreeningProvider was ever actually registered (see
+	// compliance.Registry's doc comment); SandboxProvider is the first.
+	if c.CaseType == compliance.CaseTypeKYB && c.Status == compliance.StatusApproved {
+		if err := h.tenant.ApproveKYB(r.Context(), c.ReferenceID); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("case approved but failed to activate tenant: %w", err))
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, c)
 }
 

@@ -1,0 +1,722 @@
+openapi: 3.0.3
+info:
+  title: Payment Rail v2 API
+  description: >
+    Crypto-to-fiat payment rail for banks and fintechs. See ARCHITECTURE.md
+    for the full design (module map, ledger schema, session state machine,
+    corridor/provider config). This spec covers every route mounted under
+    /v2 in cmd/server/router.go.
+  version: "2.0"
+servers:
+  - url: http://localhost:3700/v2
+    description: Local dev (go run ./cmd/server, or docker compose up server)
+
+tags:
+  - name: public
+    description: Unauthenticated
+  - name: tenant
+    description: Tenant-authenticated (API key + HMAC signature)
+  - name: admin
+    description: Admin-authenticated (bearer token from /admin/login)
+  - name: webhooks
+    description: Inbound, self-verified by provider signature
+
+security: []
+
+paths:
+  /health:
+    get:
+      tags: [public]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: OK
+
+  /rate/{fiatCurrency}:
+    get:
+      tags: [public]
+      summary: Current published FX rate for a fiat currency
+      description: >
+        Returns the persisted "current rate" (internal/rate's CurrentRateJob
+        output) — the same value LockRate locks transactions against, not a
+        live per-request recomputation.
+      security: []
+      parameters:
+        - name: fiatCurrency
+          in: path
+          required: true
+          schema: { type: string, example: NGN }
+      responses:
+        "200":
+          description: Rate found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rate: { type: string, example: "1,650.00" }
+        "404":
+          description: No rate computed yet for this currency
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/login:
+    post:
+      tags: [admin]
+      summary: Exchange admin credentials for a bearer token
+      description: >
+        The only unauthenticated route under /admin — there is no
+        self-service admin signup; accounts are provisioned via adminctl.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Login succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        "401":
+          description: Invalid credentials
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /sessions:
+    post:
+      tags: [tenant]
+      summary: Create a session (corridor lookup, compliance, rate lock, deposit instructions)
+      security: [{ tenantAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [crypto_asset, crypto_network, fiat_currency, fiat_amount]
+              properties:
+                crypto_asset: { type: string, example: USDT }
+                crypto_network: { type: string, example: TRC20 }
+                fiat_currency: { type: string, example: NGN }
+                fiat_amount: { type: string, example: "100.00" }
+                payout_destination:
+                  type: object
+                  description: Opaque, provider-shaped payout destination.
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Session" } }
+        "400":
+          description: Corridor not supported, tenant not entitled, or invalid destination
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "401":
+          description: Missing/invalid tenant credentials
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /sessions/{sessionID}:
+    get:
+      tags: [tenant]
+      summary: Get a session
+      description: >
+        Returns 404 both when the session truly doesn't exist and when it
+        belongs to a different tenant — never 403.
+      security: [{ tenantAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/sessionID"
+      responses:
+        "200":
+          description: Session found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Session" } }
+        "404":
+          description: Not found (or belongs to a different tenant)
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /webhooks/settlement/{providerName}:
+    post:
+      tags: [webhooks]
+      summary: Settlement provider payout callback
+      description: >
+        Self-verified via the X-Webhook-Signature header
+        (settlement.VerifyWebhookSignature) — not gated by tenant or admin auth.
+      security: []
+      parameters:
+        - name: providerName
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: Provider-shaped payload. }
+      responses:
+        "200":
+          description: Accepted
+        "401":
+          description: Invalid signature
+        "404":
+          description: Unknown provider or attempt
+
+  /webhooks/treasury/busha:
+    post:
+      tags: [webhooks]
+      summary: Busha partner-custodied deposit notification
+      description: >
+        Self-verified via X-Webhook-Signature (treasury.VerifyWebhookSignature).
+        Self-custody deposit detection instead runs via watcher polling, so
+        this path is Busha-specific rather than a generic {providerName}.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: Busha-shaped payload. }
+      responses:
+        "200":
+          description: Accepted
+        "401":
+          description: Invalid signature
+        "404":
+          description: Unknown reservation
+
+  /admin/tenants:
+    post:
+      tags: [admin]
+      summary: "Register a tenant (onboarding step 1)"
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+        "400":
+          description: Missing name
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/tenants/{tenantID}/kyb:
+    post:
+      tags: [admin]
+      summary: "Submit KYB for a tenant (onboarding step 2)"
+      description: >
+        An empty provider_name (no vendor selected yet) always lands in the
+        manual hold queue for a human to resolve via /admin/compliance/holds/{caseID}/resolve.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                submitted_data: { type: object }
+                provider_name: { type: string }
+      responses:
+        "201":
+          description: Case created (approved, rejected, or hold)
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ComplianceCase" } }
+        "400":
+          description: Invalid request
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/compliance/holds:
+    get:
+      tags: [admin]
+      summary: List open compliance holds (ops queue)
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: case_type
+          in: query
+          schema: { type: string, enum: [kyb, transaction_screening], default: kyb }
+      responses:
+        "200":
+          description: Holds
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ComplianceCase" }
+
+  /admin/compliance/holds/{caseID}/resolve:
+    post:
+      tags: [admin]
+      summary: "Approve or reject a compliance hold (onboarding step 3)"
+      description: >
+        A KYB approval synchronously activates the tenant
+        (tenant.ApproveKYB) as part of this call.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: caseID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovalDecision" }
+      responses:
+        "200":
+          description: Case resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ComplianceCase" } }
+        "401":
+          description: Missing admin identity
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "409":
+          description: Already resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/tenants/{tenantID}/api-keys:
+    post:
+      tags: [admin]
+      summary: "Issue an API key + HMAC secret for a tenant (onboarding step 4)"
+      description: >
+        Refused unless the tenant is already active (KYB-approved). The raw
+        secret is shown once and is never retrievable again.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+      responses:
+        "201":
+          description: Credential issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_key: { type: string }
+                  hmac_secret: { type: string }
+        "400":
+          description: Tenant not active
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/tenants/{tenantID}/corridors/{corridorID}:
+    post:
+      tags: [admin]
+      summary: "Set a tenant's corridor entitlement (onboarding step 5)"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+        - name: corridorID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                active: { type: boolean }
+                fee_bps_override:
+                  type: integer
+                  nullable: true
+      responses:
+        "200":
+          description: Entitlement set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+
+  /admin/tenants/{tenantID}/webhook:
+    post:
+      tags: [admin]
+      summary: "Set a tenant's webhook URL (onboarding step 6, SSRF-validated)"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri }
+      responses:
+        "200":
+          description: >
+            Webhook URL set. webhook_signing_secret is present only the
+            first time a secret is generated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook_url: { type: string }
+                  webhook_signing_secret: { type: string }
+        "400":
+          description: Invalid or SSRF-unsafe URL
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/sessions/{sessionID}/resolve:
+    post:
+      tags: [admin]
+      summary: Analyst resolution of a session's compliance hold
+      description: >
+        Approval re-runs the rate-lock + deposit-instructions path into
+        pending; rejection is a direct transition.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/sessionID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovalDecision" }
+      responses:
+        "200":
+          description: Session resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Session" } }
+        "409":
+          description: Not in a resolvable state
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/settlements:
+    get:
+      tags: [admin]
+      summary: List settlements by status (ops queue)
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending_dispatch, dispatching, settling, settled, settlement_failed, reversed, reversal_resolved]
+            default: settlement_failed
+      responses:
+        "200":
+          description: Settlements
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Settlement" }
+
+  /admin/settlements/{settlementID}/retry:
+    post:
+      tags: [admin]
+      summary: Retry a failed settlement, optionally with a corrected destination
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: settlementID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                corrected_destination:
+                  type: object
+                  description: Opaque, provider-shaped payout destination.
+                confirmed_failed: { type: boolean }
+      responses:
+        "200":
+          description: Retry dispatched
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Settlement" } }
+        "409":
+          description: Not retryable
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/settlements/reversals/{reversalID}/resolve:
+    post:
+      tags: [admin]
+      summary: Manually resolve a reversal to wherever the funds actually ended up
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: reversalID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [debit, credit, amount]
+              properties:
+                debit: { $ref: "#/components/schemas/AccountRef" }
+                credit: { $ref: "#/components/schemas/AccountRef" }
+                amount: { type: string, example: "100.00" }
+                note: { type: string }
+      responses:
+        "200":
+          description: Reversal resolved
+        "404":
+          description: Reversal not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "409":
+          description: Already resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/notifications/deliveries:
+    get:
+      tags: [admin]
+      summary: List webhook/email deliveries by status (dead-letter queue)
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, default: dead_letter }
+      responses:
+        "200":
+          description: Deliveries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Delivery" }
+
+  /admin/notifications/deliveries/{deliveryID}/retry:
+    post:
+      tags: [admin]
+      summary: Retry a dead-lettered delivery
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: deliveryID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Retry scheduled
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Delivery" } }
+        "404":
+          description: Not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/ledger/discrepancies:
+    get:
+      tags: [admin]
+      summary: List ledger reconciliation discrepancies
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          description: "\"resolved\" for closed discrepancies; anything else means open."
+          schema: { type: string, default: open }
+      responses:
+        "200":
+          description: Discrepancies
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Discrepancy" }
+
+  /admin/ledger/discrepancies/{discrepancyID}/resolve:
+    post:
+      tags: [admin]
+      summary: Annotate a discrepancy as resolved
+      description: >
+        Never rewrites the cached balance — resolution is a note, not a
+        correction.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: discrepancyID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string }
+      responses:
+        "200":
+          description: Discrepancy resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Discrepancy" } }
+        "409":
+          description: Already resolved
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+components:
+  parameters:
+    tenantID:
+      name: tenantID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    sessionID:
+      name: sessionID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  securitySchemes:
+    tenantAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Requires three headers together: X-API-Key, X-Timestamp (used in the
+        signed string and checked against a clock-skew window), and
+        X-Signature (HMAC-SHA256 over method+path+timestamp+body, keyed by
+        the tenant's HMAC secret — see internal/platform/gateway/hmac.go's
+        Sign function for the exact construction). OpenAPI has no native way
+        to express a 3-header composite scheme, so this entry documents
+        X-API-Key as the representative header.
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: Token obtained from POST /admin/login.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    ApprovalDecision:
+      type: object
+      required: [approved]
+      properties:
+        approved: { type: boolean }
+        reason: { type: string }
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [compliance_hold, pending, deposit_confirmed, settling, settled, settlement_failed, reversed, reversal_resolved]
+        fiat_currency: { type: string }
+        fiat_amount: { type: string }
+        crypto_asset: { type: string }
+        crypto_network: { type: string }
+        deposit_reservation_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string }
+
+    ComplianceCase:
+      type: object
+      properties:
+        ID: { type: string, format: uuid }
+        CaseType: { type: string, enum: [kyb, transaction_screening] }
+        ReferenceType: { type: string }
+        ReferenceID: { type: string, format: uuid }
+        Status: { type: string, enum: [approved, rejected, hold] }
+        ProviderName: { type: string, nullable: true }
+        DecisionReason: { type: string, nullable: true }
+        SubmittedData: { type: object }
+        HoldExpiresAt: { type: string, nullable: true }
+        ResolvedBy: { type: string, format: uuid, nullable: true }
+        CreatedAt: { type: string }
+        ResolvedAt: { type: string, nullable: true }
+
+    Settlement:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending_dispatch, dispatching, settling, settled, settlement_failed, reversed, reversal_resolved]
+        crypto_asset: { type: string }
+        crypto_amount: { type: string }
+        fiat_currency: { type: string }
+        fiat_value: { type: string }
+        fee_amount: { type: string }
+        tenant_payable_amount: { type: string }
+        attempt_count: { type: integer }
+        ops_paged: { type: boolean }
+        created_at: { type: string }
+
+    AccountRef:
+      type: object
+      required: [account_type, asset_code, unit_type, name]
+      properties:
+        tenant_id: { type: string, format: uuid, nullable: true }
+        account_type: { type: string }
+        asset_code: { type: string }
+        unit_type: { type: string }
+        name: { type: string }
+
+    Delivery:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        event_type: { type: string }
+        channel: { type: string }
+        destination: { type: string }
+        status: { type: string }
+        attempt_count: { type: integer }
+        last_error: { type: string, nullable: true }
+        next_attempt_at: { type: string }
+        created_at: { type: string }
+
+    Discrepancy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        cached_balance: { type: string }
+        computed_balance: { type: string }
+        drift_amount: { type: string }
+        detected_at: { type: string }
+        resolved_at: { type: string, nullable: true }
+        resolved_by: { type: string, format: uuid, nullable: true }
+        resolution_note: { type: string, nullable: true }

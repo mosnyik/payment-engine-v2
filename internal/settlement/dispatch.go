@@ -69,12 +69,21 @@ func NewDispatchWorker(store *Store, pollInterval time.Duration) *DispatchWorker
 func (w *DispatchWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
+	// Checked once, not per-tick: whether the sandbox provider exists at all
+	// is fixed at Store construction (settlement.New), so re-checking the
+	// map every tick would just waste a lookup.
+	_, sandboxActive := w.store.providers[SandboxProviderName]
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			w.dispatchBatch(ctx)
+			if sandboxActive {
+				if err := w.store.confirmSandboxDispatches(ctx); err != nil {
+					log.Printf("settlement: confirm sandbox dispatches: %v", err)
+				}
+			}
 		}
 	}
 }

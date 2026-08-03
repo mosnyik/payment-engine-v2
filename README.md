@@ -48,6 +48,25 @@ docker compose up
   ```
 - The rate fetcher (`ratefetcher`) is fully independent — it never needs the server running, only Postgres.
 
+### Sandbox environment
+
+A second, fully independent deployment (own database, own ports, own config) with fake compliance/treasury/settlement providers instead of real ones — same codebase, same API shape. See [`docs/SANDBOX_PLAN.md`](docs/SANDBOX_PLAN.md) for the full design.
+
+Bring both stacks up together — one command per file starts every container in it, not one command per container:
+
+```
+docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.sandbox.yml up -d --build
+```
+
+(drop `--build` once the images already reflect your current code — faster startup)
+
+- Sandbox server: `:3701` (main stack stays on `:3700`). Sandbox Postgres: `:5434` (main stack stays on `:5433`).
+- One-time: `.env.sandbox` ships with a placeholder `TENANT_SECRET_ENCRYPTION_KEY` — replace it with a real one (`openssl rand -hex 32`), same as `.env.example`'s.
+- One-time: provision a sandbox admin account — the same `adminctl` command from [Provisioning](#provisioning) below, but with `DATABASE_URL`/`TENANT_SECRET_ENCRYPTION_KEY` pointed at the sandbox database (`localhost:5434`/`2settle_sandbox`) and `.env.sandbox`'s key, instead of `.env`'s.
+- Corridors are seeded automatically at startup from `.env.sandbox`'s `SANDBOX_CORRIDORS` (default `USDT:SANDBOX:NGN`) — no manual corridor/provider-binding setup needed.
+- Tear down: `docker compose -f docker-compose.sandbox.yml down` (add `-v` to also wipe the sandbox database).
+
 ### Against a database outside Docker
 
 Build and run the server image standalone, pointing at any reachable Postgres:
@@ -104,15 +123,27 @@ All routes are versioned under `/v2`.
 - **Admin-authenticated** (`POST /v2/admin/login` to get a token): tenant onboarding/KYB, corridor entitlements, compliance hold review, settlement retry/reversal, notification dead-letter queue, ledger reconciliation — see `cmd/server/router.go` for the full list.
 - **Inbound webhooks** (self-verified by signature, not tenant/admin auth): settlement provider callbacks, Busha deposit notifications.
 
+Full OpenAPI 3.0 spec: [`docs/openapi.yaml`](docs/openapi.yaml) — hand-maintained, update it alongside any route change in `cmd/server/router.go`.
+
+With the server running (`APP_ENV` unset or not `production`), browse it live at **http://localhost:3700/docs** (Swagger UI, raw spec at `/docs/openapi.yaml`). This route is skipped entirely in production. Without a running server, view it with:
+
+```
+npx @redocly/cli preview-docs docs/openapi.yaml
+```
+
+or paste its contents into [editor.swagger.io](https://editor.swagger.io).
+
 ## Testing
 
-Tests are integration tests against a real Postgres (no mocks for the database) — set `DATABASE_URL` (`.env` is loaded automatically) and run:
+Tests are integration tests against a real Postgres (no mocks for the database) — set `TEST_DATABASE_URL` (`.env` is loaded automatically; see `.env.example`) and run:
 
 ```
 go test ./...
 ```
 
-Some tests share state across packages against the same live database; if you see flakiness running the full suite in parallel, run serially instead:
+`TEST_DATABASE_URL` is intentionally separate from `DATABASE_URL` — tests write real rows and don't all clean up after themselves, so pointing them at your dev database lets fixture data pile up there. Point it at any Postgres database (dockerized or native) reachable from your machine, and run migrations against it once (any binary in `cmd/` applies them automatically on startup) before running tests the first time.
+
+Some tests share state across packages against the same test database; if you see flakiness running the full suite in parallel, run serially instead:
 
 ```
 go test -p 1 ./...

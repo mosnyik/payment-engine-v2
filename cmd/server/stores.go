@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/shopspring/decimal"
@@ -41,14 +42,28 @@ type appStores struct {
 	bus          *eventbus.Bus
 }
 
-func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
+func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	tenantStore, err := tenant.New(pool, cfg.TenantSecretEncryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("build stores: %w", err)
 	}
-	complianceStore := compliance.New(pool, compliance.NewRegistry())
+	complianceRegistry := compliance.NewRegistry()
+	if cfg.SandboxMode {
+		complianceRegistry.Register(compliance.SandboxProvider{})
+	}
+	complianceStore := compliance.New(pool, complianceRegistry)
 	adminStore := adminauth.New(pool, cfg.AdminSessionTTL)
 	corridorStore := corridor.New(pool)
+
+	// Config-driven sandbox corridor/provider-binding seeding — must happen
+	// before the rate engine's CurrentRateJob starts in main.go (its own
+	// warm-up run needs ListActiveFiatCurrencies to already see these), and
+	// before any request can reach session.CreateSession.
+	if cfg.SandboxMode {
+		if err := seedSandboxCorridors(ctx, corridorStore, cfg.SandboxCorridors); err != nil {
+			return nil, fmt.Errorf("build stores: %w", err)
+		}
+	}
 
 	rateStore := rate.New(pool, rate.Config{
 		CoinMarketCapAPIKey: cfg.RateEngine.CoinMarketCapAPIKey,
@@ -83,6 +98,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		},
 		TenantWebhookTimeout:    cfg.Treasury.TenantWebhookTimeout,
 		TenantWebhookMaxRetries: cfg.Treasury.TenantWebhookMaxRetries,
+		SandboxMode:             cfg.SandboxMode,
 	})
 
 	// The eventbus dispatcher itself is started from main.go (needs a
@@ -104,6 +120,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),
 		Monnify:     settlement.SettlementProviderConfig(cfg.Settlement.Monnify),
 		HydrogenPay: settlement.SettlementProviderConfig(cfg.Settlement.HydrogenPay),
+		SandboxMode: cfg.SandboxMode,
 	})
 	settlementStore.SetEventBus(bus)
 	settlementStore.RegisterEventHandlers()

@@ -28,9 +28,9 @@ func openTestPool(t *testing.T) *db.Pool {
 	t.Helper()
 	_ = godotenv.Load("../../.env")
 
-	url := os.Getenv("DATABASE_URL")
+	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("DATABASE_URL not set — skipping integration test")
+		t.Skip("TEST_DATABASE_URL not set — skipping integration test")
 	}
 
 	pool, err := db.Open(context.Background(), url)

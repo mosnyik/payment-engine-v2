@@ -32,7 +32,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.Post("/sessions", sh.createSession)
 	protected.Get("/sessions/{sessionID}", sh.getSession)
 
-	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session}
+	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
 	sth := &settlementHandlers{settlement: stores.settlement}
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}
@@ -82,6 +82,15 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// this single mount point rather than per-route.
 	versioned := chi.NewRouter()
 	versioned.Mount("/v2", r)
+
+	// Dev/staging-only: browse docs/openapi.yaml at /docs. Unversioned
+	// (it's tooling, not an API endpoint) and skipped in production since
+	// it reads the spec straight off disk rather than embedding it.
+	if !cfg.IsProduction() {
+		d := docsHandlers{}
+		versioned.Get("/docs", d.ui)
+		versioned.Get("/docs/openapi.yaml", d.spec)
+	}
 
 	return versioned, nil
 }

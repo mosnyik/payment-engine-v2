@@ -13,6 +13,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 	"github.com/sirfi/payment-engine-v2/internal/session"
 	"github.com/sirfi/payment-engine-v2/internal/settlement"
+	"github.com/sirfi/payment-engine-v2/internal/treasury"
 )
 
 func main() {
@@ -47,7 +48,7 @@ func run() error {
 	// Builds every module Store once, including wiring treasury's
 	// SetEventBus and session's RegisterEventHandlers — both must happen
 	// before bus.Run starts below (see appStores' doc comment).
-	stores, err := buildStores(cfg, pool)
+	stores, err := buildStores(ctx, cfg, pool)
 	if err != nil {
 		return err
 	}
@@ -85,6 +86,14 @@ func run() error {
 
 	timeoutJob := settlement.NewTimeoutJob(stores.settlement, cfg.Settlement.TimeoutCheckPollInterval)
 	go timeoutJob.Run(ctx)
+
+	// The sandbox environment's fake-deposit confirmer (docs/SANDBOX_PLAN.md)
+	// — only worth running at all when SandboxMode actually registered the
+	// provider it acts on; otherwise it would tick forever finding nothing.
+	if cfg.SandboxMode {
+		sandboxConfirmJob := treasury.NewSandboxConfirmJob(stores.treasury)
+		go sandboxConfirmJob.Run(ctx)
+	}
 
 	// notification's delivery sender (Phase 7) — same "eventbus handler
 	// claims a local row, this ticker-driven worker does the real network

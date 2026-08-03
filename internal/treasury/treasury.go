@@ -104,6 +104,11 @@ type Config struct {
 	// back to sensible defaults in New.
 	TenantWebhookTimeout    time.Duration
 	TenantWebhookMaxRetries int
+
+	// SandboxMode registers the fake sandbox collection provider (see
+	// sandbox_provider.go) — set from config.Config.SandboxMode by
+	// cmd/server/stores.go.
+	SandboxMode bool
 }
 
 // ChainConfig mirrors config.ChainConfig — see watcher.go.
@@ -179,6 +184,10 @@ func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 		busha.Name():        busha,
 		selfCustody.Name():  selfCustody,
 		tenantWallet.Name(): tenantWallet,
+	}
+	if cfg.SandboxMode {
+		sandbox := sandboxCollectionProvider{}
+		s.providers[sandbox.Name()] = sandbox
 	}
 	return s
 }
