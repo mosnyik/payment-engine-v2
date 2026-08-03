@@ -7,7 +7,10 @@ import (
 	"github.com/google/uuid"
 )
 
-const sandboxProviderName = "sandbox"
+// SandboxProviderName is the registered name of the fake sandbox settlement
+// provider — cmd/server's sandbox corridor seeding binds a corridor's
+// settlement provider to this when config.SandboxMode is set.
+const SandboxProviderName = "sandbox"
 
 // sandboxSettlementProvider is the fake SettlementProvider registered only
 // when Config.SandboxMode is set (see New) — Dispatch always accepts
@@ -17,7 +20,7 @@ const sandboxProviderName = "sandbox"
 // loop directly instead.
 type sandboxSettlementProvider struct{}
 
-func (sandboxSettlementProvider) Name() string    { return sandboxProviderName }
+func (sandboxSettlementProvider) Name() string    { return SandboxProviderName }
 func (sandboxSettlementProvider) IsEnabled() bool { return true }
 
 func (sandboxSettlementProvider) Dispatch(_ context.Context, _ PayoutRequest) (PayoutResult, error) {
@@ -39,14 +42,14 @@ func (s *Store) confirmSandboxDispatches(ctx context.Context) error {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, settlement_id FROM settlement_attempts
 		 WHERE provider_name = $1 AND status = 'dispatched'`,
-		sandboxProviderName,
+		SandboxProviderName,
 	)
 	if err != nil {
 		return fmt.Errorf("settlement: find due sandbox dispatches: %w", err)
 	}
 	var attempts []settlementAttempt
 	for rows.Next() {
-		a := settlementAttempt{ProviderName: sandboxProviderName}
+		a := settlementAttempt{ProviderName: SandboxProviderName}
 		if err := rows.Scan(&a.ID, &a.SettlementID); err != nil {
 			rows.Close()
 			return fmt.Errorf("settlement: scan due sandbox dispatch: %w", err)

@@ -35,6 +35,13 @@ type Config struct {
 	// against its own database, not a per-request flag (docs/SANDBOX_PLAN.md).
 	SandboxMode bool
 
+	// SandboxCorridors is a comma-separated list of "cryptoAsset:cryptoNetwork:fiatCurrency"
+	// triples (e.g. "USDT:SANDBOX:NGN") — cmd/server upserts one corridor per
+	// entry at startup, with compliance/collection/settlement provider
+	// bindings pointed at the sandbox fakes, only when SandboxMode is set.
+	// Only meaningful in sandbox mode; ignored otherwise.
+	SandboxCorridors string
+
 	DatabaseURL string
 
 	// TenantSecretEncryptionKey encrypts tenant credentials (e.g. HMAC
@@ -271,6 +278,7 @@ func Load(source Source) (*Config, error) {
 
 	environment := stringOrDefault(source, "APP_ENV", "development")
 	sandboxMode := boolOrDefault(source, "SANDBOX_MODE", false)
+	sandboxCorridors := stringOrDefault(source, "SANDBOX_CORRIDORS", "USDT:SANDBOX:NGN")
 
 	databaseURL := requireString(source, "DATABASE_URL", &errs)
 	if environment == "production" && databaseURL == localDevDatabaseURL {
@@ -376,6 +384,7 @@ func Load(source Source) (*Config, error) {
 	return &Config{
 		Environment:               environment,
 		SandboxMode:               sandboxMode,
+		SandboxCorridors:          sandboxCorridors,
 		DatabaseURL:               databaseURL,
 		TenantSecretEncryptionKey: tenantSecretEncryptionKey,
 		HMACClockSkew:             hmacClockSkew,

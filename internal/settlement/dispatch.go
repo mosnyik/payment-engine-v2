@@ -72,7 +72,7 @@ func (w *DispatchWorker) Run(ctx context.Context) {
 	// Checked once, not per-tick: whether the sandbox provider exists at all
 	// is fixed at Store construction (settlement.New), so re-checking the
 	// map every tick would just waste a lookup.
-	_, sandboxActive := w.store.providers[sandboxProviderName]
+	_, sandboxActive := w.store.providers[SandboxProviderName]
 	for {
 		select {
 		case <-ctx.Done():
