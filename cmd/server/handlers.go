@@ -114,6 +114,19 @@ func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+
+	// Bridge: a case a registered provider approved outright (never touching
+	// the hold queue) activates its tenant here — same bridge resolveHold
+	// applies for a case an analyst approves after a hold. Unreachable until
+	// a ScreeningProvider was ever actually registered (see
+	// compliance.Registry's doc comment); SandboxProvider is the first.
+	if c.CaseType == compliance.CaseTypeKYB && c.Status == compliance.StatusApproved {
+		if err := h.tenant.ApproveKYB(r.Context(), c.ReferenceID); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("case approved but failed to activate tenant: %w", err))
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, c)
 }
 

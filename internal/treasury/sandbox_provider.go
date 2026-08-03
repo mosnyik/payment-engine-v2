@@ -124,6 +124,15 @@ func (s *Store) confirmDueSandboxDeposits(ctx context.Context) error {
 		// Mirrors rate.Lock.FiatToCrypto's formula: fiat -> USD -> crypto.
 		cryptoAmount := d.fiatAmount.Div(d.rate).Div(d.assetPriceUSD)
 		txReference := "sandbox-" + d.reservationID.String()
+		// Through "detected" first, then "confirmed" — not just a status
+		// value, a distinct event each (treasury.deposit_detected/confirmed).
+		// session.handleDepositConfirmed's own CAS only fires from
+		// deposit_detected (events.go), the same two-step sequence a real
+		// Busha webhook pair drives; skipping straight to "confirmed" would
+		// silently no-op there and strand the session in "pending" forever.
+		if err := s.recordDepositTransition(ctx, d.reservationID, "detected", cryptoAmount, txReference, payload); err != nil {
+			return fmt.Errorf("treasury: detect sandbox deposit %s: %w", d.reservationID, err)
+		}
 		if err := s.recordDepositTransition(ctx, d.reservationID, "confirmed", cryptoAmount, txReference, payload); err != nil {
 			return fmt.Errorf("treasury: confirm sandbox deposit %s: %w", d.reservationID, err)
 		}
