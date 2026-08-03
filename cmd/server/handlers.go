@@ -22,10 +22,11 @@ import (
 // "analyst approves/rejects" transitions). Every handler except login sits
 // behind adminauth.Middleware, never the tenant gateway's auth.
 type adminHandlers struct {
-	tenant     *tenant.Store
-	compliance *compliance.Store
-	admin      *adminauth.Store
-	session    *session.Store
+	tenant      *tenant.Store
+	compliance  *compliance.Store
+	admin       *adminauth.Store
+	session     *session.Store
+	sandboxMode bool
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -99,6 +100,13 @@ func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+
+	// Sandbox tenants shouldn't need to know a magic provider name to skip
+	// the manual hold queue — force it regardless of what was submitted
+	// (docs/SANDBOX_PLAN.md).
+	if h.sandboxMode {
+		req.ProviderName = compliance.SandboxProviderName
 	}
 
 	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.ProviderName)
