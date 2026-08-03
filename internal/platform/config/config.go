@@ -29,6 +29,12 @@ type Config struct {
 	// APP_ENV. Gates the weak/placeholder-secret checks below.
 	Environment string
 
+	// SandboxMode switches on the fake compliance/treasury/settlement
+	// providers (see each package's sandbox_provider.go) instead of the
+	// real ones — a second, independent deployment of this same binary
+	// against its own database, not a per-request flag (docs/SANDBOX_PLAN.md).
+	SandboxMode bool
+
 	DatabaseURL string
 
 	// TenantSecretEncryptionKey encrypts tenant credentials (e.g. HMAC
@@ -264,6 +270,7 @@ func Load(source Source) (*Config, error) {
 	var errs []string
 
 	environment := stringOrDefault(source, "APP_ENV", "development")
+	sandboxMode := boolOrDefault(source, "SANDBOX_MODE", false)
 
 	databaseURL := requireString(source, "DATABASE_URL", &errs)
 	if environment == "production" && databaseURL == localDevDatabaseURL {
@@ -368,6 +375,7 @@ func Load(source Source) (*Config, error) {
 
 	return &Config{
 		Environment:               environment,
+		SandboxMode:               sandboxMode,
 		DatabaseURL:               databaseURL,
 		TenantSecretEncryptionKey: tenantSecretEncryptionKey,
 		HMACClockSkew:             hmacClockSkew,
