@@ -32,7 +32,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.Post("/sessions", sh.createSession)
 	protected.Get("/sessions/{sessionID}", sh.getSession)
 
-	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session}
+	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
 	sth := &settlementHandlers{settlement: stores.settlement}
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}

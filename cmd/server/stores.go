@@ -46,7 +46,11 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build stores: %w", err)
 	}
-	complianceStore := compliance.New(pool, compliance.NewRegistry())
+	complianceRegistry := compliance.NewRegistry()
+	if cfg.SandboxMode {
+		complianceRegistry.Register(compliance.SandboxProvider{})
+	}
+	complianceStore := compliance.New(pool, complianceRegistry)
 	adminStore := adminauth.New(pool, cfg.AdminSessionTTL)
 	corridorStore := corridor.New(pool)
 
@@ -83,6 +87,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		},
 		TenantWebhookTimeout:    cfg.Treasury.TenantWebhookTimeout,
 		TenantWebhookMaxRetries: cfg.Treasury.TenantWebhookMaxRetries,
+		SandboxMode:             cfg.SandboxMode,
 	})
 
 	// The eventbus dispatcher itself is started from main.go (needs a
@@ -104,6 +109,7 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),
 		Monnify:     settlement.SettlementProviderConfig(cfg.Settlement.Monnify),
 		HydrogenPay: settlement.SettlementProviderConfig(cfg.Settlement.HydrogenPay),
+		SandboxMode: cfg.SandboxMode,
 	})
 	settlementStore.SetEventBus(bus)
 	settlementStore.RegisterEventHandlers()
