@@ -1,0 +1,71 @@
+# The sandbox environment (docs/SANDBOX_PLAN.md): a second, fully
+# independent deployment of the same three services docker-compose.yml
+# runs, against its own database — SANDBOX_MODE (.env.sandbox) is what
+# actually switches server-sandbox's providers to fakes, this file just
+# gives it somewhere isolated to run. `name:` below pins the compose
+# project name so this stack (containers, network, volume) never collides
+# with or gets merged into the plain `docker-compose.yml` stack, even
+# though both files live in the same directory — run with:
+#   docker compose -f docker-compose.sandbox.yml up -d
+name: payment-engine-v2-sandbox
+
+services:
+  postgres-sandbox:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payment_engine
+      POSTGRES_PASSWORD: local_dev_only
+      POSTGRES_DB: 2settle_sandbox
+    ports:
+      # Host port 5434 — distinct from the main stack's 5433 (and the
+      # native Postgres install some machines already have on 5432) so both
+      # stacks can run side by side.
+      - "5434:5432"
+    volumes:
+      - postgres_sandbox_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_engine -d 2settle_sandbox"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server-sandbox:
+    build:
+      context: .
+      dockerfile: cmd/server/Dockerfile
+    env_file:
+      - .env.sandbox
+    environment:
+      # Overrides .env.sandbox's own DATABASE_URL (that one points at
+      # localhost:5434, for running the binary directly on the host) —
+      # inside this compose network postgres-sandbox is reached by service
+      # name on its container-internal port, same split the main stack's
+      # docker-compose.yml already establishes for `server`.
+      DATABASE_URL: postgres://payment_engine:local_dev_only@postgres-sandbox:5432/2settle_sandbox?sslmode=disable
+    ports:
+      # Host port 3701 — distinct from the main stack's server on 3700, so
+      # a tenant can point sandbox.2settle.io's reverse proxy here later
+      # (Phase 3) while api.2settle.io keeps talking to the main stack.
+      - "3701:3700"
+    depends_on:
+      postgres-sandbox:
+        condition: service_healthy
+
+  ratefetcher-sandbox:
+    build:
+      context: .
+      dockerfile: cmd/ratefetcher/Dockerfile
+    environment:
+      # Deliberately the exact same mechanism the main stack's ratefetcher
+      # uses to keep provider_rates warm — sandbox rates are not
+      # special-cased or hardcoded (see .env.sandbox's rate engine comment).
+      DATABASE_URL: postgres://payment_engine:local_dev_only@postgres-sandbox:5432/2settle_sandbox?sslmode=disable
+      COINGECKO_FIAT_CURRENCY: NGN
+      COINGECKO_FETCH_INTERVAL: 20m
+      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+    depends_on:
+      postgres-sandbox:
+        condition: service_healthy
+
+volumes:
+  postgres_sandbox_data:
