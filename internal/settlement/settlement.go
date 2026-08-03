@@ -97,6 +97,11 @@ type Config struct {
 	Paystack    SettlementProviderConfig
 	Monnify     SettlementProviderConfig
 	HydrogenPay SettlementProviderConfig
+
+	// SandboxMode registers the fake sandbox settlement provider (see
+	// sandbox_provider.go) — set from config.Config.SandboxMode by
+	// cmd/server/stores.go.
+	SandboxMode bool
 }
 
 type Store struct {
@@ -122,6 +127,17 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 	paystack := newPaystackProvider(cfg.Paystack)
 	monnify := newMonnifyProvider(cfg.Monnify)
 	hydrogenpay := newHydrogenPayProvider(cfg.HydrogenPay)
+	providers := map[string]SettlementProvider{
+		cngn.Name():        cngn,
+		flutterwave.Name(): flutterwave,
+		paystack.Name():    paystack,
+		monnify.Name():     monnify,
+		hydrogenpay.Name(): hydrogenpay,
+	}
+	if cfg.SandboxMode {
+		sandbox := sandboxSettlementProvider{}
+		providers[sandbox.Name()] = sandbox
+	}
 	return &Store{
 		pool:          pool,
 		ledger:        ledgerStore,
@@ -130,13 +146,7 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 		treasuryStore: treasuryStore,
 		rateStore:     rateStore,
 		feeResolver:   feeResolver,
-		providers: map[string]SettlementProvider{
-			cngn.Name():        cngn,
-			flutterwave.Name(): flutterwave,
-			paystack.Name():    paystack,
-			monnify.Name():     monnify,
-			hydrogenpay.Name(): hydrogenpay,
-		},
+		providers:     providers,
 	}
 }
 
