@@ -11,7 +11,10 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const sandboxProviderName = "sandbox"
+// SandboxProviderName is the registered name of the fake sandbox collection
+// provider — cmd/server's sandbox corridor seeding binds a corridor's
+// collection provider to this when config.SandboxMode is set.
+const SandboxProviderName = "sandbox"
 
 // sandboxConfirmDelay/sandboxConfirmPollInterval are compiled-in, not ops
 // knobs — the sandbox environment (docs/SANDBOX_PLAN.md) is a fixed-behavior
@@ -30,7 +33,7 @@ const (
 // them on a timer instead.
 type sandboxCollectionProvider struct{}
 
-func (sandboxCollectionProvider) Name() string             { return sandboxProviderName }
+func (sandboxCollectionProvider) Name() string             { return SandboxProviderName }
 func (sandboxCollectionProvider) IsEnabled() bool          { return true }
 func (sandboxCollectionProvider) CustodyType() CustodyType { return CustodyTypePartner }
 
@@ -88,7 +91,7 @@ func (s *Store) confirmDueSandboxDeposits(ctx context.Context) error {
 		 JOIN rate_locks rl ON rl.id = s.rate_lock_id
 		 WHERE r.provider_name = $1 AND r.status = 'reserved' AND r.reserved_at < $2
 		   AND NOT EXISTS (SELECT 1 FROM treasury_deposits d WHERE d.reservation_id = r.id)`,
-		sandboxProviderName, time.Now().Add(-sandboxConfirmDelay),
+		SandboxProviderName, time.Now().Add(-sandboxConfirmDelay),
 	)
 	if err != nil {
 		return fmt.Errorf("treasury: find due sandbox deposits: %w", err)
