@@ -1,6 +1,6 @@
 # Sandbox Environment — Implementation Plan
 
-Status: Phase 1 (fake providers) done. Companion to `ARCHITECTURE.md`/`IMPLEMENTATION_PLAN.md` but describes an *operational* addition (a second, tenant-facing environment), not a new business module in the Phase 0–8 module map.
+Status: Phases 1, 2 & 4 done (validated end-to-end against real Docker containers). Phase 3 (domain routing) blocked on a hosting decision. Companion to `ARCHITECTURE.md`/`IMPLEMENTATION_PLAN.md` but describes an *operational* addition (a second, tenant-facing environment), not a new business module in the Phase 0–8 module map.
 
 ## Goal
 
@@ -27,12 +27,20 @@ Two options were considered:
 
 `internal/treasury/sandbox_provider.go`'s `SandboxConfirmJob` (started from `main.go` only when `cfg.SandboxMode`) ticks every 3s and, for any sandbox reservation older than 10s with no deposit recorded yet, computes the crypto amount that exactly covers the owning session's locked fiat amount (joined straight from `sessions`/`rate_locks` by SQL) and confirms it via the same `recordDepositTransition` entrypoint the real Busha webhook uses. No new route — a sandbox tenant's test suite just waits and watches the session progress on its own.
 
-## Phase 2 — Deployment wiring (config, no new code)
+## Phase 2 — Deployment wiring ✅
 
-- [ ] **New database** — e.g. `2settle_sandbox`. No new migration files: the existing `migrations/` apply automatically on first boot of any binary, same as every environment today.
-- [ ] **`.env.sandbox`** — `SANDBOX_MODE=true`, sandbox `DATABASE_URL`, every real-provider `*_ENABLED` flag omitted (irrelevant once the sandbox fakes take over), sandbox's own `TENANT_SECRET_ENCRYPTION_KEY`.
-- [ ] **`docker-compose.sandbox.yml`** (new) — own `postgres` service (new volume, new host port e.g. `5434`), `server` built the same way but `env_file: .env.sandbox` and a distinct host port (e.g. `3701:3700`), so it runs alongside the existing dev stack rather than replacing it. `ratefetcher` can be omitted — the real rate pipeline is read-only and harmless to reuse as-is, or seed one fixed `system_rates` row instead for deterministic sandbox quotes.
-- [ ] **Seed corridors + provider bindings in the sandbox DB** pointed at the fake provider names — a normal admin-API runbook step (`POST /admin/tenants/{id}/corridors/{corridorID}` etc.), run once against the sandbox deployment instead of production. No new code.
+Revised from the original "no new code" framing: `corridor.UpsertCorridor`/`UpsertProviderBinding` were never actually reachable from an HTTP endpoint (only `POST /admin/tenants/{id}/corridors/{corridorID}` exists, which sets *tenant entitlement* to an already-existing corridor, not corridor/provider-binding creation itself — confirmed by grepping `cmd/server`'s routes and `onboarding_test.go`'s own scoping note). Decided: corridor/provider-binding config is **config-driven, not a manual runbook step** — `cmd/server` upserts it automatically at boot.
+
+- [x] **New database** — `2settle_sandbox`, provisioned by `docker-compose.sandbox.yml`. No new migration files — `migrations/` applies automatically on first boot, same as every environment.
+- [x] **`internal/platform/config`** — added `SandboxCorridors string` (`SANDBOX_CORRIDORS`, default `"USDT:SANDBOX:NGN"`, comma-separated `asset:network:fiat` triples).
+- [x] **`cmd/server/sandbox.go`** (new) — `seedSandboxCorridors` parses `SandboxCorridors` and upserts one corridor per entry with compliance/collection/settlement provider bindings all pointed at the sandbox fakes (`compliance.SandboxProviderName`/`treasury.SandboxProviderName`/`settlement.SandboxProviderName`, all now exported). Called from `buildStores` (now `ctx`-threaded) only when `cfg.SandboxMode`, before any background job or request can run.
+- [x] **`.env.sandbox`** — `SANDBOX_MODE=true`, `SANDBOX_CORRIDORS`, sandbox `DATABASE_URL`, own `TENANT_SECRET_ENCRYPTION_KEY` placeholder, every real-provider `*_ENABLED` flag omitted.
+- [x] **`docker-compose.sandbox.yml`** (new) — own `postgres-sandbox` (port `5434`, own volume), `server-sandbox` (`env_file: .env.sandbox`, port `3701:3700`), **and `ratefetcher-sandbox`** — deliberately *not* omitted or special-cased: rates are sourced from the exact same pipeline production uses (real CoinGecko fetch + `rate.CurrentRateJob`), no fixed/hardcoded sandbox rate. Pinned to its own compose project name (`payment-engine-v2-sandbox`) so it never collides with the main dev stack.
+
+### Bugs found and fixed during validation (pre-existing, exposed by sandbox — not introduced by it)
+
+- **`submitKYB`'s auto-approve path never activated the tenant.** `resolveHold` (the hold-queue path) had a "bridge" calling `tenant.ApproveKYB` after an approval; `submitKYB`'s direct-approve path (when a registered `ScreeningProvider` approves outright, skipping the hold queue) did not. Unreachable until now because no `ScreeningProvider` had ever been registered in this codebase before — `SandboxProvider` is the first. Fixed in `cmd/server/handlers.go` with the same bridge.
+- **My own Phase 1 gap:** the sandbox deposit confirm job published `treasury.deposit_confirmed` directly, but `session.handleDepositConfirmed`'s CAS only fires from `deposit_detected` (`internal/session/events.go`) — the same two-step sequence a real Busha webhook pair drives. Fixed by having `confirmDueSandboxDeposits` go through `recordDepositTransition(..., "detected", ...)` then `"confirmed", ...)`, same as production would receive.
 
 ## Phase 3 — Domain routing (infra, outside the Go app)
 
@@ -47,13 +55,16 @@ Confirmed compatible with Phase 2: chi's router matches paths, not hostnames, so
 - Kubernetes → an `Ingress` with host-based routing rules.
 - PaaS (Fly.io / Railway / Render) → each app gets its own domain; mostly a "add custom domain" step per app, no proxy config to write.
 
-## Phase 4 — Validation
+## Phase 4 — Validation ✅
 
-- [ ] Bring up `docker-compose.sandbox.yml`.
-- [ ] Run the same sequence `cmd/server/onboarding_test.go` already exercises against it manually: register tenant → KYB (auto-approved via the forced sandbox provider) → issue API key → set corridor entitlement → create session.
-- [ ] Confirm the session reaches `settled` with no real provider ever called (check logs / DB rows for the sandbox provider names, not the real ones).
-- [ ] Confirm the real `api.2settle.io` deployment's data is untouched throughout.
+- [x] Brought up `docker-compose.sandbox.yml` for real (`docker compose -f docker-compose.sandbox.yml up -d --build`).
+- [x] Ran the full sequence manually over real HTTP against the running sandbox server: register tenant → KYB (auto-approved via the forced sandbox provider) → issue API key → set corridor entitlement → create session (HMAC-signed, `internal/platform/gateway.Sign`).
+- [x] Confirmed the session reaches `settled` with no real provider ever called: `treasury_deposits` row confirmed by the sandbox job (amount computed from the locked rate, matching `rate.Lock.FiatToCrypto`'s formula), `settlement_attempts` row `succeeded` with `provider_name = 'sandbox'`, `settlements.status = 'settled'`, `sessions.status = 'settled'`.
+- [x] `ratefetcher-sandbox` confirmed writing real CoinGecko quotes into the sandbox DB independent of the main stack.
+- [ ] Confirm the real `api.2settle.io` deployment's data is untouched — not yet applicable, no production deployment exists yet.
+
+Torn down after validation (`docker compose -f docker-compose.sandbox.yml down`, volume preserved) — bring back up the same way when needed.
 
 ## Rough size
 
-~150–200 lines of new/changed Go across 4 files (`config.go` + 3 new `sandbox_provider.go` files) plus small edits to `treasury.New`/`settlement.New`/`stores.go`/`handlers.go`, one new compose file, one new env file. Domain/TLS/proxy work is separate and gated on a hosting decision.
+Grew somewhat from the original estimate once seeding and validation surfaced real gaps: ~250–300 lines of new/changed Go across `config.go`, 3 `sandbox_provider.go` files, `cmd/server/sandbox.go` (new), `cmd/server/handlers.go` (sandbox force + the `submitKYB` tenant-activation bridge fix), `stores.go`/`main.go` (ctx-threading, job wiring), `dispatch.go`, plus one new compose file and one new env file. Domain/TLS/proxy work (Phase 3) is separate and gated on a hosting decision.
