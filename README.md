@@ -48,6 +48,25 @@ docker compose up
   ```
 - The rate fetcher (`ratefetcher`) is fully independent — it never needs the server running, only Postgres.
 
+### Sandbox environment
+
+A second, fully independent deployment (own database, own ports, own config) with fake compliance/treasury/settlement providers instead of real ones — same codebase, same API shape. See [`docs/SANDBOX_PLAN.md`](docs/SANDBOX_PLAN.md) for the full design.
+
+Bring both stacks up together — one command per file starts every container in it, not one command per container:
+
+```
+docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.sandbox.yml up -d --build
+```
+
+(drop `--build` once the images already reflect your current code — faster startup)
+
+- Sandbox server: `:3701` (main stack stays on `:3700`). Sandbox Postgres: `:5434` (main stack stays on `:5433`).
+- One-time: `.env.sandbox` ships with a placeholder `TENANT_SECRET_ENCRYPTION_KEY` — replace it with a real one (`openssl rand -hex 32`), same as `.env.example`'s.
+- One-time: provision a sandbox admin account — the same `adminctl` command from [Provisioning](#provisioning) below, but with `DATABASE_URL`/`TENANT_SECRET_ENCRYPTION_KEY` pointed at the sandbox database (`localhost:5434`/`2settle_sandbox`) and `.env.sandbox`'s key, instead of `.env`'s.
+- Corridors are seeded automatically at startup from `.env.sandbox`'s `SANDBOX_CORRIDORS` (default `USDT:SANDBOX:NGN`) — no manual corridor/provider-binding setup needed.
+- Tear down: `docker compose -f docker-compose.sandbox.yml down` (add `-v` to also wipe the sandbox database).
+
 ### Against a database outside Docker
 
 Build and run the server image standalone, pointing at any reachable Postgres:
