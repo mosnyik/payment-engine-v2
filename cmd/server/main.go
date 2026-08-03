@@ -48,7 +48,7 @@ func run() error {
 	// Builds every module Store once, including wiring treasury's
 	// SetEventBus and session's RegisterEventHandlers — both must happen
 	// before bus.Run starts below (see appStores' doc comment).
-	stores, err := buildStores(cfg, pool)
+	stores, err := buildStores(ctx, cfg, pool)
 	if err != nil {
 		return err
 	}

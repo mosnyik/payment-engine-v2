@@ -48,7 +48,7 @@ func TestSessionCreateAndDepositFlowOverHTTP(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	stores, err := buildStores(cfg, pool)
+	stores, err := buildStores(ctx, cfg, pool)
 	if err != nil {
 		t.Fatalf("build stores: %v", err)
 	}

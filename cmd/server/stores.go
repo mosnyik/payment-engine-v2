@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/shopspring/decimal"
@@ -41,7 +42,7 @@ type appStores struct {
 	bus          *eventbus.Bus
 }
 
-func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
+func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	tenantStore, err := tenant.New(pool, cfg.TenantSecretEncryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("build stores: %w", err)
@@ -53,6 +54,16 @@ func buildStores(cfg *config.Config, pool *db.Pool) (*appStores, error) {
 	complianceStore := compliance.New(pool, complianceRegistry)
 	adminStore := adminauth.New(pool, cfg.AdminSessionTTL)
 	corridorStore := corridor.New(pool)
+
+	// Config-driven sandbox corridor/provider-binding seeding — must happen
+	// before the rate engine's CurrentRateJob starts in main.go (its own
+	// warm-up run needs ListActiveFiatCurrencies to already see these), and
+	// before any request can reach session.CreateSession.
+	if cfg.SandboxMode {
+		if err := seedSandboxCorridors(ctx, corridorStore, cfg.SandboxCorridors); err != nil {
+			return nil, fmt.Errorf("build stores: %w", err)
+		}
+	}
 
 	rateStore := rate.New(pool, rate.Config{
 		CoinMarketCapAPIKey: cfg.RateEngine.CoinMarketCapAPIKey,
