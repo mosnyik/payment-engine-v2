@@ -47,6 +47,13 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	if err != nil {
 		return nil, fmt.Errorf("build stores: %w", err)
 	}
+	// Reuses the same configured email vendor adapter Phase 7's ops-alert
+	// pipeline uses (see internal/notification.NewEmailProvider) for
+	// portal magic-link delivery — one email integration, not two. Disabled
+	// by default like every other provider in this codebase until
+	// NOTIFICATION_EMAIL_* is actually configured.
+	tenantStore.SetEmailSender(notification.NewEmailProvider(notification.EmailProviderConfig(cfg.Notification.Email)))
+
 	complianceRegistry := compliance.NewRegistry()
 	if cfg.SandboxMode {
 		complianceRegistry.Register(compliance.SandboxProvider{})

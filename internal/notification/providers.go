@@ -31,6 +31,15 @@ const emailProviderTimeout = 8 * time.Second
 // providers.go use for their own multi-vendor selection. An empty or
 // unrecognized Provider falls back to stubEmailProvider, which just reports
 // itself disabled — safe by construction, never a startup failure.
+// NewEmailProvider is the exported form of newEmailProvider, for other
+// packages that need the same configured vendor adapter DispatchWorker
+// uses — e.g. internal/tenant's magic-link sender (tenant.EmailSender is a
+// structural subset of this interface) — so a second HTTP email-vendor
+// integration is never built.
+func NewEmailProvider(cfg EmailProviderConfig) EmailProvider {
+	return newEmailProvider(cfg)
+}
+
 func newEmailProvider(cfg EmailProviderConfig) EmailProvider {
 	switch cfg.Provider {
 	case "resend":

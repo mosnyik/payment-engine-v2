@@ -8,6 +8,7 @@ package tenant
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -125,6 +126,194 @@ func (s *Store) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
 	}
 	t.Status = Status(status)
 	return &t, nil
+}
+
+// RegisterTenant creates a new self-service tenant — status pending_kyb,
+// same starting state CreateTenant already uses — with a contact email for
+// portal login. Passwordless: see RequestMagicLink/VerifyMagicLink for how
+// that email is turned into a session.
+func (s *Store) RegisterTenant(ctx context.Context, name, email string) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO tenants (name, contact_email) VALUES ($1, $2) RETURNING id`,
+		name, email,
+	).Scan(&id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return uuid.Nil, ErrEmailTaken
+		}
+		return uuid.Nil, fmt.Errorf("tenant: register tenant: %w", err)
+	}
+	return id, nil
+}
+
+// RequestMagicLink issues a single-use, time-limited login token for the
+// tenant registered under email and, if an EmailSender is configured,
+// delivers it. Returns ErrNotFound if no tenant has this email — the HTTP
+// handler is responsible for hiding that distinction behind a uniform
+// response so this can't be used to enumerate registered emails (same
+// split of responsibility sessionHandlers.getSession already uses: the
+// Store tells the truth, the handler decides what to reveal).
+func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
+	var tenantID uuid.UUID
+	err := s.pool.QueryRow(ctx, `SELECT id FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("tenant: lookup by email: %w", err)
+	}
+
+	token, tokenHash, err := newPortalToken()
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO tenant_magic_links (token_hash, tenant_id, expires_at) VALUES ($1, $2, $3)`,
+		tokenHash, tenantID, time.Now().Add(PortalMagicLinkTTL),
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: store magic link: %w", err)
+	}
+
+	if s.emailSender == nil || !s.emailSender.IsEnabled() {
+		return ErrEmailDeliveryUnavailable
+	}
+	subject := "Your 2Settle dashboard login link"
+	body := fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", token, int(PortalMagicLinkTTL.Minutes()))
+	if err := s.emailSender.Send(ctx, email, subject, body); err != nil {
+		return fmt.Errorf("tenant: send magic link email: %w", err)
+	}
+	return nil
+}
+
+// VerifyMagicLink redeems a single-use magic-link token and issues a real
+// portal session token in its place — CAS-consumed (UPDATE ... WHERE
+// consumed_at IS NULL) the same way every other state transition in this
+// codebase claims a one-time action, so a token can't be redeemed twice
+// even under concurrent requests.
+func (s *Store) VerifyMagicLink(ctx context.Context, token string) (sessionToken string, tenantID uuid.UUID, err error) {
+	tokenHash := hashPortalToken(token)
+
+	var expiresAt time.Time
+	var consumedAt *time.Time
+	err = s.pool.QueryRow(ctx,
+		`SELECT tenant_id, expires_at, consumed_at FROM tenant_magic_links WHERE token_hash = $1`,
+		tokenHash,
+	).Scan(&tenantID, &expiresAt, &consumedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", uuid.Nil, ErrInvalidMagicLink
+	}
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("tenant: lookup magic link: %w", err)
+	}
+	if consumedAt != nil || time.Now().After(expiresAt) {
+		return "", uuid.Nil, ErrInvalidMagicLink
+	}
+
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE tenant_magic_links SET consumed_at = now() WHERE token_hash = $1 AND consumed_at IS NULL`,
+		tokenHash,
+	)
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("tenant: consume magic link: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Consumed by a concurrent request between the SELECT and this
+		// UPDATE — treated identically to "already invalid," same race
+		// window every other CAS transition in this codebase accepts.
+		return "", uuid.Nil, ErrInvalidMagicLink
+	}
+
+	sessionToken, sessionHash, err := newPortalToken()
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO tenant_sessions (token_hash, tenant_id, expires_at) VALUES ($1, $2, $3)`,
+		sessionHash, tenantID, time.Now().Add(PortalSessionTTL),
+	)
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("tenant: create session: %w", err)
+	}
+	return sessionToken, tenantID, nil
+}
+
+// AuthenticateSession resolves a portal bearer token to a tenant ID —
+// mirrors adminauth.Store.Authenticate exactly: looked up by the token's
+// hash, no secret-comparison step at all, sidestepping timing-attack
+// concerns structurally.
+func (s *Store) AuthenticateSession(ctx context.Context, token string) (uuid.UUID, error) {
+	tokenHash := hashPortalToken(token)
+
+	var tenantID uuid.UUID
+	var expiresAt time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id, expires_at FROM tenant_sessions WHERE token_hash = $1`,
+		tokenHash,
+	).Scan(&tenantID, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrPortalSessionInvalid
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("tenant: lookup session: %w", err)
+	}
+	if time.Now().After(expiresAt) {
+		return uuid.Nil, ErrPortalSessionInvalid
+	}
+	return tenantID, nil
+}
+
+// APIKeySummary is the self-service view of an issued API key — never
+// includes the HMAC secret, which is shown once at issuance and never
+// again.
+type APIKeySummary struct {
+	ID        uuid.UUID
+	APIKey    string
+	Active    bool
+	CreatedAt time.Time
+	RevokedAt *time.Time
+}
+
+// ListAPIKeys returns a tenant's own API keys, newest first.
+func (s *Store) ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]APIKeySummary, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, api_key, active, created_at, revoked_at FROM tenant_api_keys WHERE tenant_id = $1 ORDER BY created_at DESC`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("tenant: list api keys: %w", err)
+	}
+	defer rows.Close()
+
+	var out []APIKeySummary
+	for rows.Next() {
+		var k APIKeySummary
+		if err := rows.Scan(&k.ID, &k.APIKey, &k.Active, &k.CreatedAt, &k.RevokedAt); err != nil {
+			return nil, fmt.Errorf("tenant: list api keys: scan: %w", err)
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// RevokeAPIKey deactivates one of a tenant's own API keys. Scoped by
+// tenant_id in the same query as the active check — a key ID that exists
+// but belongs to a different tenant is indistinguishable from one that
+// doesn't exist at all, same reasoning LookupHMACSecret's doc comment
+// already gives for not telling those cases apart.
+func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, keyID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE tenant_api_keys SET active = false, revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND active = true`,
+		keyID, tenantID,
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: revoke api key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ApproveKYB activates a tenant. Only valid from pending_kyb — the
@@ -384,4 +573,33 @@ func randomHex(n int) (string, error) {
 		return "", fmt.Errorf("tenant: generate random bytes: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// newPortalToken/hashPortalToken back both magic-link and session tokens —
+// same 32-random-bytes-hex/SHA-256-hash shape adminauth.newToken/hashToken
+// already use, duplicated locally per this codebase's existing convention
+// of each package owning its own small helpers rather than sharing one.
+func newPortalToken() (raw, hash string, err error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", "", fmt.Errorf("tenant: generate token: %w", err)
+	}
+	raw = hex.EncodeToString(buf)
+	return raw, hashPortalToken(raw), nil
+}
+
+func hashPortalToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// isUniqueViolation detects a Postgres unique-constraint violation (SQLSTATE
+// 23505) — same helper shape internal/treasury/hdwallet.go already
+// establishes for the identical need.
+func isUniqueViolation(err error) bool {
+	var pgErr interface{ SQLState() string }
+	if errors.As(err, &pgErr) {
+		return pgErr.SQLState() == "23505"
+	}
+	return false
 }
