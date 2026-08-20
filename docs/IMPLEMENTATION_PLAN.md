@@ -128,7 +128,7 @@ Grounding this phase in the actual code (not this list's original aspirational f
 Not part of the original build order — surfaced by comparing the actual v2 codebase against the two policy documents in the sibling `payment-engine` repo's `compliance/` folder (`Information-Security-Policy-Sirfi-Payment-Engine.md`, `Cryptographic-Controls-Policy-2Settle-Payment-Engine.md`), which were written against v1 and still describe controls v2 hasn't ported yet. Grouped by what actually blocks reissuing those policies against v2, not by module.
 
 - **Tenant API-key scoping** — `tenant_api_keys` (migration `000006`) has no permission-list or rate-limit-tier column at all; ISP §3 assumes both exist per key.
-- **Rate limiting** — no rate-limiting middleware anywhere in the repo. ISP §6 specifies 100/1,000/10,000 req/min by tier, sliding window; v2 has nothing at any tier.
+- **Rate limiting** — no rate-limiting middleware anywhere in the repo. ISP §6 specifies 100/1,000/10,000 req/min by tier, sliding window; v2 has nothing at any tier. **Now more urgent**: Phase 9a's `POST /v2/portal/register`/`POST /v2/portal/login` are the first fully public, unauthenticated, non-webhook routes this codebase has — brute-force/enumeration risk on login and spam-registration risk on register, with nothing in front of them yet.
 - **IP whitelisting** — `gateway/hmac.go`'s own doc comment says CIDR-aware IP allowlisting is "layered on separately as defense-in-depth," but no such code exists yet. ISP §3/§6 both assume it's live.
 - **Security headers** — no `X-Content-Type-Options`, `X-Frame-Options`, CSP, HSTS, no-cache, or `X-Powered-By` removal anywhere; `gateway/router.go` only wires `RequestID`/`Recoverer`.
 - **Blanket per-request audit log** — `admin_audit_log` only covers admin actions the code explicitly calls `LogAction` for. The tenant-facing gateway and the settlement/treasury webhook routes have no audit-log table at all. ISP §7 assumes every request (method/path, IP, UA, body hash, status, response time) is logged.
@@ -141,6 +141,12 @@ Not part of the original build order — surfaced by comparing the actual v2 cod
 - **Infra-layer controls** (reverse-proxy WAF/`mod_security2`-equivalent, DoS blocking/`mod_evasive`-equivalent, request body size cap, TLS termination, OS patch cadence) — not visible in this repo at all; v1's policy points to Apache config outside the codebase. Needs answering at the deployment layer before either policy can be reissued against v2, per the crypto policy's own §1 commitment to do so once v2 is in production.
 
 *Next: prioritize among the above — rate limiting, IP whitelisting, and the blanket audit log are the ones most directly promised to partners in the ISP's due-diligence framing (§9), so likely first. The end-user-auth scope question and the infra-layer controls need a decision/answer from ops rather than code, and can move in parallel.*
+
+## Phase 9a — Tenant self-service portal ✅ complete
+
+Not part of the original build order or the Phase 9 gap list above — a separate, user-requested feature (self-service onboarding + dashboard for tenants, previously 100% admin-driven). Full detail lives in the working plan this was built from (`register`/`login`/`verify` passwordless magic-link auth in `internal/tenant`; tenant-scoped reads added to `session`/`settlement`/`notification`/`ledger`; `cmd/server/portal_handlers.go` + `/v2/portal/*` routes). Verified end to end: `internal/tenant/portal_test.go` (9 unit tests) and `cmd/server/portal_test.go` (full HTTP acceptance test — register → verify → KYB hold → admin resolution → self-service API key issue/authenticate/revoke → tenant-scoped reads → webhook config → cross-tenant isolation). Full `go test ./...` passes.
+
+Out of scope, not done here: rate limiting/IP whitelisting on the new public routes (see the Phase 9 callout above — this is what made it urgent), bootstrapping portal credentials onto an admin-created tenant, multi-user/role support per tenant.
 
 ## Dependency summary
 
