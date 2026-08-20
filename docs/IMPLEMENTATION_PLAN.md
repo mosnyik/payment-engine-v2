@@ -123,6 +123,25 @@ Grounding this phase in the actual code (not this list's original aspirational f
 - ✅ **SLA-breach alerting** — `session.markSLABreaches` (`internal/session/ttl.go`) set `sla_breached_at` via a bulk `UPDATE` with no event published, so nothing ever notified ops. Reworked to run inside a transaction and publish `session.sla_breached` once per breaching session (via `UPDATE ... RETURNING`, one round trip), same atomicity discipline `transitionByReservation` already uses. Routes to the ops email channel only (`internal/notification/events.go`'s `emailEvents`), same treatment as `compliance.hold_created` — the tenant already sees the session's real pipeline stage untouched.
 - **Notable ripple**: `ledger.drift_detected` is the first event this system publishes that isn't tenant-scoped — a platform/omnibus ledger account genuinely has no owning tenant. `notification_deliveries.tenant_id` was `NOT NULL` (migration 000022 dropped that), and `notification.Delivery.TenantID` became `*uuid.UUID` throughout the package (`events.go`'s `tenantIDFromPayload`, `webhook.go`'s `sendWebhook` nil-guard, the admin handler's JSON response).
 
+## Phase 9 — Compliance/security hardening (not started)
+
+Not part of the original build order — surfaced by comparing the actual v2 codebase against the two policy documents in the sibling `payment-engine` repo's `compliance/` folder (`Information-Security-Policy-Sirfi-Payment-Engine.md`, `Cryptographic-Controls-Policy-2Settle-Payment-Engine.md`), which were written against v1 and still describe controls v2 hasn't ported yet. Grouped by what actually blocks reissuing those policies against v2, not by module.
+
+- **Tenant API-key scoping** — `tenant_api_keys` (migration `000006`) has no permission-list or rate-limit-tier column at all; ISP §3 assumes both exist per key.
+- **Rate limiting** — no rate-limiting middleware anywhere in the repo. ISP §6 specifies 100/1,000/10,000 req/min by tier, sliding window; v2 has nothing at any tier.
+- **IP whitelisting** — `gateway/hmac.go`'s own doc comment says CIDR-aware IP allowlisting is "layered on separately as defense-in-depth," but no such code exists yet. ISP §3/§6 both assume it's live.
+- **Security headers** — no `X-Content-Type-Options`, `X-Frame-Options`, CSP, HSTS, no-cache, or `X-Powered-By` removal anywhere; `gateway/router.go` only wires `RequestID`/`Recoverer`.
+- **Blanket per-request audit log** — `admin_audit_log` only covers admin actions the code explicitly calls `LogAction` for. The tenant-facing gateway and the settlement/treasury webhook routes have no audit-log table at all. ISP §7 assumes every request (method/path, IP, UA, body hash, status, response time) is logged.
+- **Deposit-watcher fraud checks** — `internal/treasury/watcher.go` only does confirmation-count gating. RBF detection, dust filtering, and fake-token filtering (all named in ISP §7 as live v1 controls) don't exist in v2's watcher.
+- **Tenant HMAC secret storage** — `tenant_api_keys.hmac_secret_encrypted` is reversibly AES-256-GCM encrypted, not hashed. The crypto policy's stated v1 design was hash-only storage (`SHA256(secretKey)`), implying the expected signature was computed off the hash itself, never a recoverable raw secret. v2's own code comment acknowledges the tradeoff; needs a deliberate policy call (accept the encrypted-at-rest model, or move to the hash-as-key-material scheme) rather than staying an implicit deviation.
+- **Key management** — `TenantSecretEncryptionKey` and `HDWalletSeedEncryptionKey` are both plain env vars (`platform/config`), no KMS/HSM, no rotation schedule. This is the crypto policy's own stated "main gap" in v1, now duplicated across two master keys instead of one.
+- **End-user authentication surface** — no JWT, OTP, SIWE, or Google Sign-In code exists anywhere in v2; the session/tenant model today is B2B-only (HMAC-authenticated tenants). ISP §4 describes a whole control surface v2 currently has no equivalent of. Needs an explicit scope decision (build it, or descope it from the policy) before the policy can honestly describe v2.
+- **Retention enforcement** — no purge/retention job exists for either the 5-year financial-record window or the 12-month audit-log window ISP §7 specifies; data just accumulates today.
+- **Ops alert channel** — v2 routes failed-settlement/drift/SLA-breach alerts through `internal/notification`'s email/webhook pipeline, not Telegram as ISP §7 currently documents. Functionally reasonable, but the policy text is now stale against the actual mechanism.
+- **Infra-layer controls** (reverse-proxy WAF/`mod_security2`-equivalent, DoS blocking/`mod_evasive`-equivalent, request body size cap, TLS termination, OS patch cadence) — not visible in this repo at all; v1's policy points to Apache config outside the codebase. Needs answering at the deployment layer before either policy can be reissued against v2, per the crypto policy's own §1 commitment to do so once v2 is in production.
+
+*Next: prioritize among the above — rate limiting, IP whitelisting, and the blanket audit log are the ones most directly promised to partners in the ISP's due-diligence framing (§9), so likely first. The end-user-auth scope question and the infra-layer controls need a decision/answer from ops rather than code, and can move in parallel.*
+
 ## Dependency summary
 
 ```
@@ -136,8 +155,9 @@ Phase 0 (foundation)
                                └─▶ Phase 6 (settlement) ✅ complete
                                       └─▶ Phase 7 (notification) ✅ complete
                                              └─▶ Phase 8 (ops/observability) ✅ complete
+                                                    └─▶ Phase 9 (compliance/security hardening) — not started
 
-Every phase in the original build order is complete.
+Every phase in the original build order (0–8) is complete. Phase 9 is a follow-on, policy-driven addition, not part of that original scope.
 ```
 
 ## Open items carried over from ARCHITECTURE.md
@@ -150,4 +170,4 @@ Every phase in the original build order is complete.
 All open items from the original design pass are resolved.
 
 ---
-*Next: every phase in the original build order (0–8) is complete. No open design blockers remain.*
+*Next: every phase in the original build order (0–8) is complete, no open design blockers remain there. Phase 9 (compliance/security hardening) is the current open work — see that section for the prioritized list.*
