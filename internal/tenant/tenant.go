@@ -22,6 +22,26 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/webhookurl"
 )
 
+// PortalMagicLinkTTL / PortalSessionTTL are fixed design constants, not ops
+// knobs — same convention session.SessionTTL/rate.slippageBuffer already
+// use for timers that don't need per-environment tuning.
+const (
+	PortalMagicLinkTTL = 15 * time.Minute
+	PortalSessionTTL   = 12 * time.Hour
+)
+
+// EmailSender is the narrow capability RequestMagicLink needs to deliver a
+// login link. Structurally identical to notification.EmailProvider (Name
+// omitted — not needed here), so cmd/server can wire that already-
+// configured vendor adapter straight into SetEmailSender without this
+// package ever importing internal/notification directly, which would
+// invert the existing dependency direction (notification depends on
+// tenant via TenantWebhookLookup, never the reverse).
+type EmailSender interface {
+	IsEnabled() bool
+	Send(ctx context.Context, to, subject, body string) error
+}
+
 // Compile-time proof that Store satisfies gateway.CredentialLookup —
 // catches interface drift immediately rather than at first wiring.
 var _ gateway.CredentialLookup = (*Store)(nil)
@@ -35,9 +55,13 @@ const (
 )
 
 var (
-	ErrNotFound                = errors.New("tenant: not found")
-	ErrInvalidStatusTransition = errors.New("tenant: invalid status transition")
-	ErrInvalidWebhookURL       = errors.New("tenant: invalid webhook url")
+	ErrNotFound                 = errors.New("tenant: not found")
+	ErrInvalidStatusTransition  = errors.New("tenant: invalid status transition")
+	ErrInvalidWebhookURL        = errors.New("tenant: invalid webhook url")
+	ErrEmailTaken               = errors.New("tenant: email already registered")
+	ErrInvalidMagicLink         = errors.New("tenant: invalid or expired magic link")
+	ErrPortalSessionInvalid     = errors.New("tenant: invalid or expired session")
+	ErrEmailDeliveryUnavailable = errors.New("tenant: email delivery not configured")
 )
 
 type Tenant struct {
@@ -50,8 +74,9 @@ type Tenant struct {
 }
 
 type Store struct {
-	pool   *db.Pool
-	crypto *pcrypto.AESGCM
+	pool        *db.Pool
+	crypto      *pcrypto.AESGCM
+	emailSender EmailSender
 }
 
 // New builds a Store. encryptionKey is config.TenantSecretEncryptionKey —
@@ -62,6 +87,15 @@ func New(pool *db.Pool, encryptionKey []byte) (*Store, error) {
 		return nil, fmt.Errorf("tenant: %w", err)
 	}
 	return &Store{pool: pool, crypto: c}, nil
+}
+
+// SetEmailSender wires the magic-link delivery mechanism — optional-
+// dependency convention (nil-safe field + setter) this codebase already
+// uses for eventbus wiring (e.g. treasury.SetEventBus), so every existing
+// tenant.New call site, none of which are concerned with portal auth,
+// stays unaffected.
+func (s *Store) SetEmailSender(sender EmailSender) {
+	s.emailSender = sender
 }
 
 func (s *Store) CreateTenant(ctx context.Context, name string) (uuid.UUID, error) {
