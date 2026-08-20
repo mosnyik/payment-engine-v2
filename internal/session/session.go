@@ -316,6 +316,31 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 	return sess, nil
 }
 
+// ListSessionsByTenant returns a tenant's own sessions, newest first — the
+// portal dashboard's read surface. No admin/ops equivalent exists (admin
+// only ever fetches a single session by ID), so this is new, not a
+// tenant-scoped variant of an existing list.
+func (s *Store) ListSessionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]Session, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+sessionColumns+` FROM sessions WHERE tenant_id = $1 ORDER BY created_at DESC`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session: list by tenant: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("session: list by tenant: scan: %w", err)
+		}
+		out = append(out, *sess)
+	}
+	return out, rows.Err()
+}
+
 // ErrNotInComplianceHold means ResolveComplianceHold was called against a
 // session that isn't currently held — either it never was, or it already
 // moved on (resolved twice, or timed out via the TTL job).
