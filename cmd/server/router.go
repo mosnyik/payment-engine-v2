@@ -8,6 +8,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/gateway"
+	"github.com/sirfi/payment-engine-v2/internal/tenant"
 )
 
 // buildRouter wires every module built so far into one router. Separated
@@ -38,8 +39,39 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	nh := &notificationHandlers{notification: stores.notification}
 	lh := &ledgerHandlers{ledger: stores.ledger}
 	rh := &rateHandlers{rate: stores.rate}
+	ph := &portalHandlers{
+		tenant:       stores.tenant,
+		compliance:   stores.compliance,
+		session:      stores.session,
+		settlement:   stores.settlement,
+		notification: stores.notification,
+		ledger:       stores.ledger,
+		sandboxMode:  cfg.SandboxMode,
+	}
 
 	r.Post("/admin/login", h.login)
+
+	// Tenant self-service: passwordless (email magic link), same
+	// unauthenticated tier as /admin/login for the three entry points.
+	r.Post("/portal/register", ph.register)
+	r.Post("/portal/login", ph.login)
+	r.Post("/portal/verify", ph.verify)
+
+	r.Route("/portal", func(portal chi.Router) {
+		portal.Use(tenant.PortalMiddleware(stores.tenant))
+
+		portal.Get("/me", ph.me)
+		portal.Post("/kyb", ph.submitKYB)
+		portal.Get("/sessions", ph.listSessions)
+		portal.Get("/sessions/{sessionID}", ph.getSession)
+		portal.Get("/settlements", ph.listSettlements)
+		portal.Get("/balance", ph.getBalance)
+		portal.Get("/notifications", ph.listNotifications)
+		portal.Post("/api-keys", ph.issueAPIKey)
+		portal.Get("/api-keys", ph.listAPIKeys)
+		portal.Post("/api-keys/{keyID}/revoke", ph.revokeAPIKey)
+		portal.Put("/webhook", ph.setWebhookURL)
+	})
 
 	// Public, unauthenticated — same tier as /admin/login, deliberately not
 	// behind the tenant gateway's HMAC (see rate_handlers.go's doc comment).
