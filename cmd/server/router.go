@@ -19,7 +19,7 @@ import (
 func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// stores.tenant satisfies gateway.CredentialLookup — proven at compile
 	// time in internal/tenant/tenant.go, used here for real.
-	r, protected := gateway.NewRouter(stores.tenant, cfg.HMACClockSkew)
+	r, protected := gateway.NewRouter(stores.tenant, cfg.HMACClockSkew, stores.audit)
 
 	// A minimal authenticated smoke-test route proving an issued credential
 	// actually works end to end, not just that Store-level HMAC logic is

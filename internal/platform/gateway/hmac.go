@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 )
 
 const (
@@ -31,13 +33,14 @@ var (
 	ErrBadSignature   = errors.New("signature mismatch")
 )
 
-// CredentialLookup resolves an API key to the tenant's HMAC secret. The
+// CredentialLookup resolves an API key to the tenant's HMAC secret and the
+// key's own row ID (for audit attribution — see audit.Record.APIKeyID). The
 // tenant module (Phase 2) implements this against its own storage — gateway
 // depends only on this interface, never on tenant directly, so the module
 // boundary stays a hard one and this package is fully testable before
 // tenant exists.
 type CredentialLookup interface {
-	LookupHMACSecret(ctx context.Context, apiKey string) (secret string, tenantID uuid.UUID, ok bool, err error)
+	LookupHMACSecret(ctx context.Context, apiKey string) (secret string, tenantID uuid.UUID, apiKeyID uuid.UUID, ok bool, err error)
 }
 
 type tenantIDKey struct{}
@@ -81,7 +84,7 @@ func HMACMiddleware(lookup CredentialLookup, maxClockSkew time.Duration) func(ht
 				return
 			}
 
-			secret, tenantID, ok, err := lookup.LookupHMACSecret(r.Context(), apiKey)
+			secret, tenantID, apiKeyID, ok, err := lookup.LookupHMACSecret(r.Context(), apiKey)
 			if err != nil {
 				http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 				return
@@ -102,6 +105,11 @@ func HMACMiddleware(lookup CredentialLookup, maxClockSkew time.Duration) func(ht
 			if !hmac.Equal([]byte(expected), []byte(signature)) {
 				writeAuthError(w, ErrBadSignature)
 				return
+			}
+
+			if id, ok := audit.IdentityFromContext(r.Context()); ok {
+				id.TenantID = &tenantID
+				id.APIKeyID = &apiKeyID
 			}
 
 			ctx := context.WithValue(r.Context(), tenantIDKey{}, tenantID)

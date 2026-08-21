@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 )
 
 type adminIDKey struct{}
@@ -37,6 +39,10 @@ func Middleware(store *Store) func(http.Handler) http.Handler {
 			if err != nil {
 				writeError(w, err)
 				return
+			}
+
+			if id, ok := audit.IdentityFromContext(r.Context()); ok {
+				id.AdminID = &adminID
 			}
 
 			ctx := context.WithValue(r.Context(), adminIDKey{}, adminID)

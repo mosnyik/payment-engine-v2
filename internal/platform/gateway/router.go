@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 )
 
 // NewRouter returns the base router and the protected sub-router, gated by
@@ -21,9 +23,12 @@ import (
 // exist until the tenant module (Phase 2) is built. HMAC is fully usable
 // standalone in the meantime — per-tenant choice of auth method comes once
 // tenant exists to express it, without changing this router's shape.
-func NewRouter(lookup CredentialLookup, hmacClockSkew time.Duration) (router chi.Router, protected chi.Router) {
+func NewRouter(lookup CredentialLookup, hmacClockSkew time.Duration, auditLogger *audit.Logger) (router chi.Router, protected chi.Router) {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	// Wired before (outside) Recoverer deliberately — see audit.Middleware's
+	// doc comment for why a panic would otherwise never get logged.
+	r.Use(audit.Middleware(auditLogger))
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {

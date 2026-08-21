@@ -11,6 +11,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
@@ -40,6 +41,7 @@ type appStores struct {
 	settlement   *settlement.Store
 	notification *notification.Store
 	bus          *eventbus.Bus
+	audit        *audit.Logger
 }
 
 func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appStores, error) {
@@ -151,5 +153,6 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 		settlement:   settlementStore,
 		notification: notificationStore,
 		bus:          bus,
+		audit:        audit.New(pool),
 	}, nil
 }

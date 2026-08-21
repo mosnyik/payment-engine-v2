@@ -241,7 +241,7 @@ func TestListAPIKeys_And_RevokeAPIKey(t *testing.T) {
 		t.Fatalf("revoke api key: %v", err)
 	}
 
-	_, _, ok, err := s.LookupHMACSecret(ctx, apiKey1)
+	_, _, _, ok, err := s.LookupHMACSecret(ctx, apiKey1)
 	if err != nil {
 		t.Fatalf("lookup after revoke: %v", err)
 	}

@@ -63,6 +63,11 @@ func run() error {
 	// event handlers (Phase 5).
 	go stores.bus.Run(ctx, cfg.EventbusPollInterval)
 
+	// The blanket per-request audit log (ISP §7) — drains the in-memory
+	// buffer gateway.NewRouter's audit.Middleware writes to, off the
+	// request path.
+	go stores.audit.Run(ctx)
+
 	fetchJob := rate.NewFetchJob(stores.rate, stores.corridor, cfg.RateEngine.FetchInterval)
 	go fetchJob.Run(ctx)
 

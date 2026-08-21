@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 )
 
 type portalTenantIDKey struct{}
@@ -40,6 +42,10 @@ func PortalMiddleware(store *Store) func(http.Handler) http.Handler {
 			if err != nil {
 				writePortalAuthError(w, err)
 				return
+			}
+
+			if id, ok := audit.IdentityFromContext(r.Context()); ok {
+				id.TenantID = &tenantID
 			}
 
 			ctx := context.WithValue(r.Context(), portalTenantIDKey{}, tenantID)

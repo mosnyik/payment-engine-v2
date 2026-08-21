@@ -17,14 +17,15 @@ import (
 type fakeLookup struct {
 	secret   string
 	tenantID uuid.UUID
+	apiKeyID uuid.UUID
 	known    bool
 }
 
-func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, bool, error) {
+func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, bool, error) {
 	if !f.known {
-		return "", uuid.Nil, false, nil
+		return "", uuid.Nil, uuid.Nil, false, nil
 	}
-	return f.secret, f.tenantID, true, nil
+	return f.secret, f.tenantID, f.apiKeyID, true, nil
 }
 
 func newSignedRequest(t *testing.T, secret, method, path string, body []byte, ts time.Time) *http.Request {
