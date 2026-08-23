@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -114,6 +115,39 @@ func (h *portalHandlers) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"token": sessionToken})
+}
+
+// POST /v2/portal/logout — revokes only the session that authenticated this
+// request, the counterpart to /v2/portal/verify's session creation. Sits
+// behind PortalMiddleware (so the token is already proven valid by the time
+// this runs) but still re-parses the header itself, since the middleware
+// only puts the resolved tenant ID in context, not the raw token.
+func (h *portalHandlers) logout(w http.ResponseWriter, r *http.Request) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || token == "" {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing bearer token"))
+		return
+	}
+	if err := h.tenant.Logout(r.Context(), token); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})
+}
+
+// POST /v2/portal/logout-all — revokes every session for this tenant, e.g.
+// "sign out everywhere" after a suspected leaked session token.
+func (h *portalHandlers) logoutAll(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := portalTenantID(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
+		return
+	}
+	if err := h.tenant.LogoutAll(r.Context(), tenantID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out of all sessions"})
 }
 
 type portalTenantResponse struct {

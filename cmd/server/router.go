@@ -61,6 +61,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Use(tenant.PortalMiddleware(stores.tenant))
 
 		portal.Get("/me", ph.me)
+		portal.Post("/logout", ph.logout)
+		portal.Post("/logout-all", ph.logoutAll)
 		portal.Post("/kyb", ph.submitKYB)
 		portal.Get("/sessions", ph.listSessions)
 		portal.Get("/sessions/{sessionID}", ph.getSession)

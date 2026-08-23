@@ -291,6 +291,29 @@ func (s *Store) AuthenticateSession(ctx context.Context, token string) (uuid.UUI
 	return tenantID, nil
 }
 
+// Logout revokes a single portal session by its bearer token — the
+// counterpart to VerifyMagicLink's session INSERT. Idempotent: revoking a
+// token that's already gone (expired, already logged out, never existed) is
+// not an error, since the caller's intent — "this token should no longer
+// work" — is already true either way.
+func (s *Store) Logout(ctx context.Context, token string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM tenant_sessions WHERE token_hash = $1`, hashPortalToken(token))
+	if err != nil {
+		return fmt.Errorf("tenant: logout: %w", err)
+	}
+	return nil
+}
+
+// LogoutAll revokes every active session for tenantID — "sign out
+// everywhere," e.g. after a suspected leaked session token.
+func (s *Store) LogoutAll(ctx context.Context, tenantID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM tenant_sessions WHERE tenant_id = $1`, tenantID)
+	if err != nil {
+		return fmt.Errorf("tenant: logout all: %w", err)
+	}
+	return nil
+}
+
 // APIKeySummary is the self-service view of an issued API key — never
 // includes the HMAC secret, which is shown once at issuance and never
 // again.
