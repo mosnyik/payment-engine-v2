@@ -63,6 +63,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Get("/me", ph.me)
 		portal.Post("/logout", ph.logout)
 		portal.Post("/logout-all", ph.logoutAll)
+		portal.Post("/delete-account", ph.deleteAccount)
 		portal.Post("/kyb", ph.submitKYB)
 		portal.Get("/sessions", ph.listSessions)
 		portal.Get("/sessions/{sessionID}", ph.getSession)
@@ -96,6 +97,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Use(adminauth.Middleware(stores.admin))
 
 		admin.Post("/tenants", h.createTenant)
+		admin.Post("/tenants/{tenantID}/restore", h.restoreTenant)
 		admin.Post("/tenants/{tenantID}/kyb", h.submitKYB)
 		admin.Get("/compliance/holds", h.listHolds)
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)

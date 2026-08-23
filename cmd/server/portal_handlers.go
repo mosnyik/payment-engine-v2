@@ -150,6 +150,27 @@ func (h *portalHandlers) logoutAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "logged out of all sessions"})
 }
 
+// POST /v2/portal/delete-account — self-service account deletion. Disables
+// portal login and HMAC auth, revokes every session and API key, but
+// deletes no data: the tenant row and everything referencing it stay in
+// place for ISP §7's 5-year retention window (tenant.DeleteAccount's doc
+// comment). Reversible only by an admin (tenant.RestoreAccount) — not
+// something this endpoint itself offers, deliberately, since a self-service
+// undo would defeat the point of asking "are you sure" on the frontend
+// before this is ever called.
+func (h *portalHandlers) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := portalTenantID(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
+		return
+	}
+	if err := h.tenant.DeleteAccount(r.Context(), tenantID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "account deleted"})
+}
+
 type portalTenantResponse struct {
 	ID         uuid.UUID `json:"id"`
 	Name       string    `json:"name"`

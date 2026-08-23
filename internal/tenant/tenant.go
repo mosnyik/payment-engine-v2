@@ -55,6 +55,12 @@ const (
 	StatusPendingKYB Status = "pending_kyb"
 	StatusActive     Status = "active"
 	StatusSuspended  Status = "suspended"
+	// StatusDeleted is tenant-initiated account deletion (DeleteAccount) —
+	// distinct from StatusSuspended, an admin/compliance action, so status
+	// alone still answers "why is this account inactive". Reversible only
+	// by an admin (RestoreAccount); nothing about it removes data (ISP §7's
+	// 5-year retention still applies).
+	StatusDeleted Status = "deleted"
 )
 
 var (
@@ -168,12 +174,21 @@ func (s *Store) RegisterTenant(ctx context.Context, name, email string) (uuid.UU
 // Store tells the truth, the handler decides what to reveal).
 func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
 	var tenantID uuid.UUID
-	err := s.pool.QueryRow(ctx, `SELECT id FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID)
+	var status string
+	err := s.pool.QueryRow(ctx, `SELECT id, status FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("tenant: lookup by email: %w", err)
+	}
+	// Suspended/deleted tenants get the same response as a nonexistent
+	// email (ErrNotFound) rather than a distinct error — telling a caller
+	// "this account is deleted" would itself leak account status to
+	// whoever's asking, the same enumeration risk RequestMagicLink's own
+	// doc comment already guards pending_kyb/active tenants against.
+	if Status(status) == StatusSuspended || Status(status) == StatusDeleted {
+		return ErrNotFound
 	}
 
 	token, tokenHash, err := newPortalToken()
@@ -224,10 +239,14 @@ func (s *Store) VerifyMagicLink(ctx context.Context, token string) (sessionToken
 
 	var expiresAt time.Time
 	var consumedAt *time.Time
+	var status string
 	err = s.pool.QueryRow(ctx,
-		`SELECT tenant_id, expires_at, consumed_at FROM tenant_magic_links WHERE token_hash = $1`,
+		`SELECT ml.tenant_id, ml.expires_at, ml.consumed_at, t.status
+		 FROM tenant_magic_links ml
+		 JOIN tenants t ON t.id = ml.tenant_id
+		 WHERE ml.token_hash = $1`,
 		tokenHash,
-	).Scan(&tenantID, &expiresAt, &consumedAt)
+	).Scan(&tenantID, &expiresAt, &consumedAt, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", uuid.Nil, ErrInvalidMagicLink
 	}
@@ -235,6 +254,12 @@ func (s *Store) VerifyMagicLink(ctx context.Context, token string) (sessionToken
 		return "", uuid.Nil, fmt.Errorf("tenant: lookup magic link: %w", err)
 	}
 	if consumedAt != nil || time.Now().After(expiresAt) {
+		return "", uuid.Nil, ErrInvalidMagicLink
+	}
+	// Covers the race where a tenant is suspended/deleted after the magic
+	// link was mailed but before it's redeemed — same rejection as an
+	// expired/consumed link, no distinct error (see RequestMagicLink).
+	if Status(status) == StatusSuspended || Status(status) == StatusDeleted {
 		return "", uuid.Nil, ErrInvalidMagicLink
 	}
 
@@ -269,21 +294,32 @@ func (s *Store) VerifyMagicLink(ctx context.Context, token string) (sessionToken
 // AuthenticateSession resolves a portal bearer token to a tenant ID —
 // mirrors adminauth.Store.Authenticate exactly: looked up by the token's
 // hash, no secret-comparison step at all, sidestepping timing-attack
-// concerns structurally.
+// concerns structurally. Also re-checks tenant status on every call, not
+// just at session creation: Suspend/DeleteAccount both revoke every
+// existing session as part of the same transaction, but this is the
+// defense-in-depth backstop in case a session row ever outlives that (e.g.
+// a future admin-side status change that forgets to revoke sessions too).
 func (s *Store) AuthenticateSession(ctx context.Context, token string) (uuid.UUID, error) {
 	tokenHash := hashPortalToken(token)
 
 	var tenantID uuid.UUID
 	var expiresAt time.Time
+	var status string
 	err := s.pool.QueryRow(ctx,
-		`SELECT tenant_id, expires_at FROM tenant_sessions WHERE token_hash = $1`,
+		`SELECT s.tenant_id, s.expires_at, t.status
+		 FROM tenant_sessions s
+		 JOIN tenants t ON t.id = s.tenant_id
+		 WHERE s.token_hash = $1`,
 		tokenHash,
-	).Scan(&tenantID, &expiresAt)
+	).Scan(&tenantID, &expiresAt, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrPortalSessionInvalid
 	}
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("tenant: lookup session: %w", err)
+	}
+	if Status(status) == StatusSuspended || Status(status) == StatusDeleted {
+		return uuid.Nil, ErrPortalSessionInvalid
 	}
 	if time.Now().After(expiresAt) {
 		return uuid.Nil, ErrPortalSessionInvalid
@@ -387,12 +423,96 @@ func (s *Store) ApproveKYB(ctx context.Context, tenantID uuid.UUID) error {
 // Suspend deactivates a tenant — their existing API keys immediately stop
 // authenticating (see LookupHMACSecret), regardless of key-level active state.
 func (s *Store) Suspend(ctx context.Context, tenantID uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("tenant: suspend: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	tag, err := tx.Exec(ctx,
 		`UPDATE tenants SET status = $2, updated_at = now() WHERE id = $1 AND status != $2`,
 		tenantID, string(StatusSuspended),
 	)
 	if err != nil {
 		return fmt.Errorf("tenant: suspend: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrInvalidStatusTransition
+	}
+	// Revoke existing sessions immediately rather than leaving them to
+	// expire on their own TTL — AuthenticateSession's own status check
+	// would catch them regardless, but doing it here means a suspended
+	// tenant's browser gets a real 401 on its very next request instead of
+	// silently succeeding until some backstop happens to run.
+	if _, err := tx.Exec(ctx, `DELETE FROM tenant_sessions WHERE tenant_id = $1`, tenantID); err != nil {
+		return fmt.Errorf("tenant: suspend: revoke sessions: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("tenant: suspend: commit: %w", err)
+	}
+	return nil
+}
+
+// DeleteAccount is tenant-initiated account deletion: disables portal login
+// and HMAC auth (StatusDeleted), revokes every existing session, and
+// explicitly revokes every API key — unlike Suspend, this is not meant to
+// be casually reversible, so restoring via RestoreAccount deliberately
+// leaves old credentials revoked rather than silently reactivating them.
+// Nothing here deletes a row: the tenant and every record referencing it
+// stay in place for ISP §7's 5-year retention window — this is an access
+// control, not a data-removal operation.
+func (s *Store) DeleteAccount(ctx context.Context, tenantID uuid.UUID) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("tenant: delete account: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE tenants SET status = $2, deleted_at = now(), updated_at = now() WHERE id = $1 AND status != $2`,
+		tenantID, string(StatusDeleted),
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: delete account: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrInvalidStatusTransition
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM tenant_sessions WHERE tenant_id = $1`, tenantID); err != nil {
+		return fmt.Errorf("tenant: delete account: revoke sessions: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE tenant_api_keys SET active = false, revoked_at = now() WHERE tenant_id = $1 AND active = true`,
+		tenantID,
+	); err != nil {
+		return fmt.Errorf("tenant: delete account: revoke api keys: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("tenant: delete account: commit: %w", err)
+	}
+	return nil
+}
+
+// RestoreAccount reverses DeleteAccount — admin-only (see
+// cmd/server/handlers.go), for a legitimate "I didn't mean to delete this"
+// support request. Always lands back in pending_kyb, never active,
+// regardless of the tenant's status before deletion: DeleteAccount doesn't
+// record what that prior status was, and guessing "they were active before,
+// so make them active again" would silently bypass ApproveKYB's gate for
+// any tenant who was never actually approved (deleted straight out of
+// pending_kyb). A previously-approved tenant re-clears KYB the normal way
+// (POST /v2/portal/kyb -> admin review) — a deliberate re-verification
+// after any account reopening, not just a formality. Also deliberately
+// does not restore API keys revoked by DeleteAccount: a restored tenant
+// issues fresh credentials via the portal once active again, rather than
+// old ones silently working.
+func (s *Store) RestoreAccount(ctx context.Context, tenantID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE tenants SET status = $2, deleted_at = NULL, updated_at = now() WHERE id = $1 AND status = $3`,
+		tenantID, string(StatusPendingKYB), string(StatusDeleted),
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: restore account: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrInvalidStatusTransition
