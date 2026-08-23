@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -117,6 +119,10 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// Every route above lives under /v2 — the whole app is versioned at
 	// this single mount point rather than per-route.
 	versioned := chi.NewRouter()
+	// Wired before Mount so it runs first, ahead of every auth middleware
+	// (HMAC, admin, portal) — see methodNotAllowedMiddleware's doc comment
+	// for why that ordering matters, not just where it's convenient.
+	versioned.Use(methodNotAllowedMiddleware(versioned))
 	versioned.Mount("/v2", r)
 
 	// Dev/staging-only: browse docs/openapi.yaml at /docs. Unversioned
@@ -129,4 +135,58 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	}
 
 	return versioned, nil
+}
+
+// httpMethods is every verb this app registers routes under — used to probe
+// "does this path exist for some *other* method" below.
+var httpMethods = []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+
+// methodNotAllowedMiddleware answers a wrong-method request to a real,
+// registered path with a proper 405 (Allow header + JSON body matching
+// writeErr's shape everywhere else in this API) instead of letting it fall
+// through.
+//
+// Falling through is the actual bug this fixes: gateway.NewRouter mounts
+// its HMAC-protected sub-router at "/" (protecting every tenant-gateway
+// route not otherwise made public), and chi middleware runs for *any*
+// request that lands on a mounted router regardless of whether that
+// request's path/method combo matches anything inside it. So today, e.g. a
+// GET to the POST-only /v2/portal/register never reaches chi's own routing
+// logic at all — HMACMiddleware fires first, finds no signature headers,
+// and returns a misleading 401 ("missing signature headers") instead of an
+// honest 405. Every admin/portal sub-route has the identical issue via
+// adminauth.Middleware/tenant.PortalMiddleware. Router.Match performs the
+// same tree walk as real routing but never invokes a handler or middleware,
+// so it's unaffected by any of that — this runs as the very first
+// middleware on the top-level router, ahead of every auth layer, precisely
+// so it decides "wrong method" before any of them get a chance to
+// misreport it as "wrong credentials".
+func methodNotAllowedMiddleware(router chi.Router) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if router.Match(chi.NewRouteContext(), r.Method, r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			var allowed []string
+			for _, method := range httpMethods {
+				if method == r.Method {
+					continue
+				}
+				if router.Match(chi.NewRouteContext(), method, r.URL.Path) {
+					allowed = append(allowed, method)
+				}
+			}
+			if len(allowed) == 0 {
+				// Doesn't exist for any method either — an honest 404, not
+				// this middleware's job to report.
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			w.Header().Set("Allow", strings.Join(allowed, ", "))
+			writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s not allowed on %s", r.Method, r.URL.Path))
+		})
+	}
 }
