@@ -55,6 +55,7 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	// by default like every other provider in this codebase until
 	// NOTIFICATION_EMAIL_* is actually configured.
 	tenantStore.SetEmailSender(notification.NewEmailProvider(notification.EmailProviderConfig(cfg.Notification.Email)))
+	tenantStore.SetPortalBaseURL(cfg.PortalBaseURL)
 
 	complianceRegistry := compliance.NewRegistry()
 	if cfg.SandboxMode {

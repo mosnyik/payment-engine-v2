@@ -12,6 +12,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -75,9 +77,10 @@ type Tenant struct {
 }
 
 type Store struct {
-	pool        *db.Pool
-	crypto      *pcrypto.AESGCM
-	emailSender EmailSender
+	pool          *db.Pool
+	crypto        *pcrypto.AESGCM
+	emailSender   EmailSender
+	portalBaseURL string
 }
 
 // New builds a Store. encryptionKey is config.TenantSecretEncryptionKey —
@@ -97,6 +100,15 @@ func New(pool *db.Pool, encryptionKey []byte) (*Store, error) {
 // stays unaffected.
 func (s *Store) SetEmailSender(sender EmailSender) {
 	s.emailSender = sender
+}
+
+// SetPortalBaseURL wires the tenant portal frontend's origin (e.g.
+// https://portal.2settle.io) — same optional-dependency setter convention
+// as SetEmailSender. When unset, RequestMagicLink emails the bare token
+// instead of a clickable link, so this stays safe to leave unconfigured
+// (config.PortalBaseURL defaults to "").
+func (s *Store) SetPortalBaseURL(baseURL string) {
+	s.portalBaseURL = baseURL
 }
 
 func (s *Store) CreateTenant(ctx context.Context, name string) (uuid.UUID, error) {
@@ -180,11 +192,26 @@ func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
 		return ErrEmailDeliveryUnavailable
 	}
 	subject := "Your 2Settle dashboard login link"
-	body := fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", token, int(PortalMagicLinkTTL.Minutes()))
+	body := magicLinkEmailBody(token, s.portalBaseURL)
 	if err := s.emailSender.Send(ctx, email, subject, body); err != nil {
 		return fmt.Errorf("tenant: send magic link email: %w", err)
 	}
 	return nil
+}
+
+// magicLinkEmailBody renders a real "{portalBaseURL}/verify?token=..." link
+// when portalBaseURL is configured (see SetPortalBaseURL), so the email
+// contains something clickable instead of a bare token the recipient would
+// have to copy into a request body by hand. Falls back to the bare token
+// when no frontend origin is configured, so a deployment that hasn't set
+// PORTAL_BASE_URL yet still sends something usable, just not clickable.
+func magicLinkEmailBody(token, portalBaseURL string) string {
+	link := token
+	if portalBaseURL != "" {
+		link = fmt.Sprintf("%s/v2/portal/verify?token=%s", strings.TrimRight(portalBaseURL, "/"), url.QueryEscape(token))
+	}
+	expiryMinutes := int(PortalMagicLinkTTL.Minutes())
+	return fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", link, expiryMinutes)
 }
 
 // VerifyMagicLink redeems a single-use magic-link token and issues a real

@@ -60,6 +60,14 @@ type Config struct {
 
 	HTTPAddr string // default :3700
 
+	// PortalBaseURL is the tenant self-service frontend's origin (e.g.
+	// https://portal.2settle.io) — internal/tenant.RequestMagicLink uses it
+	// to build a real clickable "{PortalBaseURL}/verify?token=..." link
+	// instead of emailing the bare token. Empty by default: no frontend
+	// exists to point at yet, and RequestMagicLink falls back to the bare
+	// token in that case rather than emitting a broken link.
+	PortalBaseURL string
+
 	RateEngine   RateEngineConfig
 	Treasury     TreasuryConfig
 	Session      SessionConfig
@@ -197,6 +205,10 @@ type EmailProviderConfig struct {
 	APIURL      string
 	APIKey      string
 	FromAddress string
+	// FromName is the display name shown alongside FromAddress (e.g. "2Settle"
+	// renders as "2Settle <noreply@api.2settle.io>") — optional; an empty
+	// value falls back to the bare address, same as before this field existed.
+	FromName string
 }
 
 // NotificationConfig is Phase 7's operational tuning — see internal/notification
@@ -306,6 +318,7 @@ func Load(source Source) (*Config, error) {
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
 	eventbusPollInterval := durationOrDefault(source, "EVENTBUS_POLL_INTERVAL", 2*time.Second, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
+	portalBaseURL := stringOrDefault(source, "PORTAL_BASE_URL", "")
 
 	session := SessionConfig{
 		TTLCheckInterval: durationOrDefault(source, "SESSION_TTL_CHECK_INTERVAL", 30*time.Second, &errs),
@@ -392,6 +405,7 @@ func Load(source Source) (*Config, error) {
 		EventbusBatchSize:         eventbusBatchSize,
 		EventbusPollInterval:      eventbusPollInterval,
 		HTTPAddr:                  httpAddr,
+		PortalBaseURL:             portalBaseURL,
 		RateEngine:                rateEngine,
 		Treasury:                  treasury,
 		Session:                   session,
@@ -458,6 +472,7 @@ func loadEmailProviderConfig(source Source, prefix string) EmailProviderConfig {
 		Enabled:     boolOrDefault(source, prefix+"_ENABLED", false),
 		Provider:    stringOrDefault(source, prefix+"_PROVIDER", ""),
 		APIURL:      stringOrDefault(source, prefix+"_API_URL", ""),
+		FromName:    stringOrDefault(source, prefix+"_FROM_NAME", ""),
 		APIKey:      stringOrDefault(source, prefix+"_API_KEY", ""),
 		FromAddress: stringOrDefault(source, prefix+"_FROM_ADDRESS", ""),
 	}

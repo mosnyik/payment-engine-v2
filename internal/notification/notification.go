@@ -115,6 +115,11 @@ type EmailProviderConfig struct {
 	APIURL      string // optional override; each adapter has its own real default
 	APIKey      string
 	FromAddress string
+	// FromName is the display name shown alongside FromAddress — see
+	// config.EmailProviderConfig's doc comment (the two structs must stay
+	// field-for-field identical for cmd/server's direct type conversion
+	// between them to keep compiling).
+	FromName string
 }
 
 // Config is what main.go builds from *config.Config to construct a Store —
