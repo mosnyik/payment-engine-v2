@@ -45,9 +45,31 @@ type EmailSender interface {
 	Send(ctx context.Context, to, subject, body string) error
 }
 
+// FiatCurrencyLookup is the one corridor-module capability
+// GrantCorridorEntitlement needs (Phase 10) — a narrow interface, not
+// internal/corridor.Store directly, same module-boundary convention
+// session.EntitlementChecker already establishes. Satisfied directly by
+// *corridor.Store (see corridor.Store.FiatCurrencyForCorridor).
+type FiatCurrencyLookup interface {
+	FiatCurrencyForCorridor(ctx context.Context, corridorID uuid.UUID) (string, error)
+}
+
+// JurisdictionApprovalChecker is the one compliance-module capability
+// GrantCorridorEntitlement needs (Phase 10). Satisfied directly by
+// *compliance.Store (see compliance.Store.IsJurisdictionApproved).
+type JurisdictionApprovalChecker interface {
+	IsJurisdictionApproved(ctx context.Context, tenantID uuid.UUID, fiatCurrency string) (bool, error)
+}
+
 // Compile-time proof that Store satisfies gateway.CredentialLookup —
 // catches interface drift immediately rather than at first wiring.
 var _ gateway.CredentialLookup = (*Store)(nil)
+
+// FiatCurrencyLookup/JurisdictionApprovalChecker (above) get no equivalent
+// compile-time assertion here — same convention session.EntitlementChecker
+// already establishes: corridor.Store/compliance.Store satisfying them is
+// proven implicitly at the SetJurisdictionGate call site in
+// cmd/server/stores.go, without this package importing either.
 
 type Status string
 
@@ -71,6 +93,11 @@ var (
 	ErrInvalidMagicLink         = errors.New("tenant: invalid or expired magic link")
 	ErrPortalSessionInvalid     = errors.New("tenant: invalid or expired session")
 	ErrEmailDeliveryUnavailable = errors.New("tenant: email delivery not configured")
+	// ErrJurisdictionNotApproved is returned by GrantCorridorEntitlement
+	// (Phase 10) when the tenant has no approved KYB case covering the
+	// corridor's fiat currency — the corridor's jurisdiction was never
+	// cleared, so the entitlement can't activate.
+	ErrJurisdictionNotApproved = errors.New("tenant: jurisdiction not approved by KYB")
 )
 
 type Tenant struct {
@@ -87,6 +114,16 @@ type Store struct {
 	crypto        *pcrypto.AESGCM
 	emailSender   EmailSender
 	portalBaseURL string
+
+	// fiatLookup/jurisdictionChecker back GrantCorridorEntitlement's
+	// compliance gate (Phase 10) — optional-dependency setter convention
+	// (SetJurisdictionGate), same as SetEmailSender/SetPortalBaseURL, so
+	// tenant.New's signature and every existing call site stay untouched.
+	// Unlike those two, an unset gate is not silently skipped:
+	// GrantCorridorEntitlement fails closed (see its doc comment) — a
+	// missing wiring is a startup bug, not a legitimately optional feature.
+	fiatLookup          FiatCurrencyLookup
+	jurisdictionChecker JurisdictionApprovalChecker
 }
 
 // New builds a Store. encryptionKey is config.TenantSecretEncryptionKey —
@@ -106,6 +143,16 @@ func New(pool *db.Pool, encryptionKey []byte) (*Store, error) {
 // stays unaffected.
 func (s *Store) SetEmailSender(sender EmailSender) {
 	s.emailSender = sender
+}
+
+// SetJurisdictionGate wires GrantCorridorEntitlement's compliance check
+// (Phase 10). cmd/server must call this once at startup with the real
+// corridor/compliance stores — see the fiatLookup/jurisdictionChecker
+// fields' doc comment for why an unset gate fails closed rather than being
+// silently skipped like this package's other optional dependencies.
+func (s *Store) SetJurisdictionGate(fiatLookup FiatCurrencyLookup, checker JurisdictionApprovalChecker) {
+	s.fiatLookup = fiatLookup
+	s.jurisdictionChecker = checker
 }
 
 // SetPortalBaseURL wires the tenant portal frontend's origin (e.g.
@@ -611,6 +658,35 @@ func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID
 		return fmt.Errorf("tenant: set corridor entitlement: %w", err)
 	}
 	return nil
+}
+
+// GrantCorridorEntitlement is the compliance-gated counterpart to
+// SetCorridorEntitlement (Phase 10 item 3): activates an entitlement only
+// if the tenant has an approved KYB case covering the corridor's fiat
+// currency's jurisdiction, so an admin can't ride a tenant's original
+// (e.g. NGN) approval into a corridor under a different regulator (e.g.
+// KES) it never covered. Revocation doesn't go through this — callers
+// should call SetCorridorEntitlement(ctx, tenantID, corridorID, false, ...)
+// directly, since a compliance check has no bearing on turning access off.
+func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, feeBpsOverride *int) error {
+	if s.fiatLookup == nil || s.jurisdictionChecker == nil {
+		return errors.New("tenant: jurisdiction gate not configured — call SetJurisdictionGate at startup")
+	}
+
+	fiatCurrency, err := s.fiatLookup.FiatCurrencyForCorridor(ctx, corridorID)
+	if err != nil {
+		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+	}
+
+	approved, err := s.jurisdictionChecker.IsJurisdictionApproved(ctx, tenantID, fiatCurrency)
+	if err != nil {
+		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+	}
+	if !approved {
+		return fmt.Errorf("%w: no approved KYB case covers %s", ErrJurisdictionNotApproved, fiatCurrency)
+	}
+
+	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, feeBpsOverride)
 }
 
 // CheckEntitlement reports whether a tenant may use a corridor. No row at

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -215,7 +216,7 @@ func TestScreenTenant_NoProviderFallsIntoHold(t *testing.T) {
 	s := compliance.New(pool, compliance.NewRegistry())
 
 	tenantID := uuid.New()
-	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"company":"Test Bank"}`), "")
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"company":"Test Bank"}`), []string{"NGN"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -238,7 +239,7 @@ func TestScreenTenant_RegisteredProviderApproves(t *testing.T) {
 	s := compliance.New(pool, reg)
 
 	tenantID := uuid.New()
-	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), "test-provider")
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "test-provider")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -260,7 +261,7 @@ func TestScreenTenant_RegisteredProviderRejects(t *testing.T) {
 	reg.Register(fakeProvider{name: "test-provider-reject", decision: compliance.Decision{Approved: false, Reason: "sanctions hit"}})
 	s := compliance.New(pool, reg)
 
-	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), "test-provider-reject")
+	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "test-provider-reject")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -277,7 +278,7 @@ func TestScreenTenant_UnknownProviderNameErrors(t *testing.T) {
 	ctx := context.Background()
 	s := compliance.New(pool, compliance.NewRegistry())
 
-	_, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), "does-not-exist")
+	_, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "does-not-exist")
 	if !errors.Is(err, compliance.ErrProviderNotFound) {
 		t.Fatalf("expected ErrProviderNotFound, got %v", err)
 	}
@@ -294,7 +295,7 @@ func TestGetLatestCase(t *testing.T) {
 		t.Fatalf("expected ErrNotFound before any case exists, got %v", err)
 	}
 
-	created, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), "")
+	created, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -315,7 +316,7 @@ func TestListHolds_AndResolveHold(t *testing.T) {
 	adminID := mustCreateAdmin(t, pool)
 
 	tenantID := uuid.New()
-	held, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), "")
+	held, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -366,7 +367,7 @@ func TestResolveHold_ConcurrentResolutionOnlyOneWins(t *testing.T) {
 	admin1 := mustCreateAdmin(t, pool)
 	admin2 := mustCreateAdmin(t, pool)
 
-	held, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), "")
+	held, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -464,7 +465,7 @@ func TestScreenTenant_ApprovedDoesNotPublishHoldEvent(t *testing.T) {
 	bus := eventbus.New(pool, 50)
 	s.SetEventBus(bus)
 
-	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), "always-approve-3")
+	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "always-approve-3")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -481,5 +482,120 @@ func TestScreenTenant_ApprovedDoesNotPublishHoldEvent(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected no compliance.hold_created event for an approved case, got %d", count)
+	}
+}
+
+func TestScreenTenant_NoDeclaredCurrenciesRejected(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := compliance.New(pool, compliance.NewRegistry())
+
+	_, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), nil, "")
+	if !errors.Is(err, compliance.ErrNoDeclaredCurrencies) {
+		t.Fatalf("expected ErrNoDeclaredCurrencies, got %v", err)
+	}
+}
+
+// TestScreenTenant_MissingRequiredFieldsRejectedBeforeAnyWrite proves the
+// Phase 10 "validate before proceeding" discipline: a submission missing a
+// jurisdiction-required field is rejected outright, and — critically — no
+// compliance_cases row is ever created for it (unlike a hold, which does
+// insert a row, just an unresolved one).
+func TestScreenTenant_MissingRequiredFieldsRejectedBeforeAnyWrite(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := compliance.New(pool, compliance.NewRegistry())
+
+	currency := "T1_" + uuid.NewString()[:8]
+	if _, err := s.UpsertJurisdictionRequirement(ctx, currency, "Test Jurisdiction", []string{"registration_number", "director_name"}); err != nil {
+		t.Fatalf("upsert jurisdiction requirement: %v", err)
+	}
+
+	tenantID := uuid.New()
+	_, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"registration_number":"RC12345"}`), []string{currency}, "")
+	if !errors.Is(err, compliance.ErrMissingRequiredFields) {
+		t.Fatalf("expected ErrMissingRequiredFields, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "director_name") {
+		t.Fatalf("expected error to name the missing field director_name, got %q", err.Error())
+	}
+
+	_, err = s.GetLatestCase(ctx, "tenant", tenantID, compliance.CaseTypeKYB)
+	if !errors.Is(err, compliance.ErrNotFound) {
+		t.Fatalf("expected no case row to have been created, got %v", err)
+	}
+}
+
+// TestScreenTenant_DeclaredCurrenciesPersistedAndUnionedAcrossJurisdictions
+// verifies declared_currencies is stored on the case, and that required
+// fields are unioned across every declared currency (a submission covering
+// two currencies must satisfy both jurisdictions' requirements at once).
+func TestScreenTenant_DeclaredCurrenciesPersistedAndUnionedAcrossJurisdictions(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := compliance.New(pool, compliance.NewRegistry())
+
+	currencyA := "T2_" + uuid.NewString()[:8]
+	currencyB := "T3_" + uuid.NewString()[:8]
+	if _, err := s.UpsertJurisdictionRequirement(ctx, currencyA, "Jurisdiction A", []string{"field_a"}); err != nil {
+		t.Fatalf("upsert jurisdiction requirement A: %v", err)
+	}
+	if _, err := s.UpsertJurisdictionRequirement(ctx, currencyB, "Jurisdiction B", []string{"field_b"}); err != nil {
+		t.Fatalf("upsert jurisdiction requirement B: %v", err)
+	}
+
+	tenantID := uuid.New()
+	// Missing field_b -- must fail even though field_a is present.
+	_, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"field_a":"x"}`), []string{currencyA, currencyB}, "")
+	if !errors.Is(err, compliance.ErrMissingRequiredFields) {
+		t.Fatalf("expected ErrMissingRequiredFields for missing field_b, got %v", err)
+	}
+
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"field_a":"x","field_b":"y"}`), []string{currencyA, currencyB}, "")
+	if err != nil {
+		t.Fatalf("screen tenant with both fields: %v", err)
+	}
+	if len(c.DeclaredCurrencies) != 2 || c.DeclaredCurrencies[0] != currencyA || c.DeclaredCurrencies[1] != currencyB {
+		t.Fatalf("expected declared_currencies [%s %s], got %v", currencyA, currencyB, c.DeclaredCurrencies)
+	}
+}
+
+func TestIsJurisdictionApproved(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	reg := compliance.NewRegistry()
+	reg.Register(fakeProvider{name: "auto-approve", decision: compliance.Decision{Approved: true, Reason: "ok"}})
+	s := compliance.New(pool, reg)
+
+	currency := "T4_" + uuid.NewString()[:8]
+	tenantID := uuid.New()
+
+	approved, err := s.IsJurisdictionApproved(ctx, tenantID, currency)
+	if err != nil {
+		t.Fatalf("is jurisdiction approved (before any case): %v", err)
+	}
+	if approved {
+		t.Fatal("expected not approved before any KYB case exists")
+	}
+
+	if _, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{currency}, "auto-approve"); err != nil {
+		t.Fatalf("screen tenant: %v", err)
+	}
+
+	approved, err = s.IsJurisdictionApproved(ctx, tenantID, currency)
+	if err != nil {
+		t.Fatalf("is jurisdiction approved (after approval): %v", err)
+	}
+	if !approved {
+		t.Fatal("expected approved after an auto-approved KYB case declaring this currency")
+	}
+
+	// A different, undeclared currency must not be considered approved.
+	approved, err = s.IsJurisdictionApproved(ctx, tenantID, "UNDECLARED")
+	if err != nil {
+		t.Fatalf("is jurisdiction approved (undeclared currency): %v", err)
+	}
+	if approved {
+		t.Fatal("expected not approved for a currency never declared in any case")
 	}
 }

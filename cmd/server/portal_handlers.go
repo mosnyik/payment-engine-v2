@@ -202,11 +202,13 @@ func (h *portalHandlers) me(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /v2/portal/kyb {"submitted_data": {...}} — self-service counterpart
+// POST /v2/portal/kyb {"submitted_data": {...}, "declared_currencies": ["NGN"]} — self-service counterpart
 // to adminHandlers.submitKYB. provider_name is deliberately never taken
 // from the request: a self-service caller must never be able to pick a
 // screening provider or otherwise influence hold-queue routing. Sandbox
 // mode's forced sandbox provider still applies (server-side check only).
+// declared_currencies is required (Phase 10) — same enforcement as the
+// admin path, see its doc comment.
 func (h *portalHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := portalTenantID(r)
 	if !ok {
@@ -215,7 +217,8 @@ func (h *portalHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		SubmittedData json.RawMessage `json:"submitted_data"`
+		SubmittedData      json.RawMessage `json:"submitted_data"`
+		DeclaredCurrencies []string        `json:"declared_currencies"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -227,7 +230,7 @@ func (h *portalHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 		providerName = compliance.SandboxProviderName
 	}
 
-	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, providerName)
+	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.DeclaredCurrencies, providerName)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,15 @@ var (
 	ErrNotFound            = errors.New("compliance: case not found")
 	ErrHoldAlreadyResolved = errors.New("compliance: hold already resolved")
 	ErrProviderNotFound    = errors.New("compliance: provider not registered")
+	// ErrNoDeclaredCurrencies is returned by ScreenTenant when a KYB
+	// submission declares no jurisdictions at all -- Phase 10: every KYB
+	// case must state which fiat currencies/jurisdictions it's onboarding
+	// for, since required documentation varies by regulator.
+	ErrNoDeclaredCurrencies = errors.New("compliance: no declared currencies")
+	// ErrMissingRequiredFields is returned by ScreenTenant when
+	// submitted_data is missing a field the declared jurisdiction(s)
+	// require -- same shape as corridor.ErrDestinationInvalid.
+	ErrMissingRequiredFields = errors.New("compliance: submission missing required fields")
 )
 
 type Case struct {
@@ -57,6 +67,10 @@ type Case struct {
 	ResolvedBy     *uuid.UUID
 	CreatedAt      time.Time
 	ResolvedAt     *time.Time
+	// DeclaredCurrencies is which fiat currencies/jurisdictions a KYB case
+	// is onboarding the tenant for (Phase 10) -- always empty for
+	// transaction-screening cases.
+	DeclaredCurrencies []string
 }
 
 type Decision struct {
@@ -119,7 +133,7 @@ func (s *Store) SetEventBus(bus *eventbus.Bus) {
 
 const caseColumns = `id, case_type, reference_type, reference_id, status,
 	provider_name, decision_reason, submitted_data, hold_expires_at,
-	resolved_by, created_at, resolved_at`
+	resolved_by, created_at, resolved_at, declared_currencies`
 
 func scanCase(row pgx.Row) (*Case, error) {
 	var c Case
@@ -127,7 +141,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	err := row.Scan(
 		&c.ID, &caseType, &c.ReferenceType, &c.ReferenceID, &status,
 		&c.ProviderName, &c.DecisionReason, &c.SubmittedData, &c.HoldExpiresAt,
-		&c.ResolvedBy, &c.CreatedAt, &c.ResolvedAt,
+		&c.ResolvedBy, &c.CreatedAt, &c.ResolvedAt, &c.DeclaredCurrencies,
 	)
 	if err != nil {
 		return nil, err
@@ -142,9 +156,19 @@ func scanCase(row pgx.Row) (*Case, error) {
 // (empty name, or a name with no registered provider — since none exist
 // yet by default) the case lands in the manual hold queue, unresolved,
 // with no hold_expires_at (see the schema comment for why).
-func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedData json.RawMessage, providerName string) (*Case, error) {
+//
+// declaredCurrencies is which fiat currencies/jurisdictions this KYB
+// submission is onboarding the tenant for (Phase 10) — required, and
+// validated against jurisdiction_kyb_requirements before anything else
+// happens: an empty list, or submittedData missing a field the union of
+// those jurisdictions' requirements demands, rejects the submission
+// outright (no case row inserted, no provider called).
+func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedData json.RawMessage, declaredCurrencies []string, providerName string) (*Case, error) {
 	if submittedData == nil {
 		submittedData = json.RawMessage("{}")
+	}
+	if err := s.validateDeclaredCurrencies(ctx, declaredCurrencies, submittedData); err != nil {
+		return nil, err
 	}
 
 	status := StatusHold
@@ -183,10 +207,10 @@ func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedD
 	defer tx.Rollback(ctx) // no-op once committed
 
 	row := tx.QueryRow(ctx,
-		`INSERT INTO compliance_cases (case_type, reference_type, reference_id, status, provider_name, decision_reason, submitted_data, resolved_at)
-		 VALUES ($1, 'tenant', $2, $3, $4, $5, $6, $7)
+		`INSERT INTO compliance_cases (case_type, reference_type, reference_id, status, provider_name, decision_reason, submitted_data, resolved_at, declared_currencies)
+		 VALUES ($1, 'tenant', $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `+caseColumns,
-		string(CaseTypeKYB), tenantID, string(status), resolvedProviderName, decisionReason, submittedData, resolvedAt,
+		string(CaseTypeKYB), tenantID, string(status), resolvedProviderName, decisionReason, submittedData, resolvedAt, declaredCurrencies,
 	)
 	c, err := scanCase(row)
 	if err != nil {
@@ -279,6 +303,59 @@ func (s *Store) ScreenSession(ctx context.Context, sessionID, tenantID uuid.UUID
 		return nil, fmt.Errorf("compliance: commit create session case: %w", err)
 	}
 	return c, nil
+}
+
+// validateDeclaredCurrencies enforces Phase 10's KYB precondition: rejects
+// (before any case row is inserted or provider called) if declaredCurrencies
+// is empty, or if submittedData is missing a field required by the union of
+// those currencies' jurisdiction_kyb_requirements. Mirrors
+// corridor.Corridor.ValidateDestination's missing-field logic and error
+// shape exactly.
+func (s *Store) validateDeclaredCurrencies(ctx context.Context, declaredCurrencies []string, submittedData json.RawMessage) error {
+	if len(declaredCurrencies) == 0 {
+		return ErrNoDeclaredCurrencies
+	}
+
+	seen := make(map[string]bool)
+	var required []string
+	for _, currency := range declaredCurrencies {
+		fields, err := s.GetRequiredFields(ctx, currency)
+		if err != nil {
+			return err
+		}
+		for _, f := range fields {
+			if !seen[f] {
+				seen[f] = true
+				required = append(required, f)
+			}
+		}
+	}
+	if len(required) == 0 {
+		return nil
+	}
+
+	var data map[string]any
+	if len(submittedData) > 0 {
+		if err := json.Unmarshal(submittedData, &data); err != nil {
+			return fmt.Errorf("%w: not a JSON object: %v", ErrMissingRequiredFields, err)
+		}
+	}
+	var missing []string
+	for _, req := range required {
+		v, ok := data[req]
+		if !ok {
+			missing = append(missing, req)
+			continue
+		}
+		s, ok := v.(string)
+		if !ok || s == "" {
+			missing = append(missing, req)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing or empty field(s): %s", ErrMissingRequiredFields, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 // publishIfHold publishes compliance.hold_created in the same transaction

@@ -3,6 +3,7 @@ package tenant_test
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
+	"github.com/sirfi/payment-engine-v2/internal/compliance"
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/platform/gateway"
@@ -254,6 +256,103 @@ func TestCorridorEntitlement_GrantAndRevoke(t *testing.T) {
 	}
 	if entitled {
 		t.Fatal("expected no entitlement after revoking it")
+	}
+}
+
+// mustCreateCorridor is a small helper for the GrantCorridorEntitlement
+// tests below — a corridor with a distinct fiat currency per test so
+// jurisdiction approval checks don't cross-contaminate.
+func mustCreateCorridor(t *testing.T, pool *db.Pool, fiatCurrency string) uuid.UUID {
+	t.Helper()
+	cs := corridor.New(pool)
+	corridorID, err := cs.UpsertCorridor(context.Background(), corridor.UpsertCorridorInput{
+		CryptoAsset:   "USDT",
+		CryptoNetwork: "TESTNET_" + t.Name(),
+		FiatCurrency:  fiatCurrency,
+		Active:        true,
+	})
+	if err != nil {
+		t.Fatalf("upsert corridor: %v", err)
+	}
+	return corridorID
+}
+
+func TestGrantCorridorEntitlement_GateNotConfigured(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := newStore(t, pool)
+
+	tenantID, err := s.CreateTenant(ctx, "Test Bank "+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	corridorID := mustCreateCorridor(t, pool, "GHS")
+
+	// SetJurisdictionGate was never called on this Store — must fail
+	// closed, not silently allow the grant through.
+	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil); err == nil {
+		t.Fatal("expected an error when the jurisdiction gate isn't configured")
+	}
+}
+
+func TestGrantCorridorEntitlement_UnapprovedJurisdictionRejected(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := newStore(t, pool)
+	cs := corridor.New(pool)
+	comp := compliance.New(pool, compliance.NewRegistry())
+	s.SetJurisdictionGate(cs, comp)
+
+	tenantID, err := s.CreateTenant(ctx, "Test Bank "+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	corridorID := mustCreateCorridor(t, pool, "ZAR")
+
+	// No KYB case at all yet for this tenant/currency.
+	err = s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil)
+	if !errors.Is(err, tenant.ErrJurisdictionNotApproved) {
+		t.Fatalf("expected ErrJurisdictionNotApproved, got %v", err)
+	}
+
+	entitled, err := s.CheckEntitlement(ctx, tenantID, corridorID)
+	if err != nil {
+		t.Fatalf("check entitlement: %v", err)
+	}
+	if entitled {
+		t.Fatal("expected no entitlement after a rejected grant attempt")
+	}
+}
+
+func TestGrantCorridorEntitlement_ApprovedJurisdictionSucceeds(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := newStore(t, pool)
+	cs := corridor.New(pool)
+	reg := compliance.NewRegistry()
+	reg.Register(compliance.SandboxProvider{})
+	comp := compliance.New(pool, reg)
+	s.SetJurisdictionGate(cs, comp)
+
+	tenantID, err := s.CreateTenant(ctx, "Test Bank "+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	corridorID := mustCreateCorridor(t, pool, "UGX")
+
+	if _, err := comp.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"UGX"}, compliance.SandboxProviderName); err != nil {
+		t.Fatalf("screen tenant: %v", err)
+	}
+
+	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil); err != nil {
+		t.Fatalf("grant corridor entitlement: %v", err)
+	}
+	entitled, err := s.CheckEntitlement(ctx, tenantID, corridorID)
+	if err != nil {
+		t.Fatalf("check entitlement: %v", err)
+	}
+	if !entitled {
+		t.Fatal("expected entitlement after an approved-jurisdiction grant")
 	}
 }
 

@@ -187,8 +187,9 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 		Status string `json:"Status"`
 	}
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/kyb", token, map[string]any{
-		"submitted_data": map[string]string{"company": "Test Fintech Ltd"},
-		"provider_name":  "",
+		"submitted_data":      map[string]string{"company": "Test Fintech Ltd"},
+		"declared_currencies": []string{"NGN"},
+		"provider_name":       "",
 	}, &kybCase)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("submit kyb: expected 201, got %d", resp.StatusCode)

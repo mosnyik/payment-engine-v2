@@ -230,6 +230,10 @@ paths:
       description: >
         An empty provider_name (no vendor selected yet) always lands in the
         manual hold queue for a human to resolve via /admin/compliance/holds/{caseID}/resolve.
+        declared_currencies (required) is which fiat currencies/jurisdictions
+        this submission is onboarding the tenant for — submitted_data is
+        validated against the union of those jurisdictions' configured
+        required fields before the case is created.
       security: [{ adminAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/tenantID"
@@ -239,8 +243,10 @@ paths:
           application/json:
             schema:
               type: object
+              required: [declared_currencies]
               properties:
                 submitted_data: { type: object }
+                declared_currencies: { type: array, items: { type: string }, example: ["NGN"] }
                 provider_name: { type: string }
       responses:
         "201":
