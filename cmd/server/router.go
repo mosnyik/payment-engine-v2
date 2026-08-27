@@ -67,6 +67,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.Get("/sessions/{sessionID}", sh.getSession)
 
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
+	bh := &adminBrowseHandlers{tenant: stores.tenant, corridor: stores.corridor, session: stores.session, admin: stores.admin, requestAudit: stores.audit}
 	sth := &settlementHandlers{settlement: stores.settlement}
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}
@@ -151,6 +152,19 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/notifications/deliveries/{deliveryID}/retry", nh.retryDelivery)
 		admin.Get("/ledger/discrepancies", lh.listDiscrepancies)
 		admin.Post("/ledger/discrepancies/{discrepancyID}/resolve", lh.resolveDiscrepancy)
+
+		// Phase 11: admin read/browse surface — the GET-only counterpart to
+		// every act-on-one-record route above, needed before a frontend
+		// dashboard can be built against this API. See
+		// docs/IMPLEMENTATION_PLAN.md's Phase 11 section.
+		admin.Get("/tenants", bh.listTenants)
+		admin.Get("/tenants/{tenantID}", bh.getTenant)
+		admin.Get("/corridors", bh.listCorridors)
+		admin.Get("/corridors/{corridorID}", bh.getCorridor)
+		admin.Get("/tenants/{tenantID}/sessions", bh.listTenantSessions)
+		admin.Get("/sessions/{sessionID}", bh.getSession)
+		admin.Get("/audit-log", bh.listAuditLog)
+		admin.Get("/request-audit-log", bh.listRequestAuditLog)
 	})
 
 	// Every route above lives under /v2 — the whole app is versioned at

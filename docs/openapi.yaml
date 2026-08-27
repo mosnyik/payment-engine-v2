@@ -222,6 +222,173 @@ paths:
           description: Missing name
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
+    get:
+      tags: [admin]
+      summary: "List tenants (Phase 11 browse surface), paginated"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending_kyb, active, suspended, deleted] }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Tenants
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pagination"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Tenant" }
+
+  /admin/tenants/{tenantID}:
+    get:
+      tags: [admin]
+      summary: "Get a tenant by ID (Phase 11 browse surface)"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+      responses:
+        "200":
+          description: Tenant
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Tenant" } }
+        "404":
+          description: Not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/tenants/{tenantID}/sessions:
+    get:
+      tags: [admin]
+      summary: "List a tenant's sessions (Phase 11 browse surface), paginated"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/tenantID"
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pagination"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AdminSession" }
+
+  /admin/corridors:
+    get:
+      tags: [admin]
+      summary: "List corridors (Phase 11 browse surface), paginated"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: active
+          in: query
+          description: "true restricts to active corridors only; omitted/false returns all"
+          schema: { type: boolean }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Corridors
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pagination"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Corridor" }
+
+  /admin/corridors/{corridorID}:
+    get:
+      tags: [admin]
+      summary: "Get a corridor by ID (Phase 11 browse surface)"
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/corridorID"
+      responses:
+        "200":
+          description: Corridor
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Corridor" } }
+        "404":
+          description: Not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/audit-log:
+    get:
+      tags: [admin]
+      summary: "List admin_audit_log entries (Phase 11 browse surface), paginated"
+      description: >
+        The human-readable "who approved what" trail — see
+        /admin/request-audit-log for the separate blanket per-request log.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: admin_id
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pagination"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/AuditLogEntry" }
+
+  /admin/request-audit-log:
+    get:
+      tags: [admin]
+      summary: "List request_audit_log entries (Phase 11 browse surface), paginated"
+      description: >
+        ISP §7's blanket per-request log. Carries client IPs/user agents;
+        gated by the same adminAuth as every other /admin route — this
+        codebase has no finer-grained admin role/permission model yet (see
+        IMPLEMENTATION_PLAN.md's Phase 11 write-up).
+      security: [{ adminAuth: [] }]
+      parameters:
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: admin_id
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/offset"
+      responses:
+        "200":
+          description: Request log entries
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Pagination"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/RequestLogEntry" }
 
   /admin/tenants/{tenantID}/kyb:
     post:
@@ -395,6 +562,27 @@ paths:
                   webhook_signing_secret: { type: string }
         "400":
           description: Invalid or SSRF-unsafe URL
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/sessions/{sessionID}:
+    get:
+      tags: [admin]
+      summary: "Get any session by ID (Phase 11 browse surface)"
+      description: >
+        Unlike GET /v2/sessions/{sessionID} (tenant-scoped, 404s across
+        tenants), this has no ownership check — an admin can look up any
+        session.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/sessionID"
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/AdminSession" } }
+        "404":
+          description: Not found
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
@@ -609,6 +797,21 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    corridorID:
+      name: corridorID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    limit:
+      name: limit
+      in: query
+      description: "Max items per page. Default 50, capped at 200."
+      schema: { type: integer, default: 50, maximum: 200 }
+    offset:
+      name: offset
+      in: query
+      description: "Items to skip. Default 0."
+      schema: { type: integer, default: 0 }
 
   securitySchemes:
     tenantAuth:
@@ -633,6 +836,91 @@ components:
       type: object
       properties:
         error: { type: string }
+
+    Pagination:
+      type: object
+      properties:
+        limit: { type: integer }
+        offset: { type: integer }
+        total: { type: integer }
+
+    Tenant:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { type: string, enum: [pending_kyb, active, suspended, deleted] }
+        fee_bps: { type: integer }
+        webhook_url: { type: string, nullable: true }
+        created_at: { type: string }
+
+    Corridor:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        crypto_asset: { type: string }
+        crypto_network: { type: string }
+        fiat_currency: { type: string }
+        active: { type: boolean }
+        min_amount_fiat: { type: string, nullable: true }
+        max_amount_fiat: { type: string, nullable: true }
+        travel_rule_threshold_fiat: { type: string, nullable: true }
+        travel_rule_window_seconds: { type: integer }
+        compliance_hold_timeout_seconds: { type: integer }
+        required_destination_fields: { type: array, items: { type: string } }
+
+    AdminSession:
+      description: >
+        The admin-facing session shape — richer than Session (the
+        tenant-facing shape returned by /v2/sessions), which deliberately
+        omits tenant_id/compliance_case_id.
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        corridor_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [screening, compliance_hold, rejected, pending, expired, deposit_detected, deposit_confirmed, settling, settled, settlement_failed, reversed, reversal_resolved]
+        fiat_currency: { type: string }
+        fiat_amount: { type: string }
+        crypto_asset: { type: string }
+        crypto_network: { type: string }
+        compliance_case_id: { type: string, format: uuid, nullable: true }
+        rate_lock_id: { type: string, format: uuid, nullable: true }
+        deposit_reservation_id: { type: string, format: uuid, nullable: true }
+        sla_breached_at: { type: string, nullable: true }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    AuditLogEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        admin_id: { type: string, format: uuid }
+        action: { type: string }
+        target: { type: string, nullable: true }
+        metadata: { type: object, nullable: true }
+        created_at: { type: string }
+
+    RequestLogEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        request_id: { type: string }
+        method: { type: string }
+        path: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        client_ip: { type: string }
+        user_agent: { type: string }
+        status_code: { type: integer }
+        response_time_ms: { type: integer }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        api_key_id: { type: string, format: uuid, nullable: true }
+        admin_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string }
 
     ApprovalDecision:
       type: object

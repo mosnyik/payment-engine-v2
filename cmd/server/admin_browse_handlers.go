@@ -23,11 +23,11 @@ import (
 // it depends on two stores (corridor, the request-audit Logger) none of
 // adminHandlers' existing routes touch.
 type adminBrowseHandlers struct {
-	tenant        *tenant.Store
-	corridor      *corridor.Store
-	session       *session.Store
-	admin         *adminauth.Store
-	requestAudit  *audit.Logger
+	tenant       *tenant.Store
+	corridor     *corridor.Store
+	session      *session.Store
+	admin        *adminauth.Store
+	requestAudit *audit.Logger
 }
 
 // defaultPageLimit/maxPageLimit bound every new paginated endpoint below —
@@ -228,7 +228,7 @@ func (h *adminBrowseHandlers) getCorridor(w http.ResponseWriter, r *http.Request
 type adminSessionResponse struct {
 	ID                   uuid.UUID  `json:"id"`
 	TenantID             uuid.UUID  `json:"tenant_id"`
-	CorridorID            uuid.UUID  `json:"corridor_id"`
+	CorridorID           uuid.UUID  `json:"corridor_id"`
 	Status               string     `json:"status"`
 	FiatCurrency         string     `json:"fiat_currency"`
 	FiatAmount           string     `json:"fiat_amount"`
