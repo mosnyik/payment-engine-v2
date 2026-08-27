@@ -564,34 +564,36 @@ func (s *Store) IssueAPIKey(ctx context.Context, tenantID uuid.UUID) (apiKey, hm
 // non-active tenant both resolve to "unknown" (ok=false) — from the
 // gateway's perspective there is no meaningful difference between "this key
 // never existed" and "this key must no longer authenticate".
-func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, bool, error) {
+func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, bool, error) {
 	var keyID uuid.UUID
 	var tenantID uuid.UUID
 	var encryptedSecret string
 	var keyActive bool
 	var tenantStatus string
+	var rateLimitTier string
+	var allowedCIDRs []string
 	err := s.pool.QueryRow(ctx,
-		`SELECT k.id, k.tenant_id, k.hmac_secret_encrypted, k.active, t.status
+		`SELECT k.id, k.tenant_id, k.hmac_secret_encrypted, k.active, t.status, k.rate_limit_tier, k.allowed_cidrs
 		 FROM tenant_api_keys k
 		 JOIN tenants t ON t.id = k.tenant_id
 		 WHERE k.api_key = $1`,
 		apiKey,
-	).Scan(&keyID, &tenantID, &encryptedSecret, &keyActive, &tenantStatus)
+	).Scan(&keyID, &tenantID, &encryptedSecret, &keyActive, &tenantStatus, &rateLimitTier, &allowedCIDRs)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", uuid.Nil, uuid.Nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
 	}
 	if err != nil {
-		return "", uuid.Nil, uuid.Nil, false, fmt.Errorf("tenant: lookup hmac secret: %w", err)
+		return "", uuid.Nil, uuid.Nil, "", nil, false, fmt.Errorf("tenant: lookup hmac secret: %w", err)
 	}
 	if !keyActive || Status(tenantStatus) != StatusActive {
-		return "", uuid.Nil, uuid.Nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
 	}
 
 	secret, err := s.crypto.Decrypt(encryptedSecret)
 	if err != nil {
-		return "", uuid.Nil, uuid.Nil, false, fmt.Errorf("tenant: decrypt hmac secret: %w", err)
+		return "", uuid.Nil, uuid.Nil, "", nil, false, fmt.Errorf("tenant: decrypt hmac secret: %w", err)
 	}
-	return secret, tenantID, keyID, true, nil
+	return secret, tenantID, keyID, rateLimitTier, allowedCIDRs, true, nil
 }
 
 // SetCorridorEntitlement grants or revokes a tenant's access to a corridor,

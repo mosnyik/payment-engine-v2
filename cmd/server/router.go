@@ -10,8 +10,36 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/gateway"
+	"github.com/sirfi/payment-engine-v2/internal/platform/ratelimit"
 	"github.com/sirfi/payment-engine-v2/internal/tenant"
 )
+
+// publicRouteIPLimit bounds the handful of fully public, unauthenticated
+// entry points (admin/portal login, portal register/verify) per client IP
+// per minute — brute-force/enumeration protection where there's no
+// tenant/tier to key on yet (see gateway.HMACMiddleware's own per-tier
+// limiting for every route after auth). Deliberately conservative: a real
+// user only calls these a handful of times a minute; this is anti-abuse,
+// not a throughput budget.
+const publicRouteIPLimit = 20
+
+// publicRateLimit bounds GET /rate/{fiatCurrency} per client IP per minute.
+// Generous relative to how often the answer can actually change:
+// rate.CurrentRateJob only recomputes current_rates every
+// RATE_CURRENT_RATE_INTERVAL (default 15m), so no legitimate caller gains
+// anything by polling faster than that — this limit exists to cap
+// scraping/abuse, not to throttle real usage.
+const publicRateLimit = 60
+
+// publicWebhookIPLimit bounds the settlement/treasury provider-webhook
+// routes per client IP per minute. Higher than the other public limits
+// deliberately: unlike a login/register endpoint, real traffic here comes
+// from a small, fixed set of known provider IPs, not diverse end-users, so
+// per-IP limiting is a good fit — and a dropped webhook is costly (a
+// provider may not retry, turning into a missed settlement/deposit
+// confirmation that needs manual ops intervention), so this leaves real
+// headroom for a legitimate burst of confirmations.
+const publicWebhookIPLimit = 120
 
 // buildRouter wires every module built so far into one router. Separated
 // from main() so tests can exercise the real HTTP surface directly via
@@ -21,7 +49,10 @@ import (
 func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// stores.tenant satisfies gateway.CredentialLookup — proven at compile
 	// time in internal/tenant/tenant.go, used here for real.
-	r, protected := gateway.NewRouter(stores.tenant, cfg.HMACClockSkew, stores.audit)
+	r, protected := gateway.NewRouter(stores.tenant, cfg.HMACClockSkew, stores.audit, stores.ratelimit, cfg.IsProduction())
+	publicLimit := ratelimit.IPMiddleware(stores.ratelimit, publicRouteIPLimit, "public-auth")
+	rateLimit := ratelimit.IPMiddleware(stores.ratelimit, publicRateLimit, "public-rate")
+	webhookLimit := ratelimit.IPMiddleware(stores.ratelimit, publicWebhookIPLimit, "public-webhook")
 
 	// A minimal authenticated smoke-test route proving an issued credential
 	// actually works end to end, not just that Store-level HMAC logic is
@@ -51,13 +82,16 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		sandboxMode:  cfg.SandboxMode,
 	}
 
-	r.Post("/admin/login", h.login)
+	r.With(publicLimit).Post("/admin/login", h.login)
 
 	// Tenant self-service: passwordless (email magic link), same
 	// unauthenticated tier as /admin/login for the three entry points.
-	r.Post("/portal/register", ph.register)
-	r.Post("/portal/login", ph.login)
-	r.Post("/portal/verify", ph.verify)
+	// IP-rate-limited (publicLimit) — the first fully public, unauthenticated
+	// routes this codebase has (Phase 9a), so the only anti-abuse layer
+	// pre-auth is by client IP, not tenant/tier.
+	r.With(publicLimit).Post("/portal/register", ph.register)
+	r.With(publicLimit).Post("/portal/login", ph.login)
+	r.With(publicLimit).Post("/portal/verify", ph.verify)
 
 	r.Route("/portal", func(portal chi.Router) {
 		portal.Use(tenant.PortalMiddleware(stores.tenant))
@@ -80,20 +114,23 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 
 	// Public, unauthenticated — same tier as /admin/login, deliberately not
 	// behind the tenant gateway's HMAC (see rate_handlers.go's doc comment).
-	r.Get("/rate/{fiatCurrency}", rh.getRate)
+	// IP-rate-limited (rateLimit) — see publicRateLimit's doc comment.
+	r.With(rateLimit).Get("/rate/{fiatCurrency}", rh.getRate)
 
 	// Self-verified via settlement.VerifyWebhookSignature, not the tenant
 	// gateway's HMAC or adminauth — same unauthenticated tier as
 	// /admin/login, since a settlement provider is neither a tenant nor an
-	// admin.
-	r.Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
+	// admin. IP-rate-limited (webhookLimit) — see publicWebhookIPLimit's
+	// doc comment on why this one is set higher than the other public
+	// limits.
+	r.With(webhookLimit).Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
 
 	// Same unauthenticated, self-verified tier as the settlement webhook
 	// above — self-custody deposit detection already runs via watcher
 	// polling (treasury/watcher.go), so this is only Busha's partner-
 	// custodied callback path today, hence the static "busha" segment
 	// rather than settlement's {providerName}.
-	r.Post("/webhooks/treasury/busha", th.handleDepositWebhook)
+	r.With(webhookLimit).Post("/webhooks/treasury/busha", th.handleDepositWebhook)
 
 	r.Route("/admin", func(admin chi.Router) {
 		admin.Use(adminauth.Middleware(stores.admin))

@@ -61,7 +61,7 @@ func Middleware(logger *Logger) func(http.Handler) http.Handler {
 				Action:         r.Method + " " + firstNonEmpty(routePattern, r.URL.Path),
 				ResourceType:   resourceType,
 				ResourceID:     resourceID,
-				ClientIP:       clientIP(r),
+				ClientIP:       ClientIP(r),
 				UserAgent:      r.UserAgent(),
 				BodyHash:       bodyHash,
 				StatusCode:     ww.Status(),
@@ -104,10 +104,12 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-// clientIP prefers X-Forwarded-For, since production sits behind the
+// ClientIP prefers X-Forwarded-For, since production sits behind the
 // reverse proxy documented in ISP §6, and falls back to the direct
-// connection for local/dev use.
-func clientIP(r *http.Request) string {
+// connection for local/dev use. Exported for reuse by
+// internal/platform/ratelimit and gateway.HMACMiddleware's IP-allowlist
+// check — one implementation, so every caller agrees on which header wins.
+func ClientIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		if idx := strings.Index(fwd, ","); idx != -1 {
 			return strings.TrimSpace(fwd[:idx])

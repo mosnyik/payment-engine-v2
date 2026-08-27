@@ -37,6 +37,27 @@ type ChainTransaction struct {
 	// watcher orchestrator as tipHeight-BlockHeight+1, uniformly across
 	// chains, rather than trusting each API's own confirmation count —
 	// one policy application point instead of three.
+
+	// IsRBF is true when a Bitcoin transaction's inputs signal
+	// replace-by-fee eligibility (BIP125: any input's sequence number is
+	// below 0xFFFFFFFE) — such a transaction can still be replaced by a
+	// competing, fee-bumped transaction sending elsewhere, right up until
+	// enough confirmations bury it. Always false for chains with no such
+	// pre-confirmation replacement mechanism (see pollOnce's use of it).
+	IsRBF bool
+}
+
+// dustThreshold is the minimum deposit amount per chain pollOnce will act
+// on — ISP §7's "dust filtering" fraud check, ported from v1's fixed
+// per-chain values (same numbers, deliberately not reinvented). A deposit
+// below this is never recorded: dust amounts are a known technique for
+// probing/deanonymizing an address rather than a real payment attempt, and
+// are indistinguishable from noise at these sizes anyway.
+var dustThreshold = map[wallet.Chain]decimal.Decimal{
+	wallet.Bitcoin:  decimal.New(1, -5), // 0.00001 BTC (1000 sats)
+	wallet.Ethereum: decimal.New(1, -4), // 0.0001 ETH
+	wallet.BSC:      decimal.New(1, -4), // 0.0001 BNB
+	wallet.Tron:     decimal.New(1, -1), // 0.1 TRX
 }
 
 // chainWatcherClient is implemented once per chain — real HTTP/gRPC
@@ -150,10 +171,39 @@ func (w *Watcher) pollOnce(ctx context.Context) {
 		}
 
 		for _, tx := range txs {
+			// Fake-token / wrong-asset filtering: only accept a transaction
+			// carrying exactly the asset this reservation was issued for.
+			// A client's own query already scopes token transfers to the
+			// real contract address (see usdtContractAddress above), but
+			// this reservation-level check also catches the case a
+			// contract-address filter can't: a depositor sending the
+			// address's *native* coin when the reservation expects a
+			// token (or vice versa) — a mismatch that would otherwise be
+			// recorded as a deposit of whatever asset the client happened
+			// to report.
+			if tx.CryptoAsset != r.CryptoAsset {
+				log.Printf("treasury: watcher: ignoring %s deposit %s to reservation %s (expected %s)", tx.CryptoAsset, tx.TxID, r.ID, r.CryptoAsset)
+				continue
+			}
+
+			if threshold, ok := dustThreshold[chain]; ok && tx.Amount.LessThan(threshold) {
+				log.Printf("treasury: watcher: ignoring dust deposit %s (%s %s) to reservation %s", tx.TxID, tx.Amount, tx.CryptoAsset, r.ID)
+				continue
+			}
+
+			requiredConfirmations := w.minConfirmations[chain]
+			if chain == wallet.Bitcoin && tx.IsRBF {
+				// An RBF-signaled transaction can still be replaced by a
+				// competing, fee-bumped one before enough blocks bury it —
+				// require extra confirmations before this is ever treated
+				// as settled, same floor v1 applied.
+				requiredConfirmations = max(requiredConfirmations, 3)
+			}
+
 			status := "detected"
 			if tx.Confirmed {
 				confirmations := tip - tx.BlockHeight + 1
-				if int(confirmations) >= w.minConfirmations[chain] {
+				if int(confirmations) >= requiredConfirmations {
 					status = "confirmed"
 				}
 			}
@@ -239,10 +289,27 @@ type blockstreamTx struct {
 		Confirmed   bool  `json:"confirmed"`
 		BlockHeight int64 `json:"block_height"`
 	} `json:"status"`
+	Vin []struct {
+		// Sequence below 0xFFFFFFFE (BIP125) signals this input opts into
+		// replace-by-fee — see isRBFEnabled below.
+		Sequence uint32 `json:"sequence"`
+	} `json:"vin"`
 	Vout []struct {
 		ScriptPubKeyAddress string `json:"scriptpubkey_address"`
 		Value               int64  `json:"value"` // satoshis
 	} `json:"vout"`
+}
+
+// isRBFEnabled reports whether any of tx's inputs signal BIP125
+// replace-by-fee eligibility. A single such input is enough — Bitcoin Core
+// itself treats a transaction as replaceable if any input does.
+func (tx blockstreamTx) isRBFEnabled() bool {
+	for _, vin := range tx.Vin {
+		if vin.Sequence < 0xfffffffe {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *blockstreamClient) ListIncomingTransactions(ctx context.Context, address string) ([]ChainTransaction, error) {
@@ -272,6 +339,7 @@ func (c *blockstreamClient) ListIncomingTransactions(ctx context.Context, addres
 			Amount:      decimal.New(total, -8),
 			Confirmed:   tx.Status.Confirmed,
 			BlockHeight: tx.Status.BlockHeight,
+			IsRBF:       tx.isRBFEnabled(),
 		})
 	}
 	return out, nil

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
+	"github.com/sirfi/payment-engine-v2/internal/platform/ratelimit"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 	"github.com/sirfi/payment-engine-v2/internal/session"
 	"github.com/sirfi/payment-engine-v2/internal/settlement"
@@ -42,6 +44,7 @@ type appStores struct {
 	notification *notification.Store
 	bus          *eventbus.Bus
 	audit        *audit.Logger
+	ratelimit    *ratelimit.Limiter
 }
 
 func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appStores, error) {
@@ -155,5 +158,11 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 		notification: notificationStore,
 		bus:          bus,
 		audit:        audit.New(pool),
+		// One-minute window to match ISP §6's "req/min" framing — shared by
+		// both gateway.HMACMiddleware's per-tenant-tier limiting and
+		// buildRouter's IP-based limiting on the public auth routes (see
+		// ratelimit.IPMiddleware's own doc comment on why its group prefix
+		// keeps those two uses from sharing a budget).
+		ratelimit: ratelimit.New(time.Minute),
 	}, nil
 }

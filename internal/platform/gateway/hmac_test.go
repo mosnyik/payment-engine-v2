@@ -21,11 +21,11 @@ type fakeLookup struct {
 	known    bool
 }
 
-func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, bool, error) {
+func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, bool, error) {
 	if !f.known {
-		return "", uuid.Nil, uuid.Nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
 	}
-	return f.secret, f.tenantID, f.apiKeyID, true, nil
+	return f.secret, f.tenantID, f.apiKeyID, "", nil, true, nil
 }
 
 func newSignedRequest(t *testing.T, secret, method, path string, body []byte, ts time.Time) *http.Request {
@@ -45,7 +45,7 @@ func TestHMACMiddleware_ValidRequest(t *testing.T) {
 	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true}
 
 	var gotTenant uuid.UUID
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotTenant, _ = gateway.TenantIDFromContext(r.Context())
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -66,7 +66,7 @@ func TestHMACMiddleware_ValidRequest(t *testing.T) {
 
 func TestHMACMiddleware_MissingHeaders(t *testing.T) {
 	lookup := fakeLookup{known: true}
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be reached")
 	}))
 
@@ -81,7 +81,7 @@ func TestHMACMiddleware_MissingHeaders(t *testing.T) {
 
 func TestHMACMiddleware_UnknownAPIKey(t *testing.T) {
 	lookup := fakeLookup{known: false}
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be reached")
 	}))
 
@@ -98,7 +98,7 @@ func TestHMACMiddleware_UnknownAPIKey(t *testing.T) {
 func TestHMACMiddleware_TamperedBody(t *testing.T) {
 	tenantID := uuid.New()
 	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true}
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be reached")
 	}))
 
@@ -125,7 +125,7 @@ func TestHMACMiddleware_TamperedBody(t *testing.T) {
 func TestHMACMiddleware_ExpiredTimestamp(t *testing.T) {
 	tenantID := uuid.New()
 	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true}
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be reached")
 	}))
 
@@ -142,7 +142,7 @@ func TestHMACMiddleware_ExpiredTimestamp(t *testing.T) {
 func TestHMACMiddleware_WrongSecret(t *testing.T) {
 	tenantID := uuid.New()
 	lookup := fakeLookup{secret: "correct-secret", tenantID: tenantID, known: true}
-	handler := gateway.HMACMiddleware(lookup, 5*time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("handler should not be reached")
 	}))
 

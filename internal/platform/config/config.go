@@ -58,6 +58,24 @@ type Config struct {
 	EventbusBatchSize    int           // default 50
 	EventbusPollInterval time.Duration // default 2s
 
+	// OutboxRetention/OutboxCleanupInterval are Phase 9's outbox-table
+	// cleanup job (internal/platform/eventbus.CleanupJob) — retention
+	// defaults to 12 months, the same window chosen for request_audit_log
+	// below, since neither is a compliance-mandated minimum the way
+	// financial/session records are (ISP §7's 5-year figure) — this is
+	// operational hygiene on a hot-write table, not a retention obligation.
+	OutboxRetention       time.Duration // default 8760h (12 months)
+	OutboxCleanupInterval time.Duration // default 24h
+
+	// AuditLogRetention/AuditLogRetentionCheckInterval are Phase 9's
+	// request_audit_log purge job (internal/platform/audit.RetentionJob) —
+	// ISP §7: "technical audit logs ... retained for 12 months on a rolling
+	// basis". Deliberately separate from OutboxRetention above even though
+	// the default value is the same today — these are two different
+	// policies that happen to agree, not one shared number.
+	AuditLogRetention              time.Duration // default 8760h (12 months)
+	AuditLogRetentionCheckInterval time.Duration // default 24h
+
 	HTTPAddr string // default :3700
 
 	// PortalBaseURL is the tenant self-service frontend's origin (e.g.
@@ -317,6 +335,10 @@ func Load(source Source) (*Config, error) {
 	adminSessionTTL := durationOrDefault(source, "ADMIN_SESSION_TTL", 12*time.Hour, &errs)
 	eventbusBatchSize := intOrDefault(source, "EVENTBUS_BATCH_SIZE", 50, &errs)
 	eventbusPollInterval := durationOrDefault(source, "EVENTBUS_POLL_INTERVAL", 2*time.Second, &errs)
+	outboxRetention := durationOrDefault(source, "OUTBOX_RETENTION", 8760*time.Hour, &errs)
+	outboxCleanupInterval := durationOrDefault(source, "OUTBOX_CLEANUP_INTERVAL", 24*time.Hour, &errs)
+	auditLogRetention := durationOrDefault(source, "AUDIT_LOG_RETENTION", 8760*time.Hour, &errs)
+	auditLogRetentionCheckInterval := durationOrDefault(source, "AUDIT_LOG_RETENTION_CHECK_INTERVAL", 24*time.Hour, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
 	portalBaseURL := stringOrDefault(source, "PORTAL_BASE_URL", "")
 
@@ -395,23 +417,27 @@ func Load(source Source) (*Config, error) {
 	}
 
 	return &Config{
-		Environment:               environment,
-		SandboxMode:               sandboxMode,
-		SandboxCorridors:          sandboxCorridors,
-		DatabaseURL:               databaseURL,
-		TenantSecretEncryptionKey: tenantSecretEncryptionKey,
-		HMACClockSkew:             hmacClockSkew,
-		AdminSessionTTL:           adminSessionTTL,
-		EventbusBatchSize:         eventbusBatchSize,
-		EventbusPollInterval:      eventbusPollInterval,
-		HTTPAddr:                  httpAddr,
-		PortalBaseURL:             portalBaseURL,
-		RateEngine:                rateEngine,
-		Treasury:                  treasury,
-		Session:                   session,
-		Settlement:                settlement,
-		Notification:              notification,
-		Ledger:                    ledger,
+		Environment:                    environment,
+		SandboxMode:                    sandboxMode,
+		SandboxCorridors:               sandboxCorridors,
+		DatabaseURL:                    databaseURL,
+		TenantSecretEncryptionKey:      tenantSecretEncryptionKey,
+		HMACClockSkew:                  hmacClockSkew,
+		AdminSessionTTL:                adminSessionTTL,
+		EventbusBatchSize:              eventbusBatchSize,
+		EventbusPollInterval:           eventbusPollInterval,
+		OutboxRetention:                outboxRetention,
+		OutboxCleanupInterval:          outboxCleanupInterval,
+		AuditLogRetention:              auditLogRetention,
+		AuditLogRetentionCheckInterval: auditLogRetentionCheckInterval,
+		HTTPAddr:                       httpAddr,
+		PortalBaseURL:                  portalBaseURL,
+		RateEngine:                     rateEngine,
+		Treasury:                       treasury,
+		Session:                        session,
+		Settlement:                     settlement,
+		Notification:                   notification,
+		Ledger:                         ledger,
 	}, nil
 }
 
