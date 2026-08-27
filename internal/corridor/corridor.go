@@ -153,6 +153,46 @@ func (s *Store) GetCorridorByID(ctx context.Context, id uuid.UUID) (*Corridor, e
 	return c, nil
 }
 
+// ListCorridors is the admin browse surface (Phase 11) — every corridor,
+// newest first, optionally restricted to active ones. Config data, not an
+// append-only log, so it's expected to stay small, but paginated for
+// consistency with the other new list endpoints (limit<=0 means unbounded).
+func (s *Store) ListCorridors(ctx context.Context, activeOnly bool, limit, offset int) ([]Corridor, int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM corridors WHERE (NOT $1 OR active)`, activeOnly,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("corridor: list corridors: count: %w", err)
+	}
+
+	query := `SELECT ` + corridorColumns + ` FROM corridors WHERE (NOT $1 OR active)
+		ORDER BY created_at DESC`
+	args := []any{activeOnly}
+	if limit > 0 {
+		query += ` LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("corridor: list corridors: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Corridor
+	for rows.Next() {
+		c, err := scanCorridor(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("corridor: list corridors: scan: %w", err)
+		}
+		out = append(out, *c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("corridor: list corridors: %w", err)
+	}
+	return out, total, nil
+}
+
 // FiatCurrencyForCorridor returns a corridor's fiat currency — the one
 // piece of corridor data tenant.GrantCorridorEntitlement needs (Phase 10),
 // exposed narrowly rather than requiring that caller to depend on the full

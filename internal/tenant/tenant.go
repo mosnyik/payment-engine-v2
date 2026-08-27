@@ -193,6 +193,55 @@ func (s *Store) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
 	return &t, nil
 }
 
+// ListTenants is the admin browse surface (Phase 11) — every tenant, newest
+// first, optionally filtered to one status. limit<=0 means unbounded (no
+// existing caller needs that today, but it matches ListSessionsByTenant's
+// convention rather than being a special case only this method has).
+func (s *Store) ListTenants(ctx context.Context, status *Status, limit, offset int) ([]Tenant, int, error) {
+	var statusFilter *string
+	if status != nil {
+		s := string(*status)
+		statusFilter = &s
+	}
+
+	var total int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM tenants WHERE ($1::text IS NULL OR status = $1)`,
+		statusFilter,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("tenant: list tenants: count: %w", err)
+	}
+
+	query := `SELECT id, name, status, fee_bps, webhook_url, created_at FROM tenants
+		WHERE ($1::text IS NULL OR status = $1) ORDER BY created_at DESC`
+	args := []any{statusFilter}
+	if limit > 0 {
+		query += ` LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("tenant: list tenants: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Tenant
+	for rows.Next() {
+		var t Tenant
+		var st string
+		if err := rows.Scan(&t.ID, &t.Name, &st, &t.FeeBps, &t.WebhookURL, &t.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("tenant: list tenants: scan: %w", err)
+		}
+		t.Status = Status(st)
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("tenant: list tenants: %w", err)
+	}
+	return out, total, nil
+}
+
 // RegisterTenant creates a new self-service tenant — status pending_kyb,
 // same starting state CreateTenant already uses — with a contact email for
 // portal login. Passwordless: see RequestMagicLink/VerifyMagicLink for how
