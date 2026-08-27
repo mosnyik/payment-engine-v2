@@ -73,10 +73,17 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	// warm-up run needs ListActiveFiatCurrencies to already see these), and
 	// before any request can reach session.CreateSession.
 	if cfg.SandboxMode {
-		if err := seedSandboxCorridors(ctx, corridorStore, cfg.SandboxCorridors); err != nil {
+		if err := seedSandboxCorridors(ctx, corridorStore, complianceStore, cfg.SandboxCorridors); err != nil {
 			return nil, fmt.Errorf("build stores: %w", err)
 		}
 	}
+
+	// Phase 10: gates GrantCorridorEntitlement's compliance check — a
+	// tenant can only activate an entitlement on a corridor whose fiat
+	// currency an approved KYB case actually declared. Both corridorStore
+	// and complianceStore already exist at this point, so this can wire
+	// immediately rather than waiting on anything built further down.
+	tenantStore.SetJurisdictionGate(corridorStore, complianceStore)
 
 	rateStore := rate.New(pool, rate.Config{
 		CoinMarketCapAPIKey: cfg.RateEngine.CoinMarketCapAPIKey,

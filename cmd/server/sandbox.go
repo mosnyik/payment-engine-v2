@@ -49,12 +49,21 @@ func parseSandboxCorridors(spec string) ([]sandboxCorridorSpec, error) {
 // were already built for (see their doc comments), just never wired to a
 // config source until now. Idempotent — safe to run on every boot, same as
 // db.Migrate above it. Only called when cfg.SandboxMode is set.
-func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, spec string) error {
+//
+// Also seeds a permissive (empty required_fields) jurisdiction_kyb_requirements
+// row per sandbox corridor's fiat currency (Phase 10) — sandbox KYB
+// submissions still must declare a non-empty declared_currencies, just with
+// nothing actually required in it, so sandbox onboarding isn't blocked by
+// requirements the sandbox doesn't know about.
+func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, complianceStore *compliance.Store, spec string) error {
 	specs, err := parseSandboxCorridors(spec)
 	if err != nil {
 		return err
 	}
 	for _, s := range specs {
+		if _, err := complianceStore.UpsertJurisdictionRequirement(ctx, s.fiatCurrency, "sandbox", []string{}); err != nil {
+			return fmt.Errorf("sandbox: upsert jurisdiction requirement for %s: %w", s.fiatCurrency, err)
+		}
 		corridorID, err := corridorStore.UpsertCorridor(ctx, corridor.UpsertCorridorInput{
 			CryptoAsset:   s.cryptoAsset,
 			CryptoNetwork: s.cryptoNetwork,

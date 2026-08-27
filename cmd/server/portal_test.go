@@ -165,7 +165,8 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 		Status string `json:"Status"`
 	}
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/kyb", sessionToken, map[string]any{
-		"submitted_data": map[string]string{"company": "Test Fintech Ltd"},
+		"submitted_data":      map[string]string{"company": "Test Fintech Ltd"},
+		"declared_currencies": []string{"NGN"},
 	}, &kybCase)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("submit kyb: expected 201, got %d", resp.StatusCode)

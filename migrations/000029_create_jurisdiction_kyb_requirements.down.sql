@@ -1,0 +1,1 @@
+DROP TABLE jurisdiction_kyb_requirements;

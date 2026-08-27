@@ -153,6 +153,18 @@ func (s *Store) GetCorridorByID(ctx context.Context, id uuid.UUID) (*Corridor, e
 	return c, nil
 }
 
+// FiatCurrencyForCorridor returns a corridor's fiat currency — the one
+// piece of corridor data tenant.GrantCorridorEntitlement needs (Phase 10),
+// exposed narrowly rather than requiring that caller to depend on the full
+// Corridor type. Satisfies tenant.FiatCurrencyLookup directly.
+func (s *Store) FiatCurrencyForCorridor(ctx context.Context, id uuid.UUID) (string, error) {
+	c, err := s.GetCorridorByID(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return c.FiatCurrency, nil
+}
+
 type UpsertCorridorInput struct {
 	CryptoAsset               string
 	CryptoNetwork             string

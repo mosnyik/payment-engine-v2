@@ -106,9 +106,13 @@ func (h *adminHandlers) restoreTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "tenant restored"})
 }
 
-// POST /admin/tenants/{tenantID}/kyb {"submitted_data": {...}, "provider_name": ""} — step 2+3.
+// POST /admin/tenants/{tenantID}/kyb {"submitted_data": {...}, "declared_currencies": ["NGN"], "provider_name": ""} — step 2+3.
 // provider_name empty (the default — no vendor selected yet) always lands
 // in the manual hold queue for a human to resolve via resolveHold below.
+// declared_currencies is required (Phase 10) — which fiat
+// currencies/jurisdictions this submission is onboarding the tenant for;
+// submitted_data is validated against the union of those jurisdictions'
+// configured required fields before anything else happens.
 func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
 	if err != nil {
@@ -117,8 +121,9 @@ func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		SubmittedData json.RawMessage `json:"submitted_data"`
-		ProviderName  string          `json:"provider_name"`
+		SubmittedData      json.RawMessage `json:"submitted_data"`
+		DeclaredCurrencies []string        `json:"declared_currencies"`
+		ProviderName       string          `json:"provider_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -127,12 +132,15 @@ func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 
 	// Sandbox tenants shouldn't need to know a magic provider name to skip
 	// the manual hold queue — force it regardless of what was submitted
-	// (docs/SANDBOX_PLAN.md).
+	// (docs/SANDBOX_PLAN.md). declared_currencies is NOT bypassed — sandbox
+	// callers still declare like any real one (sandbox seeding configures a
+	// permissive, empty-required-fields row for the sandbox corridor's
+	// currency so this doesn't block sandbox onboarding).
 	if h.sandboxMode {
 		req.ProviderName = compliance.SandboxProviderName
 	}
 
-	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.ProviderName)
+	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.DeclaredCurrencies, req.ProviderName)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -263,6 +271,10 @@ func (h *adminHandlers) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /admin/tenants/{tenantID}/corridors/{corridorID} {"active": true, "fee_bps_override": null} — step 5.
+// Activation (active: true) is compliance-gated (Phase 10): it only
+// succeeds if the tenant has an approved KYB case declaring the corridor's
+// fiat currency. Deactivation (active: false) is never gated — revoking
+// access has no compliance precondition.
 func (h *adminHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
 	if err != nil {
@@ -284,7 +296,16 @@ func (h *adminHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if err := h.tenant.SetCorridorEntitlement(r.Context(), tenantID, corridorID, req.Active, req.FeeBpsOverride); err != nil {
+	if req.Active {
+		if err := h.tenant.GrantCorridorEntitlement(r.Context(), tenantID, corridorID, req.FeeBpsOverride); err != nil {
+			if errors.Is(err, tenant.ErrJurisdictionNotApproved) {
+				writeErr(w, http.StatusBadRequest, err)
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else if err := h.tenant.SetCorridorEntitlement(r.Context(), tenantID, corridorID, false, req.FeeBpsOverride); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
