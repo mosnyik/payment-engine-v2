@@ -64,6 +64,9 @@ func TestLoad_DefaultsApplied(t *testing.T) {
 	if len(cfg.TenantSecretEncryptionKey) != 32 {
 		t.Fatalf("expected a 32-byte decoded key, got %d bytes", len(cfg.TenantSecretEncryptionKey))
 	}
+	if cfg.AdminOIDC.IssuerURL != "" {
+		t.Fatalf("expected AdminOIDC.IssuerURL empty by default (feature off), got %q", cfg.AdminOIDC.IssuerURL)
+	}
 }
 
 func TestLoad_OverridesApplied(t *testing.T) {
@@ -73,6 +76,10 @@ func TestLoad_OverridesApplied(t *testing.T) {
 		"HMAC_CLOCK_SKEW":              "10m",
 		"ADMIN_SESSION_TTL":            "1h",
 		"EVENTBUS_BATCH_SIZE":          "200",
+		"ADMIN_OIDC_ISSUER_URL":        "https://idp.example.com",
+		"ADMIN_OIDC_CLIENT_ID":         "admin-client",
+		"ADMIN_OIDC_CLIENT_SECRET":     "shh",
+		"ADMIN_OIDC_REDIRECT_URL":      "https://api.example.com/v2/admin/login/oidc/callback",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -85,6 +92,18 @@ func TestLoad_OverridesApplied(t *testing.T) {
 	}
 	if cfg.EventbusBatchSize != 200 {
 		t.Fatalf("expected overridden EventbusBatchSize 200, got %d", cfg.EventbusBatchSize)
+	}
+	if cfg.AdminOIDC.IssuerURL != "https://idp.example.com" {
+		t.Fatalf("expected overridden AdminOIDC.IssuerURL, got %q", cfg.AdminOIDC.IssuerURL)
+	}
+	if cfg.AdminOIDC.ClientID != "admin-client" {
+		t.Fatalf("expected overridden AdminOIDC.ClientID, got %q", cfg.AdminOIDC.ClientID)
+	}
+	if cfg.AdminOIDC.ClientSecret != "shh" {
+		t.Fatalf("expected overridden AdminOIDC.ClientSecret, got %q", cfg.AdminOIDC.ClientSecret)
+	}
+	if cfg.AdminOIDC.RedirectURL != "https://api.example.com/v2/admin/login/oidc/callback" {
+		t.Fatalf("expected overridden AdminOIDC.RedirectURL, got %q", cfg.AdminOIDC.RedirectURL)
 	}
 }
 

@@ -45,6 +45,12 @@ type appStores struct {
 	bus          *eventbus.Bus
 	audit        *audit.Logger
 	ratelimit    *ratelimit.Limiter
+
+	// adminOIDC is nil unless ADMIN_OIDC_ISSUER_URL is configured — see
+	// buildRouter, which only registers the two admin OIDC routes when
+	// this is non-nil. Password login (POST /admin/login) is unaffected
+	// either way.
+	adminOIDC *adminauth.OIDCAuthenticator
 }
 
 func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appStores, error) {
@@ -152,6 +158,20 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	notificationStore.SetEventBus(bus)
 	notificationStore.RegisterEventHandlers()
 
+	// Phase 13: admin SSO/OIDC login, feature-gated on ADMIN_OIDC_ISSUER_URL
+	// being set. Discovery is a network call against the IdP — doing it
+	// here means a misconfigured/unreachable IdP fails app startup loudly,
+	// the same "fail closed at boot" discipline SetJurisdictionGate above
+	// follows, rather than surfacing as a mysterious 500 on the first
+	// admin's first login attempt.
+	var adminOIDC *adminauth.OIDCAuthenticator
+	if cfg.AdminOIDC.IssuerURL != "" {
+		adminOIDC, err = adminauth.NewOIDCAuthenticator(ctx, adminauth.OIDCConfig(cfg.AdminOIDC))
+		if err != nil {
+			return nil, fmt.Errorf("build stores: %w", err)
+		}
+	}
+
 	return &appStores{
 		tenant:       tenantStore,
 		compliance:   complianceStore,
@@ -171,5 +191,6 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 		// ratelimit.IPMiddleware's own doc comment on why its group prefix
 		// keeps those two uses from sharing a budget).
 		ratelimit: ratelimit.New(time.Minute),
+		adminOIDC: adminOIDC,
 	}, nil
 }

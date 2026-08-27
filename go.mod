@@ -7,6 +7,7 @@ require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.6
 	github.com/btcsuite/btcd/btcutil v1.1.6
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0
+	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/fbsobreira/gotron-sdk v0.26.0
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
@@ -17,6 +18,7 @@ require (
 	github.com/shopspring/decimal v1.4.0
 	github.com/tyler-smith/go-bip39 v1.1.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/oauth2 v0.36.0
 	google.golang.org/grpc v1.79.3
 )
 
@@ -35,6 +37,7 @@ require (
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/fbsobreira/go-bip39 v1.2.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/gohugoio/hugo v0.149.1 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect

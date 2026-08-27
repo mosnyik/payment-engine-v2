@@ -92,6 +92,23 @@ type Config struct {
 	Settlement   SettlementConfig
 	Notification NotificationConfig
 	Ledger       LedgerConfig
+	AdminOIDC    AdminOIDCConfig
+}
+
+// AdminOIDCConfig is Phase 13's admin SSO login — generic OIDC, any
+// compliant IdP works via these four values, no vendor-specific code. All
+// optional: an empty IssuerURL means the feature is off (the two admin
+// OIDC routes aren't registered at all), which is the default for every
+// environment that hasn't set up an IdP — password login via
+// POST /admin/login is unaffected either way.
+type AdminOIDCConfig struct {
+	IssuerURL    string
+	ClientID     string
+	ClientSecret string
+
+	// RedirectURL must exactly match the callback URL registered at the
+	// IdP, e.g. https://api.example.com/v2/admin/login/oidc/callback.
+	RedirectURL string
 }
 
 // LedgerConfig is Phase 8's reconciliation job's operational tuning — see
@@ -412,6 +429,13 @@ func Load(source Source) (*Config, error) {
 		ReconcileInterval: durationOrDefault(source, "LEDGER_RECONCILE_INTERVAL", 5*time.Minute, &errs),
 	}
 
+	adminOIDC := AdminOIDCConfig{
+		IssuerURL:    stringOrDefault(source, "ADMIN_OIDC_ISSUER_URL", ""),
+		ClientID:     stringOrDefault(source, "ADMIN_OIDC_CLIENT_ID", ""),
+		ClientSecret: stringOrDefault(source, "ADMIN_OIDC_CLIENT_SECRET", ""),
+		RedirectURL:  stringOrDefault(source, "ADMIN_OIDC_REDIRECT_URL", ""),
+	}
+
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -438,6 +462,7 @@ func Load(source Source) (*Config, error) {
 		Settlement:                     settlement,
 		Notification:                   notification,
 		Ledger:                         ledger,
+		AdminOIDC:                      adminOIDC,
 	}, nil
 }
 

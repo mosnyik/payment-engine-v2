@@ -131,6 +131,85 @@ func (s *Store) Authenticate(ctx context.Context, token string) (uuid.UUID, erro
 	return adminID, nil
 }
 
+// LoginWithOIDC resolves an OIDC-authenticated identity (subject/email
+// claims from a verified ID token, see oidc.go's Exchange) to an admin
+// session. Invite-only: this never creates an admin_users row — a row must
+// already exist (provisioned via adminctl) before its owner can SSO in.
+//
+// Two lookup paths: an admin who has already logged in via SSO once is
+// found by oidc_subject directly (the stable, spec-correct binding); an
+// admin who hasn't yet is found by email and bound to this subject on this
+// call, so a row provisioned with just a password can migrate to SSO the
+// first time its owner uses it — email is only ever trusted for this
+// one-time binding, never as the ongoing identity key.
+func (s *Store) LoginWithOIDC(ctx context.Context, subject, email string) (string, error) {
+	id, err := s.resolveOIDCAdmin(ctx, subject, email)
+	if err != nil {
+		return "", err
+	}
+
+	token, tokenHash, err := newToken()
+	if err != nil {
+		return "", err
+	}
+
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO admin_sessions (token_hash, admin_id, expires_at) VALUES ($1, $2, $3)`,
+		tokenHash, id, time.Now().Add(s.sessionTTL),
+	)
+	if err != nil {
+		return "", fmt.Errorf("adminauth: create session: %w", err)
+	}
+
+	return token, nil
+}
+
+func (s *Store) resolveOIDCAdmin(ctx context.Context, subject, email string) (uuid.UUID, error) {
+	var id uuid.UUID
+	var disabledAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, disabled_at FROM admin_users WHERE oidc_subject = $1`,
+		subject,
+	).Scan(&id, &disabledAt)
+	if err == nil {
+		if disabledAt != nil {
+			return uuid.Nil, ErrInvalidCredentials
+		}
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, fmt.Errorf("adminauth: lookup admin by oidc subject: %w", err)
+	}
+
+	// No row bound to this subject yet — fall back to a one-time
+	// email-based bind, only against a row that isn't already bound to a
+	// *different* subject (the UNIQUE constraint on oidc_subject also
+	// guards this, but checking IS NULL here keeps the intent explicit and
+	// avoids a constraint-violation error path on a should-be-rare race).
+	err = s.pool.QueryRow(ctx,
+		`SELECT id, disabled_at FROM admin_users WHERE email = $1 AND oidc_subject IS NULL`,
+		email,
+	).Scan(&id, &disabledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrInvalidCredentials
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("adminauth: lookup admin by email: %w", err)
+	}
+	if disabledAt != nil {
+		return uuid.Nil, ErrInvalidCredentials
+	}
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE admin_users SET oidc_subject = $1 WHERE id = $2 AND oidc_subject IS NULL`,
+		subject, id,
+	); err != nil {
+		return uuid.Nil, fmt.Errorf("adminauth: bind oidc subject: %w", err)
+	}
+
+	return id, nil
+}
+
 // LogAction records an audited admin action. metadata is marshaled to JSON;
 // pass nil if there's nothing beyond action/target worth recording.
 func (s *Store) LogAction(ctx context.Context, adminID uuid.UUID, action, target string, metadata any) error {
