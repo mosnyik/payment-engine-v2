@@ -106,6 +106,13 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build stores: %v", err)
 	}
+	// buildStores wires a real (disabled, in this test config) email
+	// provider — swap in a fake so the portal magic-link token can be
+	// captured, same as portal_test.go, since KYB submission (Phase 12) now
+	// only happens through the portal, even for an admin-created tenant.
+	sender := &fakePortalEmailSender{}
+	stores.tenant.SetEmailSender(sender)
+
 	router, err := buildRouter(cfg, stores)
 	if err != nil {
 		t.Fatalf("build router: %v", err)
@@ -160,11 +167,12 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 
 	// --- Step 1: registration ---
+	tenantEmail := "onboarding-tenant-" + uuid.NewString() + "@sirfi.test"
 	var createResp struct {
 		ID string `json:"id"`
 	}
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants", token, map[string]string{
-		"name": "Test Fintech " + uuid.NewString(),
+		"name": "Test Fintech " + uuid.NewString(), "email": tenantEmail,
 	}, &createResp)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create tenant: expected 201, got %d", resp.StatusCode)
@@ -181,15 +189,44 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 		t.Fatal("expected credential issuance to be refused before KYB approval")
 	}
 
-	// --- Step 2+3: KYB submission (no provider configured -> hold queue) ---
+	// --- Step 2+3: KYB submission, portal-only (Phase 12) ---
+	// An admin-created tenant has no password — it logs into the portal the
+	// same passwordless way a self-registered one does, proving
+	// RegisterTenant (not the old email-less CreateTenant) is what
+	// POST /admin/tenants now calls.
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/login", "", map[string]string{
+		"email": tenantEmail,
+	}, nil)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("portal login: expected 202, got %d", resp.StatusCode)
+	}
+	if sender.lastTo != tenantEmail {
+		t.Fatalf("expected magic link sent to %q, sent to %q", tenantEmail, sender.lastTo)
+	}
+	magicLinkToken := extractPortalMagicLinkToken(t, sender.lastBody)
+
+	var verifyResp struct {
+		Token string `json:"token"`
+	}
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/verify", "", map[string]string{"token": magicLinkToken}, &verifyResp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("portal verify: expected 200, got %d", resp.StatusCode)
+	}
+	portalSessionToken := verifyResp.Token
+	if portalSessionToken == "" {
+		t.Fatal("portal verify: expected a non-empty session token")
+	}
+
+	// No screening provider configured -> lands in the hold queue, same as
+	// the admin-submitted path used to (provider_name is never client-
+	// controlled on the portal path, same as portal_test.go).
 	var kybCase struct {
 		ID     string `json:"ID"`
 		Status string `json:"Status"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/kyb", token, map[string]any{
+	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/kyb", portalSessionToken, map[string]any{
 		"submitted_data":      map[string]string{"company": "Test Fintech Ltd"},
 		"declared_currencies": []string{"NGN"},
-		"provider_name":       "",
 	}, &kybCase)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("submit kyb: expected 201, got %d", resp.StatusCode)

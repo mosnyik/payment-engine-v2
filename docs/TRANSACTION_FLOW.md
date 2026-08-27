@@ -4,10 +4,10 @@ A narrative companion to `ARCHITECTURE.md` — that doc records design decisions
 
 ## Phase 1 — Onboarding a tenant
 
-All via admin auth (`/v2/admin/...`, staff-only, never the tenant gateway's HMAC/mTLS):
+Tenant creation is admin auth (`/v2/admin/...`, staff-only); KYB submission is portal-only (`/v2/portal/...`, the tenant's own passwordless login) — admin's role in KYB is review/resolve, never submission on the tenant's behalf (Phase 12):
 
-1. **`POST /admin/tenants`** `{name}` → `tenant.CreateTenant` — creates the bare tenant record. Can't call the API yet.
-2. **`POST /admin/tenants/{tenantID}/kyb`** → tenant submits company/beneficial-ownership/licensing docs into `compliance`.
+1. **`POST /admin/tenants`** `{name, email}` → `tenant.RegisterTenant` — creates the tenant record with a `contact_email`. Can't call the API yet, and can't submit KYB either until it logs into the portal.
+2. **Portal login + KYB submission** → the tenant requests a magic link (`POST /portal/login`), redeems it (`POST /portal/verify`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
 3. **KYB review** → automated provider decision, or if no provider is configured for that case, it drops into the manual hold queue — `GET /admin/compliance/holds` / `POST /admin/compliance/holds/{caseID}/resolve`, an analyst approves or rejects.
 4. **`POST /admin/tenants/{tenantID}/api-keys`** → only reachable after KYB clears. Issues the tenant's API key + HMAC secret (or registers their mTLS cert). **This is the gate** — nothing below is callable before this.
 5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected.

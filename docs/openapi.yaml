@@ -199,6 +199,10 @@ paths:
     post:
       tags: [admin]
       summary: "Register a tenant (onboarding step 1)"
+      description: >
+        Requires an email so the tenant can log into the portal
+        (POST /portal/login) and submit their own KYB — admin no longer
+        submits KYB on a tenant's behalf (Phase 12).
       security: [{ adminAuth: [] }]
       requestBody:
         required: true
@@ -206,9 +210,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name]
+              required: [name, email]
               properties:
                 name: { type: string }
+                email: { type: string, format: email }
       responses:
         "201":
           description: Tenant created
@@ -389,41 +394,6 @@ paths:
                       items:
                         type: array
                         items: { $ref: "#/components/schemas/RequestLogEntry" }
-
-  /admin/tenants/{tenantID}/kyb:
-    post:
-      tags: [admin]
-      summary: "Submit KYB for a tenant (onboarding step 2)"
-      description: >
-        An empty provider_name (no vendor selected yet) always lands in the
-        manual hold queue for a human to resolve via /admin/compliance/holds/{caseID}/resolve.
-        declared_currencies (required) is which fiat currencies/jurisdictions
-        this submission is onboarding the tenant for — submitted_data is
-        validated against the union of those jurisdictions' configured
-        required fields before the case is created.
-      security: [{ adminAuth: [] }]
-      parameters:
-        - $ref: "#/components/parameters/tenantID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [declared_currencies]
-              properties:
-                submitted_data: { type: object }
-                declared_currencies: { type: array, items: { type: string }, example: ["NGN"] }
-                provider_name: { type: string }
-      responses:
-        "201":
-          description: Case created (approved, rejected, or hold)
-          content:
-            application/json: { schema: { $ref: "#/components/schemas/ComplianceCase" } }
-        "400":
-          description: Invalid request
-          content:
-            application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
   /admin/compliance/holds:
     get:

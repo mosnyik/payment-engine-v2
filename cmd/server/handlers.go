@@ -61,21 +61,29 @@ func (h *adminHandlers) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
-// POST /admin/tenants {"name": "..."} — step 1, registration.
+// POST /admin/tenants {"name": "...", "email": "..."} — step 1, registration.
+// Requires an email (Phase 12) so the tenant can log into the portal
+// (POST /portal/login) and submit their own KYB — admin no longer submits
+// KYB on a tenant's behalf, see adminHandlers.resolveHold's doc comment.
 func (h *adminHandlers) createTenant(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Name == "" {
-		writeErr(w, http.StatusBadRequest, errors.New("name is required"))
+	if req.Name == "" || req.Email == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("name and email are required"))
 		return
 	}
 
-	id, err := h.tenant.CreateTenant(r.Context(), req.Name)
+	id, err := h.tenant.RegisterTenant(r.Context(), req.Name, req.Email)
+	if errors.Is(err, tenant.ErrEmailTaken) {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -104,61 +112,6 @@ func (h *adminHandlers) restoreTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "tenant restored"})
-}
-
-// POST /admin/tenants/{tenantID}/kyb {"submitted_data": {...}, "declared_currencies": ["NGN"], "provider_name": ""} — step 2+3.
-// provider_name empty (the default — no vendor selected yet) always lands
-// in the manual hold queue for a human to resolve via resolveHold below.
-// declared_currencies is required (Phase 10) — which fiat
-// currencies/jurisdictions this submission is onboarding the tenant for;
-// submitted_data is validated against the union of those jurisdictions'
-// configured required fields before anything else happens.
-func (h *adminHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
-	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	var req struct {
-		SubmittedData      json.RawMessage `json:"submitted_data"`
-		DeclaredCurrencies []string        `json:"declared_currencies"`
-		ProviderName       string          `json:"provider_name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	// Sandbox tenants shouldn't need to know a magic provider name to skip
-	// the manual hold queue — force it regardless of what was submitted
-	// (docs/SANDBOX_PLAN.md). declared_currencies is NOT bypassed — sandbox
-	// callers still declare like any real one (sandbox seeding configures a
-	// permissive, empty-required-fields row for the sandbox corridor's
-	// currency so this doesn't block sandbox onboarding).
-	if h.sandboxMode {
-		req.ProviderName = compliance.SandboxProviderName
-	}
-
-	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.DeclaredCurrencies, req.ProviderName)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	// Bridge: a case a registered provider approved outright (never touching
-	// the hold queue) activates its tenant here — same bridge resolveHold
-	// applies for a case an analyst approves after a hold. Unreachable until
-	// a ScreeningProvider was ever actually registered (see
-	// compliance.Registry's doc comment); SandboxProvider is the first.
-	if c.CaseType == compliance.CaseTypeKYB && c.Status == compliance.StatusApproved {
-		if err := h.tenant.ApproveKYB(r.Context(), c.ReferenceID); err != nil {
-			writeErr(w, http.StatusInternalServerError, fmt.Errorf("case approved but failed to activate tenant: %w", err))
-			return
-		}
-	}
-
-	writeJSON(w, http.StatusCreated, c)
 }
 
 // GET /admin/compliance/holds?case_type=kyb — the ops queue surface.

@@ -178,20 +178,19 @@ Verified against the live dev Postgres: `internal/compliance` (no-declared-curre
 
 Verified against the live dev Postgres: `cmd/server/admin_browse_test.go` (new HTTP acceptance test, same style as `onboarding_test.go`/`session_test.go`) — list/filter/paginate/detail for tenants and corridors, empty-list and 404 handling for a fresh tenant's sessions and an unknown session ID, admin-action and request audit log reads (the latter polled, since `audit.Logger.Run`'s channel drain is async), and unauthenticated access rejected on every new route; full `go test ./...` passes (aside from the pre-existing, already-documented cross-package eventbus race in `internal/notification`/`internal/settlement`, confirmed unrelated — both pass cleanly in isolation, and this phase touches neither package). Manual smoke via PowerShell `Invoke-RestMethod` against a running `cmd/server` confirmed the same end to end, including the request-audit-log endpoint capturing the smoke test's own live requests.
 
-## Phase 12 — KYB submission becomes portal-only (not started)
+## Phase 12 — KYB submission becomes portal-only ✅ complete
 
-Product decision: the tenant submits their own KYB via the portal; admin's role in the KYB flow is review/resolve only (`GET /admin/compliance/holds`, `POST /admin/compliance/holds/{id}/resolve`), never submission on the tenant's behalf. Today both `POST /admin/tenants/{tenantID}/kyb` (`cmd/server/handlers.go`'s `adminHandlers.submitKYB`) and `POST /v2/portal/kyb` (`cmd/server/portal_handlers.go`'s `portalHandlers.submitKYB`) exist side by side, calling the same `compliance.Store.ScreenTenant`.
+Product decision: the tenant submits their own KYB via the portal; admin's role in the KYB flow is review/resolve only (`GET /admin/compliance/holds`, `POST /admin/compliance/holds/{id}/resolve`), never submission on the tenant's behalf. Before this phase, both `POST /admin/tenants/{tenantID}/kyb` (`cmd/server/handlers.go`'s `adminHandlers.submitKYB`) and `POST /v2/portal/kyb` existed side by side, calling the same `compliance.Store.ScreenTenant`.
 
-The complication surfaced while scoping this: `POST /admin/tenants/{tenantID}/kyb` isn't just a redundant alternate path — it's currently the *only* KYB path for a tenant created via `POST /admin/tenants` (`tenant.Store.CreateTenant`), because that endpoint takes no email, so a tenant created that way has no `contact_email` and can't request a portal magic link at all. Only `tenant.Store.RegisterTenant` (the self-service `POST /portal/register` path, Phase 9a) sets `contact_email`.
+The complication surfaced while scoping this: `POST /admin/tenants/{tenantID}/kyb` wasn't just a redundant alternate path — it was the *only* KYB path for a tenant created via `POST /admin/tenants` (`tenant.Store.CreateTenant`), because that endpoint took no email, so a tenant created that way had no `contact_email` and couldn't request a portal magic link at all.
 
-Resolved shape: `POST /admin/tenants` starts requiring an email, and calls `RegisterTenant` (or an equivalent that sets `contact_email`) instead of the email-less `CreateTenant`. This keeps a real admin-initiated onboarding path (e.g. a negotiated enterprise deal an admin sets up manually) while guaranteeing every tenant, however created, can log into the portal and submit their own KYB — admin creation and KYB submission become fully separate steps, never the same actor. `POST /admin/tenants/{tenantID}/kyb` and `adminHandlers.submitKYB` are then removed entirely, not just deprecated.
+- ✅ **`POST /admin/tenants` now requires `{name, email}`** and calls `tenant.Store.RegisterTenant` (already existed from Phase 9a's self-service path) instead of the email-less `CreateTenant`, handling `ErrEmailTaken` as `409` the same way `portalHandlers.register` does. This keeps a real admin-initiated onboarding path (e.g. a negotiated enterprise deal an admin sets up manually) while guaranteeing every tenant, however created, can log into the portal (`POST /portal/login`, already generic over any `contact_email` — no new send-on-create behavior needed) and submit their own KYB.
+- ✅ **`adminHandlers.submitKYB` and the `POST /admin/tenants/{tenantID}/kyb` route removed entirely**, not just deprecated. `listHolds`/`resolveHold` (review/resolve) stay admin-side, unchanged.
+- ✅ **`tenant.Store.CreateTenant` deliberately kept**, not deleted — it's used as a generic test fixture by ~15 unrelated test files (session/settlement/notification/treasury/compliance) that create a tenant without caring about email/portal login; only its one production caller (the admin handler) was swapped out.
+- ✅ **`cmd/server/onboarding_test.go` reworked** to prove the new shape: creates a tenant with an email via `/admin/tenants`, then drives that same tenant through `POST /portal/login` → `/portal/verify` → `/portal/kyb` (reusing `portal_test.go`'s `fakePortalEmailSender`/`extractPortalMagicLinkToken` helpers, same package) instead of posting straight to the old admin KYB endpoint. `cmd/server/admin_browse_test.go`'s tenant-creation calls updated to include the now-required email too.
+- ✅ **Docs updated**: `docs/TRANSACTION_FLOW.md`'s onboarding step 2 rewritten to the portal login/verify/submit sequence; `docs/openapi.yaml`'s `/admin/tenants` POST schema gained the required `email` field and the `/admin/tenants/{tenantID}/kyb` path was deleted; `README.md`'s admin-endpoint bullet list dropped "KYB" (review/resolve is still covered by "compliance hold review" in the same bullet).
 
-Downstream cleanup this touches, so a future implementer isn't surprised by test/doc breakage:
-- `cmd/server/onboarding_test.go` — currently posts straight to the admin KYB endpoint; needs reworking to go through `POST /admin/tenants` (now email-requiring) → portal magic-link login → `POST /portal/kyb`, closer to how `cmd/server/portal_test.go` already exercises the self-service flow.
-- `docs/TRANSACTION_FLOW.md` — step 2 currently documents `POST /admin/tenants/{tenantID}/kyb` as the canonical onboarding step; needs rewriting to the portal-only flow.
-- `docs/openapi.yaml` — drop the `/admin/tenants/{tenantID}/kyb` path entirely.
-- `README.md`'s admin-endpoint bullet list — currently lists "tenant onboarding/KYB" under admin-authenticated actions; needs to drop KYB submission specifically (review/resolve stays).
-- `CreateTenant` itself (`internal/tenant/tenant.go:120`) likely becomes dead code once `POST /admin/tenants` calls `RegisterTenant` instead — worth checking for other callers before deleting it outright.
+Verified against the live dev Postgres: full `go test ./...` passes, including the reworked `TestOnboardingWorkflowEndToEnd` driving admin tenant creation → portal login/verify/KYB submission → hold resolution → credential issuance → corridor entitlement → webhook config → authenticated `/v2/ping`, end to end through the real router.
 
 ## Phase 13 — Admin SSO/OIDC login (not started)
 
@@ -220,15 +219,15 @@ Phase 0 (foundation)
                                                     └─▶ Phase 9 (compliance/security hardening) — in progress
                                                     └─▶ Phase 10 (jurisdiction-aware KYB + real screening provider) — part 1 ✅ complete, part 2 (real screening vendor) not started; branches off Phase 2's compliance module
                                                     └─▶ Phase 11 (admin read/browse API surface) ✅ complete — branches off every module's admin routes
-                                                    └─▶ Phase 12 (KYB submission becomes portal-only) — not started, branches off Phase 9a's portal + Phase 2's tenant module
+                                                    └─▶ Phase 12 (KYB submission becomes portal-only) ✅ complete — branches off Phase 9a's portal + Phase 2's tenant module
                                                     └─▶ Phase 13 (admin SSO/OIDC login) — not started, branches off Phase 0's admin-auth module
 
 Every phase in the original build order (0–8) is complete. Phases 9 through 13 are follow-on, policy/product-driven additions, not part of that original scope.
 ```
 
-## Post-Phase-11 status
+## Post-Phase-12 status
 
-Phase 11 is complete. Remaining open work: Phase 9's policy/business-decision items (HMAC secret storage scheme, key management/KMS, end-user-auth scope, 5-year financial-record retention, ops alert channel docs, infra-layer controls) and its one still-open code item (tenant API-key permission-list scoping); Phase 10 part 2 (real screening provider vendor); Phase 12 (KYB submission becomes portal-only); Phase 13 (admin SSO/OIDC login).
+Phases 11 and 12 are complete. Remaining open work: Phase 9's policy/business-decision items (HMAC secret storage scheme, key management/KMS, end-user-auth scope, 5-year financial-record retention, ops alert channel docs, infra-layer controls) and its one still-open code item (tenant API-key permission-list scoping); Phase 10 part 2 (real screening provider vendor); Phase 13 (admin SSO/OIDC login).
 
 ## Open items carried over from ARCHITECTURE.md
 
@@ -240,4 +239,4 @@ Phase 11 is complete. Remaining open work: Phase 9's policy/business-decision it
 All open items from the original design pass are resolved.
 
 ---
-*Next: every phase in the original build order (0–8) is complete, no open design blockers remain there. Phase 11 (admin read/browse API surface) is now also complete. Phase 9 (compliance/security hardening — policy items + tenant API-key permission-list scoping), Phase 10 part 2 (real screening provider vendor), Phase 12 (KYB submission becomes portal-only), and Phase 13 (admin SSO/OIDC login) are the current open work — see those sections for the prioritized lists.*
+*Next: every phase in the original build order (0–8) is complete, no open design blockers remain there. Phase 11 (admin read/browse API surface) and Phase 12 (KYB submission becomes portal-only) are now also complete. Phase 9 (compliance/security hardening — policy items + tenant API-key permission-list scoping), Phase 10 part 2 (real screening provider vendor), and Phase 13 (admin SSO/OIDC login) are the current open work — see those sections for the prioritized lists.*

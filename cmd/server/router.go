@@ -138,7 +138,6 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 
 		admin.Post("/tenants", h.createTenant)
 		admin.Post("/tenants/{tenantID}/restore", h.restoreTenant)
-		admin.Post("/tenants/{tenantID}/kyb", h.submitKYB)
 		admin.Get("/compliance/holds", h.listHolds)
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
