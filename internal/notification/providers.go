@@ -31,6 +31,15 @@ const emailProviderTimeout = 8 * time.Second
 // providers.go use for their own multi-vendor selection. An empty or
 // unrecognized Provider falls back to stubEmailProvider, which just reports
 // itself disabled — safe by construction, never a startup failure.
+// NewEmailProvider is the exported form of newEmailProvider, for other
+// packages that need the same configured vendor adapter DispatchWorker
+// uses — e.g. internal/tenant's magic-link sender (tenant.EmailSender is a
+// structural subset of this interface) — so a second HTTP email-vendor
+// integration is never built.
+func NewEmailProvider(cfg EmailProviderConfig) EmailProvider {
+	return newEmailProvider(cfg)
+}
+
 func newEmailProvider(cfg EmailProviderConfig) EmailProvider {
 	switch cfg.Provider {
 	case "resend":
@@ -91,6 +100,17 @@ type resendSendRequest struct {
 	Text    string   `json:"text"`
 }
 
+// formatFromHeader renders "Name <address>" (RFC 5322 display-name form)
+// when a name is configured, so an inbox shows "2Settle" instead of the
+// bare "noreply@..." address — falls back to the bare address, unchanged,
+// when no name is set.
+func formatFromHeader(name, address string) string {
+	if name == "" {
+		return address
+	}
+	return fmt.Sprintf("%s <%s>", name, address)
+}
+
 // resendErrorResponse is Resend's documented error shape on a non-2xx
 // response — surfaced in the returned error so a dead-lettered delivery's
 // last_error is actually actionable, not just "status 4xx".
@@ -101,7 +121,7 @@ type resendErrorResponse struct {
 
 func (p *resendProvider) Send(ctx context.Context, to, subject, body string) error {
 	reqBody, err := json.Marshal(resendSendRequest{
-		From:    p.cfg.FromAddress,
+		From:    formatFromHeader(p.cfg.FromName, p.cfg.FromAddress),
 		To:      []string{to},
 		Subject: subject,
 		Text:    body,

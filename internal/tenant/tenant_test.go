@@ -121,7 +121,7 @@ func TestApproveKYB_ThenIssueAndAuthenticate(t *testing.T) {
 		t.Fatalf("expected stored secret to be hex-encoded ciphertext: %v", err)
 	}
 
-	gotSecret, gotTenantID, ok, err := s.LookupHMACSecret(ctx, apiKey)
+	gotSecret, gotTenantID, _, _, _, ok, err := s.LookupHMACSecret(ctx, apiKey)
 	if err != nil {
 		t.Fatalf("lookup hmac secret: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestSuspend_RevokesAuthenticationImmediately(t *testing.T) {
 	}
 
 	// Sanity: works while active.
-	_, _, ok, err := s.LookupHMACSecret(ctx, apiKey)
+	_, _, _, _, _, ok, err := s.LookupHMACSecret(ctx, apiKey)
 	if err != nil || !ok {
 		t.Fatalf("expected lookup to succeed before suspension, ok=%v err=%v", ok, err)
 	}
@@ -183,7 +183,7 @@ func TestSuspend_RevokesAuthenticationImmediately(t *testing.T) {
 		t.Fatalf("suspend: %v", err)
 	}
 
-	_, _, ok, err = s.LookupHMACSecret(ctx, apiKey)
+	_, _, _, _, _, ok, err = s.LookupHMACSecret(ctx, apiKey)
 	if err != nil {
 		t.Fatalf("lookup after suspend: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestLookupHMACSecret_UnknownKey(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, pool)
 
-	_, _, ok, err := s.LookupHMACSecret(ctx, "pk_does_not_exist")
+	_, _, _, _, _, ok, err := s.LookupHMACSecret(ctx, "pk_does_not_exist")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

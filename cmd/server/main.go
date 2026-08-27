@@ -8,8 +8,10 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/notification"
+	"github.com/sirfi/payment-engine-v2/internal/platform/audit"
 	"github.com/sirfi/payment-engine-v2/internal/platform/config"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
+	"github.com/sirfi/payment-engine-v2/internal/platform/eventbus"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 	"github.com/sirfi/payment-engine-v2/internal/session"
 	"github.com/sirfi/payment-engine-v2/internal/settlement"
@@ -62,6 +64,25 @@ func run() error {
 	// treasury's deposit-state transitions and session's CreateSession/
 	// event handlers (Phase 5).
 	go stores.bus.Run(ctx, cfg.EventbusPollInterval)
+
+	// The blanket per-request audit log (ISP §7) — drains the in-memory
+	// buffer gateway.NewRouter's audit.Middleware writes to, off the
+	// request path.
+	go stores.audit.Run(ctx)
+
+	// Phase 9: purges request_audit_log rows past ISP §7's 12-month
+	// technical-audit-log retention window.
+	auditRetentionJob := audit.NewRetentionJob(stores.audit, cfg.AuditLogRetention, cfg.AuditLogRetentionCheckInterval)
+	go auditRetentionJob.Run(ctx)
+
+	// Phase 9: deletes dispatched outbox_events rows — operational hygiene
+	// on a hot-write table, see internal/platform/eventbus/cleanup.go.
+	outboxCleanupJob := eventbus.NewCleanupJob(stores.bus, cfg.OutboxRetention, cfg.OutboxCleanupInterval)
+	go outboxCleanupJob.Run(ctx)
+
+	// Evicts stale rate-limit buckets (see internal/platform/ratelimit's
+	// own doc comment) so the limiter's key map doesn't grow forever.
+	go stores.ratelimit.Run(ctx)
 
 	fetchJob := rate.NewFetchJob(stores.rate, stores.corridor, cfg.RateEngine.FetchInterval)
 	go fetchJob.Run(ctx)

@@ -83,6 +83,29 @@ func (h *adminHandlers) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
 
+// POST /admin/tenants/{tenantID}/restore — reverses a tenant's self-service
+// DeleteAccount, for a legitimate "I didn't mean to delete this" support
+// request. Lands back in pending_kyb (never active) and old API keys stay
+// revoked — see tenant.RestoreAccount's doc comment for why: the tenant
+// re-clears KYB and issues fresh credentials the normal way, rather than
+// this endpoint silently reinstating whatever access they had before.
+func (h *adminHandlers) restoreTenant(w http.ResponseWriter, r *http.Request) {
+	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.tenant.RestoreAccount(r.Context(), tenantID); err != nil {
+		if errors.Is(err, tenant.ErrInvalidStatusTransition) {
+			writeErr(w, http.StatusConflict, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "tenant restored"})
+}
+
 // POST /admin/tenants/{tenantID}/kyb {"submitted_data": {...}, "provider_name": ""} — step 2+3.
 // provider_name empty (the default — no vendor selected yet) always lands
 // in the manual hold queue for a human to resolve via resolveHold below.

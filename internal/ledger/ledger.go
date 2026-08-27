@@ -217,3 +217,29 @@ func (l *Ledger) GetBalance(ctx context.Context, accountID uuid.UUID) (decimal.D
 	}
 	return balance, nil
 }
+
+// GetBalanceForTenant is the portal dashboard's read-only balance lookup —
+// unlike GetOrCreateAccount, it never creates an account as a side effect
+// of a mere balance check. (tenant_id, account_type, asset_code) is the
+// account's actual uniqueness key (ledger_accounts' ON CONFLICT target),
+// so unit_type isn't needed to identify it. A tenant with no such account
+// yet — e.g. checking a currency they've never transacted in — gets zero,
+// not an error, same "no entries yet = zero balance" convention GetBalance
+// already establishes.
+func (l *Ledger) GetBalanceForTenant(ctx context.Context, tenantID uuid.UUID, accountType, assetCode string) (decimal.Decimal, error) {
+	var balance decimal.Decimal
+	err := l.pool.QueryRow(ctx,
+		`SELECT COALESCE(b.balance, 0)
+		 FROM ledger_accounts a
+		 LEFT JOIN ledger_balances b ON b.account_id = a.id
+		 WHERE a.tenant_id = $1 AND a.account_type = $2 AND a.asset_code = $3`,
+		tenantID, accountType, assetCode,
+	).Scan(&balance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return decimal.Zero, nil
+	}
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("ledger: get balance for tenant: %w", err)
+	}
+	return balance, nil
+}

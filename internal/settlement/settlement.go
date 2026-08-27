@@ -223,3 +223,37 @@ func (s *Store) ListSettlements(ctx context.Context, status Status) ([]Settlemen
 	}
 	return out, rows.Err()
 }
+
+// ListSettlementsByTenant returns a tenant's own settlements, newest
+// first — the portal dashboard's read surface. Optionally filtered by
+// status; nil means all statuses. Deliberately newest-first, unlike
+// ListSettlements' oldest-first FIFO ops queue ordering: a dashboard wants
+// recent activity on top, an ops queue wants the longest-waiting item
+// first.
+func (s *Store) ListSettlementsByTenant(ctx context.Context, tenantID uuid.UUID, status *Status) ([]Settlement, error) {
+	var statusFilter *string
+	if status != nil {
+		v := string(*status)
+		statusFilter = &v
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+settlementColumns+` FROM settlements
+		 WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2)
+		 ORDER BY created_at DESC`,
+		tenantID, statusFilter,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("settlement: list by tenant: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Settlement
+	for rows.Next() {
+		st, err := scanSettlement(rows)
+		if err != nil {
+			return nil, fmt.Errorf("settlement: list by tenant: scan: %w", err)
+		}
+		out = append(out, *st)
+	}
+	return out, rows.Err()
+}

@@ -71,6 +71,44 @@ func TestBlockstreamClient_ListIncomingTransactions(t *testing.T) {
 	}
 }
 
+// blockstreamRBFFixture mirrors blockstreamFixture's shape but adds a "vin"
+// array with one BIP125-signaling input (sequence below 0xFFFFFFFE) so
+// isRBFEnabled has something real to detect.
+const blockstreamRBFFixture = `[
+  {
+    "txid": "rbf0000000000000000000000000000000000000000000000000000000000",
+    "vin": [
+      {"txid": "prev", "vout": 0, "sequence": 4294967293}
+    ],
+    "vout": [
+      {
+        "scriptpubkey_address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        "value": 100000
+      }
+    ],
+    "status": { "confirmed": false, "block_height": 0 }
+  }
+]`
+
+func TestBlockstreamClient_ListIncomingTransactions_DetectsRBF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(blockstreamRBFFixture))
+	}))
+	defer server.Close()
+
+	c := &blockstreamClient{apiURL: server.URL, client: server.Client()}
+	txs, err := c.ListIncomingTransactions(context.Background(), "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+	if err != nil {
+		t.Fatalf("list transactions: %v", err)
+	}
+	if len(txs) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(txs))
+	}
+	if !txs[0].IsRBF {
+		t.Fatal("expected a sequence below 0xFFFFFFFE to be detected as RBF-enabled")
+	}
+}
+
 func TestBlockstreamClient_TipHeight(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("959017"))
@@ -382,5 +420,192 @@ func TestWatcher_PollOnce_NeverSweepsTenantProvidedReservation(t *testing.T) {
 	}
 	if sweepCount != 0 {
 		t.Fatalf("expected zero sweeps for a tenant-provided reservation, got %d", sweepCount)
+	}
+}
+
+// TestWatcher_PollOnce_IgnoresDustDeposit is Phase 9's dust-filtering
+// fraud check: an amount below dustThreshold[chain] must never even reach
+// treasury_deposits, not just be recorded and left "detected" forever.
+func TestWatcher_PollOnce_IgnoresDustDeposit(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	storeWithSeed(t, s)
+	ctx := context.Background()
+
+	_, corridorID := setupCorridor(t, pool)
+	tenantID := createTestTenant(t, pool)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, wallet.Ethereum)
+	if err != nil {
+		t.Fatalf("allocate address: %v", err)
+	}
+	var reservationID uuid.UUID
+	err = pool.QueryRow(ctx,
+		`INSERT INTO treasury_address_reservations
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, addr,
+	).Scan(&reservationID)
+	if err != nil {
+		t.Fatalf("insert reservation: %v", err)
+	}
+	releaseReservationOnCleanup(t, s, reservationID)
+
+	w := &Watcher{
+		store:        s,
+		pollInterval: time.Second,
+		clients: map[wallet.Chain]chainWatcherClient{
+			// 0.00005 ETH, below dustThreshold[wallet.Ethereum] (0.0001).
+			wallet.Ethereum: &fakeChainWatcherClient{
+				tip: 1000,
+				txs: []ChainTransaction{
+					{TxID: "0xdust1", CryptoAsset: "ETH", Amount: decimal.New(5, -5), Confirmed: true, BlockHeight: 988},
+				},
+			},
+		},
+		minConfirmations: map[wallet.Chain]int{wallet.Ethereum: 12},
+	}
+	w.pollOnce(ctx)
+
+	// Scoped by reservation_id, not a bare tx_reference count: pollOnce
+	// sweeps every currently-open reservation in the database, and
+	// fakeChainWatcherClient ignores the address it's asked about, so this
+	// same fixed transaction is also handed to whatever other open
+	// reservations happen to exist in the shared test database — this test
+	// only cares that it was never recorded against the reservation it
+	// itself created.
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM treasury_deposits WHERE reservation_id = $1 AND tx_reference = '0xdust1'`, reservationID).Scan(&count); err != nil {
+		t.Fatalf("count deposits: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected a dust deposit to never be recorded, got %d row(s)", count)
+	}
+}
+
+// TestWatcher_PollOnce_IgnoresWrongAssetDeposit is Phase 9's fake-token
+// filtering fraud check: a transaction reporting a different asset than the
+// reservation was issued for (e.g. a native-coin transfer landing on a
+// token-denominated reservation) must never be recorded against it.
+func TestWatcher_PollOnce_IgnoresWrongAssetDeposit(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	storeWithSeed(t, s)
+	ctx := context.Background()
+
+	_, corridorID := setupCorridor(t, pool)
+	tenantID := createTestTenant(t, pool)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, wallet.Ethereum)
+	if err != nil {
+		t.Fatalf("allocate address: %v", err)
+	}
+	var reservationID uuid.UUID
+	err = pool.QueryRow(ctx,
+		`INSERT INTO treasury_address_reservations
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'ETH', 'ethereum', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, addr,
+	).Scan(&reservationID)
+	if err != nil {
+		t.Fatalf("insert reservation: %v", err)
+	}
+	releaseReservationOnCleanup(t, s, reservationID)
+
+	w := &Watcher{
+		store:        s,
+		pollInterval: time.Second,
+		clients: map[wallet.Chain]chainWatcherClient{
+			// Reservation expects ETH; this transaction reports USDT.
+			wallet.Ethereum: &fakeChainWatcherClient{
+				tip: 1000,
+				txs: []ChainTransaction{
+					{TxID: "0xwrongasset1", CryptoAsset: "USDT", Amount: decimal.New(250, 0), Confirmed: true, BlockHeight: 988},
+				},
+			},
+		},
+		minConfirmations: map[wallet.Chain]int{wallet.Ethereum: 12},
+	}
+	w.pollOnce(ctx)
+
+	// Scoped by reservation_id — see the dust test's comment above on why
+	// a bare tx_reference count isn't safe against the shared test database.
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM treasury_deposits WHERE reservation_id = $1 AND tx_reference = '0xwrongasset1'`, reservationID).Scan(&count); err != nil {
+		t.Fatalf("count deposits: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected a wrong-asset deposit to never be recorded, got %d row(s)", count)
+	}
+}
+
+// TestWatcher_PollOnce_RBFEnabledBitcoinRequiresExtraConfirmations is
+// Phase 9's RBF-detection fraud check: an RBF-signaled Bitcoin transaction
+// must not be treated as confirmed at the chain's normal (lower)
+// min-confirmation threshold — it stays "detected" until it clears the
+// higher floor (max(required, 3)), then confirms once it does.
+func TestWatcher_PollOnce_RBFEnabledBitcoinRequiresExtraConfirmations(t *testing.T) {
+	pool := openTestPool(t)
+	s := New(pool, corridor.New(pool), Config{})
+	storeWithSeed(t, s)
+	ctx := context.Background()
+
+	_, corridorID := setupCorridor(t, pool)
+	tenantID := createTestTenant(t, pool)
+	addr, err := s.allocateOrReuseAddress(ctx, tenantID, wallet.Bitcoin)
+	if err != nil {
+		t.Fatalf("allocate address: %v", err)
+	}
+	var reservationID uuid.UUID
+	err = pool.QueryRow(ctx,
+		`INSERT INTO treasury_address_reservations
+		   (tenant_id, corridor_id, provider_name, custody_type, crypto_asset, crypto_network, address, status)
+		 VALUES ($1, $2, 'self_custody_wallet', 'self_custody', 'BTC', 'bitcoin', $3, 'reserved')
+		 RETURNING id`,
+		tenantID, corridorID, addr,
+	).Scan(&reservationID)
+	if err != nil {
+		t.Fatalf("insert reservation: %v", err)
+	}
+	releaseReservationOnCleanup(t, s, reservationID)
+
+	client := &fakeChainWatcherClient{
+		tip: 1000,
+		txs: []ChainTransaction{
+			// tip 1000 - blockHeight 1000 + 1 = 1 confirmation: clears the
+			// chain's own min (1) but not the RBF floor (3).
+			{TxID: "btcrbf1", CryptoAsset: "BTC", Amount: decimal.New(1, -3), Confirmed: true, BlockHeight: 1000, IsRBF: true},
+		},
+	}
+	w := &Watcher{
+		store:            s,
+		pollInterval:     time.Second,
+		clients:          map[wallet.Chain]chainWatcherClient{wallet.Bitcoin: client},
+		minConfirmations: map[wallet.Chain]int{wallet.Bitcoin: 1},
+	}
+	w.pollOnce(ctx)
+
+	// Scoped by reservation_id, not a bare tx_reference lookup — see the
+	// dust/wrong-asset tests' comment above on why: fakeChainWatcherClient
+	// ignores the address it's asked about, so the same fixed tx_reference
+	// used across repeated runs of this test can otherwise match a stale
+	// row left by an earlier run's own reservation.
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM treasury_deposits WHERE reservation_id = $1 AND tx_reference = 'btcrbf1'`, reservationID).Scan(&status); err != nil {
+		t.Fatalf("find deposit: %v", err)
+	}
+	if status != "detected" {
+		t.Fatalf("expected an RBF-enabled tx at 1 confirmation to stay 'detected' (floor is 3), got %s", status)
+	}
+
+	// Now at 3 confirmations — clears the RBF floor.
+	client.txs[0].BlockHeight = 998
+	w.pollOnce(ctx)
+
+	if err := pool.QueryRow(ctx, `SELECT status FROM treasury_deposits WHERE reservation_id = $1 AND tx_reference = 'btcrbf1'`, reservationID).Scan(&status); err != nil {
+		t.Fatalf("find deposit: %v", err)
+	}
+	if status != "confirmed" {
+		t.Fatalf("expected the RBF-enabled tx to confirm once it reaches 3 confirmations, got %s", status)
 	}
 }
