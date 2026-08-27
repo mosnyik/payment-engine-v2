@@ -317,16 +317,29 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 }
 
 // ListSessionsByTenant returns a tenant's own sessions, newest first — the
-// portal dashboard's read surface. No admin/ops equivalent exists (admin
-// only ever fetches a single session by ID), so this is new, not a
-// tenant-scoped variant of an existing list.
-func (s *Store) ListSessionsByTenant(ctx context.Context, tenantID uuid.UUID) ([]Session, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+sessionColumns+` FROM sessions WHERE tenant_id = $1 ORDER BY created_at DESC`,
-		tenantID,
-	)
+// portal dashboard's read surface, and (Phase 11) the admin per-tenant
+// session browse surface. limit<=0 means unbounded — the portal caller
+// (cmd/server/portal_handlers.go) passes that to preserve its exact
+// pre-Phase-11 behavior; the admin caller passes a real page size, since
+// this table only grows.
+func (s *Store) ListSessionsByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]Session, int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE tenant_id = $1`, tenantID,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("session: list by tenant: count: %w", err)
+	}
+
+	query := `SELECT ` + sessionColumns + ` FROM sessions WHERE tenant_id = $1 ORDER BY created_at DESC`
+	args := []any{tenantID}
+	if limit > 0 {
+		query += ` LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("session: list by tenant: %w", err)
+		return nil, 0, fmt.Errorf("session: list by tenant: %w", err)
 	}
 	defer rows.Close()
 
@@ -334,11 +347,14 @@ func (s *Store) ListSessionsByTenant(ctx context.Context, tenantID uuid.UUID) ([
 	for rows.Next() {
 		sess, err := scanSession(rows)
 		if err != nil {
-			return nil, fmt.Errorf("session: list by tenant: scan: %w", err)
+			return nil, 0, fmt.Errorf("session: list by tenant: scan: %w", err)
 		}
 		out = append(out, *sess)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("session: list by tenant: %w", err)
+	}
+	return out, total, nil
 }
 
 // ErrNotInComplianceHold means ResolveComplianceHold was called against a

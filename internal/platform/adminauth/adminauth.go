@@ -153,6 +153,57 @@ func (s *Store) LogAction(ctx context.Context, adminID uuid.UUID, action, target
 	return nil
 }
 
+// AuditLogEntry is one admin_audit_log row — the human-readable "who
+// approved what" trail LogAction writes to.
+type AuditLogEntry struct {
+	ID        uuid.UUID
+	AdminID   uuid.UUID
+	Action    string
+	Target    *string
+	Metadata  json.RawMessage
+	CreatedAt time.Time
+}
+
+// ListAuditLog is the admin browse surface (Phase 11) over admin_audit_log —
+// newest first, optionally restricted to one admin's own actions. limit<=0
+// means unbounded.
+func (s *Store) ListAuditLog(ctx context.Context, adminID *uuid.UUID, limit, offset int) ([]AuditLogEntry, int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM admin_audit_log WHERE ($1::uuid IS NULL OR admin_id = $1)`,
+		adminID,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("adminauth: list audit log: count: %w", err)
+	}
+
+	query := `SELECT id, admin_id, action, target, metadata, created_at FROM admin_audit_log
+		WHERE ($1::uuid IS NULL OR admin_id = $1) ORDER BY created_at DESC`
+	args := []any{adminID}
+	if limit > 0 {
+		query += ` LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("adminauth: list audit log: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AuditLogEntry
+	for rows.Next() {
+		var e AuditLogEntry
+		if err := rows.Scan(&e.ID, &e.AdminID, &e.Action, &e.Target, &e.Metadata, &e.CreatedAt); err != nil {
+			return nil, 0, fmt.Errorf("adminauth: list audit log: scan: %w", err)
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("adminauth: list audit log: %w", err)
+	}
+	return out, total, nil
+}
+
 func newToken() (raw, hash string, err error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {

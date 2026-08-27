@@ -254,7 +254,7 @@ func (h *portalHandlers) listSessions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
 		return
 	}
-	sessions, err := h.session.ListSessionsByTenant(r.Context(), tenantID)
+	sessions, _, err := h.session.ListSessionsByTenant(r.Context(), tenantID, 0, 0)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
