@@ -4,16 +4,72 @@ A narrative companion to `ARCHITECTURE.md` — that doc records design decisions
 
 ## Phase 1 — Onboarding a tenant
 
-Tenant creation is admin auth (`/v2/admin/...`, staff-only); KYB submission is portal-only (`/v2/portal/...`, the tenant's own passwordless login) — admin's role in KYB is review/resolve, never submission on the tenant's behalf (Phase 12):
+Tenant creation, credential issuance, and webhook config each have **two equally-real paths — admin-driven or tenant self-service** (`/v2/portal/...`, the tenant's own passwordless login, Phase 9a); both call the identical store method underneath, so which one ran is a business-process choice, not a different code path with different guarantees. KYB review and corridor entitlement stay admin-only — both are judgment calls, not paperwork:
 
-1. **`POST /admin/tenants`** `{name, email}` → `tenant.RegisterTenant` — creates the tenant record with a `contact_email`. Can't call the API yet, and can't submit KYB either until it logs into the portal.
-2. **Portal login + KYB submission** → the tenant requests a magic link (`POST /portal/login`), redeems it (`POST /portal/verify`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
-3. **KYB review** → automated provider decision, or if no provider is configured for that case, it drops into the manual hold queue — `GET /admin/compliance/holds` / `POST /admin/compliance/holds/{caseID}/resolve`, an analyst approves or rejects.
-4. **`POST /admin/tenants/{tenantID}/api-keys`** → only reachable after KYB clears. Issues the tenant's API key + HMAC secret (or registers their mTLS cert). **This is the gate** — nothing below is callable before this.
-5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected.
-6. **`POST /admin/tenants/{tenantID}/webhook`** → tenant's callback URL, SSRF-validated (private/loopback ranges rejected).
+1. **`POST /admin/tenants`** `{name, email}` (staff-initiated) **or `POST /portal/register`** `{name, email}` (self-service, Phase 9a — also auto-sends the login magic link) → both call `tenant.RegisterTenant`, creating an identical tenant record with a `contact_email`. Either way, can't call the API yet, and can't submit KYB either until it logs into the portal.
+2. **Portal login + KYB submission** — **portal-only, never admin-submitted on the tenant's behalf** (Phase 12), regardless of which path created the record: the tenant requests a magic link (`POST /portal/login`), redeems it (`POST /portal/verify`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
+3. **KYB review** — **admin-only, no self-service path** → automated provider decision, or if no provider is configured for that case, it drops into the manual hold queue — `GET /admin/compliance/holds` / `POST /admin/compliance/holds/{caseID}/resolve`, an analyst approves or rejects.
+4. **`POST /admin/tenants/{tenantID}/api-keys`** (staff-initiated) **or `POST /portal/api-keys`** (self-service, Phase 9a) → both call `tenant.IssueAPIKey`, only reachable after KYB clears (`status == active`) either way. Issues the tenant's API key + HMAC secret (mTLS cert registration stays admin-only). **This is the gate** — nothing below is callable before this.
+5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** — **admin-only, no self-service path** → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected.
+6. **`POST /admin/tenants/{tenantID}/webhook`** (staff-initiated) **or `PUT /portal/webhook`** (self-service, Phase 9a) → tenant's callback URL, SSRF-validated (private/loopback ranges rejected) either way.
 
 Only after step 4 can the tenant call anything at all; only after step 5 can they use a given corridor.
+
+```mermaid
+sequenceDiagram
+    participant Ops as Admin/Staff
+    participant Rep as Tenant representative
+    participant TenantM as tenant module
+    participant Compliance as compliance module
+    participant Corridor as corridor module
+
+    alt admin-initiated
+        Ops->>TenantM: POST /admin/tenants {name, email}
+        TenantM-->>Ops: tenant created
+    else self-service (Phase 9a)
+        Rep->>TenantM: POST /portal/register {name, email}
+        TenantM-->>Rep: magic link emailed automatically
+    end
+    note over TenantM: both call the same RegisterTenant(name, email) — identical starting status
+
+    Rep->>TenantM: POST /portal/login {email}
+    TenantM-->>Rep: magic link emailed (single-use, time-limited)
+    Rep->>TenantM: POST /portal/verify {token}
+    TenantM-->>Rep: portal session token
+
+    Rep->>Compliance: POST /portal/kyb {docs, declaredCurrencies}
+    Compliance->>Compliance: validate declaredCurrencies against jurisdiction_kyb_requirements
+    alt provider configured
+        Compliance->>Compliance: automated decision
+    else no provider configured
+        Compliance-->>Ops: case queued to hold queue
+        Ops->>Compliance: POST /admin/compliance/holds/{id}/resolve
+    end
+    Compliance-->>TenantM: kyb_decision (approved / rejected) — admin-only, no self-service path
+
+    alt admin-issued
+        Ops->>TenantM: POST /admin/tenants/{id}/api-keys
+    else self-service
+        Rep->>TenantM: POST /portal/api-keys
+    end
+    note over TenantM: both call IssueAPIKey(tenantID) — gated on status == active either way
+
+    Ops->>TenantM: POST /admin/tenants/{id}/corridors/{corridorID}
+    TenantM->>Corridor: FiatCurrencyForCorridor(corridorID)
+    TenantM->>Compliance: IsJurisdictionApproved(tenantID, fiatCurrency)
+    alt approved KYB case covers that currency
+        TenantM-->>Ops: entitlement granted — admin-only, no self-service path
+    else not covered
+        TenantM-->>Ops: 422 — jurisdiction not approved
+    end
+
+    alt admin-configured
+        Ops->>TenantM: POST /admin/tenants/{id}/webhook {url}
+    else self-service
+        Rep->>TenantM: PUT /portal/webhook {url}
+    end
+    TenantM-->>TenantM: SSRF-validated, saved either way
+```
 
 ## Phase 2 — A transaction, end to end
 
@@ -49,12 +105,57 @@ Two independent consumers of the same event — deliberately not a pipeline, so 
 
 ### 5. Ledger
 
-Every step above posts balanced, double-entry transactions — `deposit_confirmed`, `fx_conversion`, `settlement_payout`, `sweep` (see the worked 100 USDT → NGN example in `ARCHITECTURE.md` §6). Nothing else is permitted to write to `ledger_entries`.
+Every step above posts balanced, double-entry transactions — `deposit_confirmed`, `fx_conversion`, `settlement_payout`, `sweep` (see the worked 100 USDT → NGN example in `ARCHITECTURE.md` §7). Nothing else is permitted to write to `ledger_entries`.
 
 ### 6. Tenant visibility
 
 - **`GET /v2/sessions/{sessionID}`** for polling.
 - Async webhook notifications (`session.*`, `settlement.*`, `compliance.hold_created`) delivered by the `notification` module to the URL configured in onboarding step 6.
+
+```mermaid
+sequenceDiagram
+    participant Tenant as Bank/fintech (HMAC)
+    participant Session as session module
+    participant Compliance as compliance module
+    participant Rate as rate module
+    participant Treasury as treasury module
+    participant Settlement as settlement module
+    participant Ledger as ledger module
+    participant Notify as notification module
+
+    Tenant->>Session: POST /v2/sessions {corridor, destination}
+    Session->>Session: validate destination against corridor's required fields
+    Session->>Compliance: ScreenSession()
+    alt REJECTED
+        Compliance-->>Session: rejected (terminal)
+    else HOLD
+        Compliance-->>Session: compliance_hold — queued to ops immediately
+        Session-->>Tenant: generic status "under_review"
+    else APPROVED
+        Compliance-->>Session: approved
+        Session->>Rate: LockRate() — 1% slippage buffer
+        Session->>Treasury: ReserveAddress()
+        Treasury-->>Session: deposit address
+        Session-->>Tenant: pending {depositAddress} — 30-min clock starts
+    end
+
+    Treasury->>Treasury: chain watcher observes deposit
+    Treasury-->>Session: deposit_detected → deposit_confirmed (confirmation policy met)
+
+    par settlement (real-time)
+        Session-->>Settlement: deposit_confirmed
+        Settlement->>Ledger: claim settlement_payout:session_id (idempotent)
+        Settlement->>Settlement: dispatch payout to corridor's provider
+        Settlement-->>Session: settling → settled (signature-verified webhook)
+    and sweep (batched for stablecoins, independent of settlement)
+        Session-->>Treasury: deposit_confirmed
+        Treasury->>Treasury: queue for sweep — not a session state
+    end
+
+    Ledger-->>Notify: session.*/settlement.* events (via outbox)
+    Notify-->>Tenant: webhook delivery
+    Tenant->>Session: GET /v2/sessions/{id} (poll, alternative to webhooks)
+```
 
 ### Terminal outcomes
 
@@ -64,6 +165,40 @@ Every step above posts balanced, double-entry transactions — `deposit_confirme
 | `rejected` / `expired` | Nothing was ever collected. |
 | `settlement_failed` | Payout failed; ops-correctable retry available. |
 | `reversed` → `reversal_resolved` | Rare post-settlement bank return. Crypto side is **never** unwound — only the fiat leg (`tenant_payable` liability) is compensated. |
+
+```mermaid
+stateDiagram-v2
+    [*] --> screening
+
+    screening --> pending: APPROVED
+    screening --> compliance_hold: HOLD
+    screening --> rejected: REJECTED
+
+    compliance_hold --> pending: analyst approves
+    compliance_hold --> rejected: analyst rejects
+    compliance_hold --> expired: hold TTL exceeded (corridor-configurable, default 24h)
+
+    pending --> deposit_detected: deposit tx observed
+    pending --> expired: 30-min TTL, no deposit ever
+
+    deposit_detected --> deposit_confirmed: confirmations met (per-asset policy)
+
+    deposit_confirmed --> settling: settlement claims ledger key, dispatches
+
+    settling --> settled: provider confirms (signature-verified)
+    settling --> settlement_failed: buckets 1/2 exhausted (3 attempts) or bucket 4 (terminal)
+
+    settlement_failed --> settling: ops supplies corrected details, retries
+
+    settled --> reversed: provider/bank reports return (rare)
+    reversed --> settling: ops supplies corrected bank details, retries
+    reversed --> reversal_resolved: ops closes case outside the pipeline
+
+    rejected --> [*]
+    expired --> [*]
+    settled --> [*]
+    reversal_resolved --> [*]
+```
 
 ### The one SLA rule that ties it together
 
