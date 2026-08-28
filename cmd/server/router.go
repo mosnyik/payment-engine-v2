@@ -85,6 +85,15 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 
 	r.With(publicLimit).Post("/admin/login", h.login)
 
+	// Phase 13: admin SSO/OIDC login, only wired up when configured (see
+	// buildStores) — an unconfigured deployment sees no new routes at all,
+	// password login above is unaffected either way.
+	if stores.adminOIDC != nil {
+		oh := &adminOIDCHandlers{oidc: stores.adminOIDC, admin: stores.admin, secureCookies: cfg.IsProduction()}
+		r.With(publicLimit).Get("/admin/login/oidc", oh.login)
+		r.With(publicLimit).Get("/admin/login/oidc/callback", oh.callback)
+	}
+
 	// Tenant self-service: passwordless (email magic link), same
 	// unauthenticated tier as /admin/login for the three entry points.
 	// IP-rate-limited (publicLimit) — the first fully public, unauthenticated
@@ -138,7 +147,6 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 
 		admin.Post("/tenants", h.createTenant)
 		admin.Post("/tenants/{tenantID}/restore", h.restoreTenant)
-		admin.Post("/tenants/{tenantID}/kyb", h.submitKYB)
 		admin.Get("/compliance/holds", h.listHolds)
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)

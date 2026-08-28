@@ -1,6 +1,6 @@
 # Payment Rail v2 — Architecture & Design Decisions
 
-Status: living design doc, pre-implementation. Update as decisions change — don't let this drift from reality.
+Status: living design doc. Implementation is well underway, not pre-implementation — see `docs/IMPLEMENTATION_PLAN.md` for build order and current phase status. Update as decisions change — don't let this drift from reality.
 
 ## 1. What this is
 
@@ -28,6 +28,10 @@ A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, d
 | Compliance | Synchronous, blocking check at session creation; multi-provider, routed by settlement currency/corridor; manual-review hold queue as fallback where no provider is configured; Travel Rule thresholds configurable per currency (rolling-window volume check) |
 | FX / rates | In-house rate engine aggregating partner quotes vs. a DB-set system rate; system rate acts as a ceiling — external providers can only push the locked rate down, never up (ported from v1, confirmed to carry forward) |
 | Tenant auth | Per-tenant configurable: API key + HMAC signature, or mTLS |
+| Tenant portal auth | Separate passwordless surface for the tenant's own KYB submission: email magic link (`POST /portal/login`) → single-use, time-limited, hashed token → session token (`POST /portal/verify`). Own credential space (`tenant_magic_links`/`tenant_sessions`), never accepted on gateway (HMAC/mTLS) or admin routes, or vice versa |
+| Admin auth | Password (bcrypt hash + DB-backed session, per-admin identity) is the baseline; OIDC SSO is an additional front door onto the *same* session model — any OIDC-compliant IdP, invite-only (never self-provisions an `admin_users` row), binds to the IdP's `sub` claim. Password login stays as a break-glass fallback once SSO is configured, not deleted |
+| KYB jurisdiction requirements | Per-fiat-currency required-fields config (`jurisdiction_kyb_requirements`, admin-configurable; unconfigured currency = no extra requirement). Every KYB case declares which currencies/jurisdictions it's onboarding for (`declared_currencies`); validated against the union of those currencies' required fields before a case is even created |
+| Corridor entitlement grant | Activating an entitlement (`GrantCorridorEntitlement`) is gated on an approved KYB case whose `declared_currencies` cover the corridor's fiat currency — an approval for one jurisdiction can't be used to unlock a corridor under a different regulator. Revocation (`SetCorridorEntitlement(..., false, ...)`) doesn't need the gate |
 | Session TTL/SLA | 30 minutes from creation is the target for the *entire* flow (create → lock rate → deposit → confirm → settle). No deposit ever arriving → `expired` at 30 min (terminal, address freed). Deposit already in flight and not yet `settled` at 30 min → status keeps showing the real pipeline stage (never force-abandoned), a separate `sla_breached_at` timestamp is set and the relevant people are notified immediately |
 | Ledger | Double-entry, core primitive from day one — every value movement is a balanced transaction, account balances are always derived, never mutated directly |
 | Monolith design | Modular monolith, hard package boundaries (no cross-module table access), transactional outbox + in-process event dispatcher for fan-out, direct interface calls for blocking critical-path operations (e.g. compliance gate). Event bus swappable for a real broker at microservice-split time without touching module logic |
@@ -38,7 +42,7 @@ A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, d
 
 ## 4. Lessons carried forward from the v1 security audit
 
-A full audit of the existing (Node/MySQL) "2Settle" payment engine at `C:\Users\hp\Projects\Sirfi\payment-engine` surfaced several critical findings that directly shape this design — see full findings in conversation history. The load-bearing lessons:
+A full audit of the existing (Node/MySQL) "2Settle" payment engine at `C:\Users\hp\Projects\2settle\payment-engine` surfaced several critical findings that directly shape this design — see full findings in conversation history. The load-bearing lessons:
 
 1. **No ledger existed** in v1 — the only source of truth for "has this been paid out" was a mutable status column, which is exactly what a race condition exploited to cause a double payout. → Ledger is non-negotiable here, and every status transition in this system is a `WHERE status = <expected>` compare-and-set, never a blind write.
 2. **Seed decryption key stored next to its own ciphertext** in `.env`. → Key-encryption key must live in a KMS/Vault, structurally separated from the app config surface.
@@ -52,8 +56,8 @@ Nine business bounded contexts + one shared platform layer. Each module owns its
 
 | Module | Owns | Exposes (sync) | Publishes (async) | Subscribes |
 |---|---|---|---|---|
-| **tenant** | Tenant profile, fee schedule, corridor entitlements, API keys/HMAC secrets, mTLS cert refs, webhook config | `GetTenant`, `ValidateCredentials`, `CheckEntitlement` | `tenant.onboarded`, `tenant.suspended` | `compliance.kyb_decision` |
-| **compliance** | KYB cases, transaction screening cases, provider registry (by corridor/currency), hold queue, rolling Travel Rule volume aggregates | `ScreenTenant()`, `ScreenSession()` — both sync, blocking | `compliance.kyb_decision`, `compliance.session_decision`, `compliance.hold_created/resolved` | `session.deposit_confirmed` (updates rolling volume) |
+| **tenant** | Tenant profile, fee schedule, corridor entitlements, API keys/HMAC secrets, mTLS cert refs, webhook config, portal magic links/sessions (passwordless tenant-representative login) | `GetTenant`, `ValidateCredentials`, `CheckEntitlement`, `GrantCorridorEntitlement` (jurisdiction-gated, calls into `compliance`/`corridor`) | `tenant.onboarded`, `tenant.suspended` | `compliance.kyb_decision` |
+| **compliance** | KYB cases (with declared currencies/jurisdictions), transaction screening cases, jurisdiction KYB requirements (required fields per fiat currency), provider registry (by corridor/currency), hold queue, rolling Travel Rule volume aggregates | `ScreenTenant()`, `ScreenSession()` — both sync, blocking; `IsJurisdictionApproved()` | `compliance.kyb_decision`, `compliance.session_decision`, `compliance.hold_created/resolved` | `session.deposit_confirmed` (updates rolling volume) |
 | **corridor** | Corridor definitions (asset+network × fiat currency), provider bindings + priority/failover, limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor), payout-destination field requirements per fiat currency | `GetCorridor`, `ListActiveProviders()` | `corridor.updated` | — |
 | **session** | Session state machine, deposit-address reference, rate-lock reference, compliance-decision reference, tenant-supplied payout destination | `CreateSession`, `GetSession` | `session.created`, `session.deposit_detected`, `session.deposit_confirmed`, `session.expired` | `treasury.deposit_detected/confirmed` |
 | **treasury** | Collection provider adapters (self-custody HD wallet + partner-custodied), address reservations, watcher state, sweep execution, custody balances | `GetDepositInstructions()`, `ReserveAddress()` | `treasury.deposit_detected`, `treasury.deposit_confirmed`, `treasury.swept` | `session.created` |
@@ -61,24 +65,241 @@ Nine business bounded contexts + one shared platform layer. Each module owns its
 | **settlement** | Settlement provider adapters, payout dispatch records, provider failover state | (internally triggered) | `settlement.dispatched`, `settlement.completed`, `settlement.failed` | `session.deposit_confirmed` |
 | **ledger** | Accounts, entries, transactions (append-only), balance cache | `Post()` — the *only* write path | `ledger.posted` | Nearly everything |
 | **notification** | Webhook subscriber config, delivery log, dead-letter queue | — | — (terminal consumer) | `session.*`, `settlement.*`, `compliance.hold_created` |
-| **platform** (shared kernel) | Tenant gateway (HMAC/mTLS auth), **admin/internal auth** (separate credential space for staff), outbox/eventbus, inbound-request idempotency store, db/migrations | used by all modules | — | — |
+| **platform** (shared kernel) | Tenant gateway (HMAC/mTLS auth), **admin/internal auth** (separate credential space for staff; password + optional OIDC SSO), outbox/eventbus, inbound-request idempotency store, db/migrations | used by all modules | — | — |
 
 **Key flow decision**: `settlement` subscribes to `session.deposit_confirmed`, not `treasury.swept`. Sweep can be batched (stablecoin policy); settlement must be real-time. They are independent consumers of the same event, not a pipeline.
 
-**Two distinct auth surfaces, not one**: tenant-facing auth (API key+HMAC or mTLS, per `tenant`'s config) gates the API banks/fintechs call. **Admin/internal auth is separate** — staff reviewing KYB submissions, resolving compliance holds, managing corridor config, or retrying settlements need their own authenticated identity, not a shared secret. This is a direct lesson from the v1 audit: v1 gated all of `/admin/*` (including wallet-destination config and API-key management) behind a single shared `ADMIN_SECRET` compared with a non-constant-time `!==`, with no per-admin identity and no attempt limiting. v2 needs per-admin credentials (not one shared token), constant-time/hashed comparison, and audit logging of who did what — this surface gates some of the most sensitive actions in the system (wallet config, compliance decisions, manual settlement), so it deserves at least as much rigor as tenant auth, arguably more.
+**Three distinct auth surfaces, not one**:
+1. **Tenant-facing API auth** (API key+HMAC or mTLS, per `tenant`'s config) gates the API banks/fintechs call.
+2. **Admin/internal auth is separate** — staff reviewing KYB submissions, resolving compliance holds, managing corridor config, or retrying settlements need their own authenticated identity, not a shared secret. This is a direct lesson from the v1 audit: v1 gated all of `/admin/*` (including wallet-destination config and API-key management) behind a single shared `ADMIN_SECRET` compared with a non-constant-time `!==`, with no per-admin identity and no attempt limiting. v2 needs per-admin credentials (not one shared token), constant-time/hashed comparison, and audit logging of who did what — this surface gates some of the most sensitive actions in the system (wallet config, compliance decisions, manual settlement), so it deserves at least as much rigor as tenant auth, arguably more. OIDC SSO now sits in front of this as an alternative login path (Phase 13) — it only changes *how* an admin proves identity; sessions are still the same DB-backed `admin_sessions` token issued the same way, and password login remains as a break-glass fallback.
+3. **Tenant portal auth is its own third surface**, built in Phase 9a as a genuine tenant self-service surface — not just a KYB form: `POST /portal/register` lets a tenant create its own record with no admin involved at all, and once KYB clears the tenant can self-issue its own API key (`POST /portal/api-keys`) and set its own webhook (`PUT /portal/webhook`), alongside tenant-scoped reads of its own sessions/settlements/balance/notifications. A tenant representative (not a bank/fintech's server-to-server integration) proves who they are via a passwordless email magic link, gets a session token, and that token is only ever accepted on `/portal/*` routes — never on gateway or admin routes, since it's a *person at the tenant company*, who has no HMAC secret or mTLS cert (those aren't issued until after KYB clears) and shouldn't share the admin credential space either. Phase 12 later built on this surface to make KYB submission exclusively portal-only, removing the admin-submitted alternative that existed before — see the onboarding workflow below for which steps are admin-only vs. either-path.
+
+None of the three credential spaces are interchangeable, and none of their session/token tables are shared.
 
 **Onboarding is a workflow, not a new module** — it's the sequence that ties `tenant` and `compliance` together, worth naming explicitly since it's easy to lose track of as "just tenant CRUD":
 
-1. Tenant registration (`tenant`) — creates the tenant record, initial profile.
-2. KYB submission (`compliance`) — tenant provides company/beneficial-ownership/licensing documents.
-3. KYB review (`compliance`, via admin/internal auth) — automated provider decision, or manual review through the hold queue if no provider is configured for that case.
-4. Credential issuance (`platform` gateway) — on approval, generate the tenant's API key+HMAC secret and/or register their mTLS cert. Nothing is issued before KYB clears.
-5. Corridor entitlement assignment (`tenant` + `corridor`) — which asset/currency corridors this tenant may use, and any limits.
-6. Webhook config (`tenant`) — tenant registers their callback URL; validated against SSRF (private/loopback ranges rejected) per the v1 audit finding on this exact gap.
+1. Tenant registration (`tenant`) — **either path creates the identical record**, via the same `RegisterTenant(name, email)` call: staff create it on the tenant's behalf (`POST /admin/tenants`), or the tenant registers itself (`POST /portal/register`, Phase 9a, which also auto-sends the portal login magic link on success). Either way the record starts in the same status, and the tenant can't call the API yet, and can't submit KYB either until it logs into the portal.
+2. Portal login + KYB submission (`tenant` portal auth + `compliance`) — **portal-only, never admin-submitted on the tenant's behalf** (Phase 12), regardless of which path created the record: the tenant's own representative requests a magic link (`POST /portal/login`), redeems it for a session (`POST /portal/verify`), then submits company/beneficial-ownership/licensing documents itself (`POST /portal/kyb`) — declaring which fiat currencies/jurisdictions it's onboarding for, validated against each jurisdiction's configured required fields (Phase 10) before a case is even created. Admin's role here is review/resolve only.
+3. KYB review (`compliance`, via admin/internal auth) — **admin-only, no self-service path** — automated provider decision, or manual review through the hold queue if no provider is configured for that case.
+4. Credential issuance (`tenant`) — **either path**, via the same `IssueAPIKey(tenantID)` call, gated on the tenant's status being `active` either way (nothing issued before KYB clears): admin does it (`POST /admin/tenants/{id}/api-keys`), or the tenant self-issues (`POST /portal/api-keys`, Phase 9a). Generating/registering an mTLS cert, where used instead of API key+HMAC, stays admin-only.
+5. Corridor entitlement assignment (`tenant` + `corridor`, gated by `compliance`) — **admin-only, no self-service path** — which asset/currency corridors this tenant may use, and any limits. Granting one (`GrantCorridorEntitlement`, Phase 10) only succeeds if the tenant has an approved KYB case whose declared currencies actually cover that corridor's fiat currency, so a jurisdiction's approval can't be used to unlock a corridor a different regulator was never cleared for.
+6. Webhook config (`tenant`) — **either path**: admin sets it (`POST /admin/tenants/{id}/webhook`), or the tenant sets its own (`PUT /portal/webhook`, Phase 9a); both validated against SSRF (private/loopback ranges rejected) per the v1 audit finding on this exact gap.
 
-Only after step 4 can a tenant call the API at all; only after step 5 can they create a session on a given corridor.
+Steps 3 and 5 are the only genuinely admin-only steps — both are judgment calls (a compliance decision, a business/limits decision), not paperwork a tenant could self-serve. Only after step 4 can a tenant call the API at all; only after step 5 can they create a session on a given corridor.
 
-## 6. Ledger schema
+## 6. System & flow diagrams
+
+Visual complement to §5's module-map table and §9's transition table — same information, drawn out. Reflects the system as it stands through Phase 13 (admin SSO/OIDC): three auth surfaces, self-service onboarding alongside the admin-driven path, portal-only KYB submission, jurisdiction-gated corridor entitlements.
+
+### High-level architecture
+
+```
+                                    ┌─────────────────────────────────────────┐
+                                    │                 CLIENTS                  │
+                                    └─────────────────────────────────────────┘
+                    ┌────────────────────────┼────────────────────────┐
+                    ▼                         ▼                        ▼
+        ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
+        │  Bank / fintech       │ │  Tenant representative │ │  2settle staff (ops)    │
+        │  (server-to-server)   │ │  (browser)              │ │  (browser)             │
+        └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
+                    │                         │                        │
+                    ▼                         ▼                        ▼
+        ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
+        │  gateway               │ │  portal auth           │ │  admin auth            │
+        │  API key + HMAC        │ │  passwordless magic    │ │  password (bcrypt) or  │
+        │  signature, or mTLS,    │ │  link → session token, │ │  OIDC SSO (invite-only,│
+        │  per-tenant config      │ │  self-registration,     │ │  bound to IdP `sub`)   │
+        │                         │ │  KYB, self-service      │ │                        │
+        │                         │ │  credentials/webhook    │ │                        │
+        └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
+                    │                         │                        │
+                    │        three separate credential spaces —        │
+                    │        no token is ever valid across surfaces    │
+                    └─────────────────────────┼────────────────────────┘
+                                              ▼
+        ┌───────────────────────────────────────────────────────────────────────────────┐
+        │                     PAYMENT RAIL CORE (modular monolith, Go)                      │
+        │                                                                                   │
+        │  ┌────────┐ ┌───────────┐ ┌─────────┐ ┌────────┐ ┌─────────┐ ┌──────┐ ┌────────┐ │
+        │  │ tenant │ │compliance │ │corridor │ │session │ │treasury │ │ rate │ │settlement│ │
+        │  └───┬────┘ └─────┬─────┘ └────┬────┘ └───┬────┘ └────┬────┘ └──┬───┘ └────┬─────┘ │
+        │      └────────────┴────────────┴───────────┴───────────┴─────────┴──────────┘     │
+        │                                          │                                          │
+        │                                          ▼                                          │
+        │                              ┌──────────────────────┐        ┌────────────────┐     │
+        │                              │        ledger          │◀──────│  notification   │     │
+        │                              │  (the only write path) │       │  (webhooks out) │     │
+        │                              └──────────────────────┘        └────────────────┘     │
+        │                                                                                       │
+        │      platform (shared kernel): outbox/eventbus, idempotency store, db/migrations      │
+        └───────────────────────────────────────────────────────────────────────────────────────┘
+                                              │
+                                              ▼
+        ┌───────────────────────────────────────────────────────────────────────────────────┐
+        │                                    POSTGRESQL                                         │
+        │   tenants · tenant_magic_links/tenant_sessions · admin_users (+oidc_subject) ·         │
+        │   compliance_cases (+declared_currencies) · jurisdiction_kyb_requirements ·            │
+        │   corridors · sessions · treasury reservations/wallets · rate_locks · settlements ·     │
+        │   ledger_accounts/entries/transactions/balances · outbox_events · request_audit_log     │
+        └───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Onboarding flow
+
+```mermaid
+sequenceDiagram
+    participant Ops as Admin/Staff
+    participant Rep as Tenant representative
+    participant TenantM as tenant module
+    participant Compliance as compliance module
+    participant Corridor as corridor module
+
+    alt admin-initiated
+        Ops->>TenantM: POST /admin/tenants {name, email}
+        TenantM-->>Ops: tenant created
+    else self-service (Phase 9a)
+        Rep->>TenantM: POST /portal/register {name, email}
+        TenantM-->>Rep: magic link emailed automatically
+    end
+    note over TenantM: both call the same RegisterTenant(name, email) — identical starting status
+
+    Rep->>TenantM: POST /portal/login {email}
+    TenantM-->>Rep: magic link emailed (single-use, time-limited)
+    Rep->>TenantM: POST /portal/verify {token}
+    TenantM-->>Rep: portal session token
+
+    Rep->>Compliance: POST /portal/kyb {docs, declaredCurrencies}
+    Compliance->>Compliance: validate declaredCurrencies against jurisdiction_kyb_requirements
+    alt provider configured
+        Compliance->>Compliance: automated decision
+    else no provider configured
+        Compliance-->>Ops: case queued to hold queue
+        Ops->>Compliance: POST /admin/compliance/holds/{id}/resolve
+    end
+    Compliance-->>TenantM: kyb_decision (approved / rejected) — admin-only, no self-service path
+
+    alt admin-issued
+        Ops->>TenantM: POST /admin/tenants/{id}/api-keys
+    else self-service
+        Rep->>TenantM: POST /portal/api-keys
+    end
+    note over TenantM: both call IssueAPIKey(tenantID) — gated on status == active either way
+
+    Ops->>TenantM: POST /admin/tenants/{id}/corridors/{corridorID}
+    TenantM->>Corridor: FiatCurrencyForCorridor(corridorID)
+    TenantM->>Compliance: IsJurisdictionApproved(tenantID, fiatCurrency)
+    alt approved KYB case covers that currency
+        TenantM-->>Ops: entitlement granted — admin-only, no self-service path
+    else not covered
+        TenantM-->>Ops: 422 — jurisdiction not approved
+    end
+
+    alt admin-configured
+        Ops->>TenantM: POST /admin/tenants/{id}/webhook {url}
+    else self-service
+        Rep->>TenantM: PUT /portal/webhook {url}
+    end
+    TenantM-->>TenantM: SSRF-validated, saved either way
+```
+
+### Transaction flow
+
+```mermaid
+sequenceDiagram
+    participant Tenant as Bank/fintech (HMAC)
+    participant Session as session module
+    participant Compliance as compliance module
+    participant Rate as rate module
+    participant Treasury as treasury module
+    participant Settlement as settlement module
+    participant Ledger as ledger module
+    participant Notify as notification module
+
+    Tenant->>Session: POST /v2/sessions {corridor, destination}
+    Session->>Session: validate destination against corridor's required fields
+    Session->>Compliance: ScreenSession()
+    alt REJECTED
+        Compliance-->>Session: rejected (terminal)
+    else HOLD
+        Compliance-->>Session: compliance_hold — queued to ops immediately
+        Session-->>Tenant: generic status "under_review"
+    else APPROVED
+        Compliance-->>Session: approved
+        Session->>Rate: LockRate() — 1% slippage buffer
+        Session->>Treasury: ReserveAddress()
+        Treasury-->>Session: deposit address
+        Session-->>Tenant: pending {depositAddress} — 30-min clock starts
+    end
+
+    Treasury->>Treasury: chain watcher observes deposit
+    Treasury-->>Session: deposit_detected → deposit_confirmed (confirmation policy met)
+
+    par settlement (real-time)
+        Session-->>Settlement: deposit_confirmed
+        Settlement->>Ledger: claim settlement_payout:session_id (idempotent)
+        Settlement->>Settlement: dispatch payout to corridor's provider
+        Settlement-->>Session: settling → settled (signature-verified webhook)
+    and sweep (batched for stablecoins, independent of settlement)
+        Session-->>Treasury: deposit_confirmed
+        Treasury->>Treasury: queue for sweep — not a session state
+    end
+
+    Ledger-->>Notify: session.*/settlement.* events (via outbox)
+    Notify-->>Tenant: webhook delivery
+    Tenant->>Session: GET /v2/sessions/{id} (poll, alternative to webhooks)
+```
+
+### Session state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> screening
+
+    screening --> pending: APPROVED
+    screening --> compliance_hold: HOLD
+    screening --> rejected: REJECTED
+
+    compliance_hold --> pending: analyst approves
+    compliance_hold --> rejected: analyst rejects
+    compliance_hold --> expired: hold TTL exceeded (corridor-configurable, default 24h)
+
+    pending --> deposit_detected: deposit tx observed
+    pending --> expired: 30-min TTL, no deposit ever
+
+    deposit_detected --> deposit_confirmed: confirmations met (per-asset policy)
+
+    note right of deposit_confirmed
+        fan-out point: settlement dispatches
+        AND treasury queues sweep, independently
+    end note
+
+    deposit_confirmed --> settling: settlement claims ledger key, dispatches
+
+    note right of settling
+        bucket 3 (confirmation timeout >10min)
+        stays "settling", ops paged manually —
+        never auto-retried (double-payout risk)
+    end note
+
+    settling --> settled: provider confirms (signature-verified)
+    settling --> settlement_failed: buckets 1/2 exhausted (3 attempts) or bucket 4 (terminal)
+
+    settlement_failed --> settling: ops supplies corrected details, retries
+
+    settled --> reversed: provider/bank reports return (rare)
+    reversed --> settling: ops supplies corrected bank details, retries
+    reversed --> reversal_resolved: ops closes case outside the pipeline
+
+    rejected --> [*]
+    expired --> [*]
+    settled --> [*]
+    reversal_resolved --> [*]
+```
+
+`sla_breached_at` (a nullable timestamp, not a state) is set orthogonally at the 30-minute mark for any session past `pending` that hasn't reached `settled` yet — see §9 below for the full rule; it never appears as a node here because it never changes which state a session is in.
+
+## 7. Ledger schema
 
 ```sql
 CREATE TABLE ledger_accounts (
@@ -137,7 +358,7 @@ CREATE TABLE ledger_balances (
 
 The `settlement_payout:session_123` idempotency key is the direct structural fix for v1's double-payout bug: `settlement` must successfully claim this ledger transaction (unique-constraint insert) *before* calling the external provider. If the insert is rejected as a duplicate, another trigger already claimed the payout — abort, don't call the provider. On provider-reported failure, a compensating `settlement_reversal:session_123` transaction reverses it, and a retry claims a new attempt-scoped key.
 
-## 7. Rate engine (ported from v1, adapted)
+## 8. Rate engine (ported from v1, adapted)
 
 Reusing the v1 design — it's sound and maps cleanly onto the `rate` module:
 
@@ -154,7 +375,7 @@ Adaptations from the v1 implementation (not a blind copy):
 
 Known gap, not blocking: asset-price lookups (crypto/USD) only call CoinMarketCap, with no fallback — unlike the fiat side's 4-provider aggregation. Revisit post-pilot.
 
-## 8. Session state machine
+## 9. Session state machine
 
 ### States
 
@@ -262,4 +483,4 @@ Not part of the original design pass — added after grounding Phase 6 in the ac
 None outstanding — all items from the original design pass are resolved as of this section.
 
 ---
-*Next: not yet decided — the session state machine has no open design blockers. Pick up from here.*
+*Next: not yet decided — no open design blockers remain anywhere in this doc. Pick up from here.*

@@ -74,7 +74,7 @@ func TestAdminBrowseSurface(t *testing.T) {
 			ID string `json:"id"`
 		}
 		resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants", token, map[string]string{
-			"name": "Browse Test Tenant " + uuid.NewString(),
+			"name": "Browse Test Tenant " + uuid.NewString(), "email": "browse-tenant-" + uuid.NewString() + "@sirfi.test",
 		}, &createResp)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create tenant: expected 201, got %d", resp.StatusCode)

@@ -120,7 +120,7 @@ All routes are versioned under `/v2`.
 
 - **Public, unauthenticated**: `GET /v2/health`, `GET /v2/rate/{fiatCurrency}` — the current published FX rate (e.g. `/v2/rate/NGN`).
 - **Tenant-authenticated** (API key + HMAC signature): `POST /v2/sessions`, `GET /v2/sessions/{id}`.
-- **Admin-authenticated** (`POST /v2/admin/login` to get a token): tenant onboarding/KYB, corridor entitlements, compliance hold review, settlement retry/reversal, notification dead-letter queue, ledger reconciliation — see `cmd/server/router.go` for the full list.
+- **Admin-authenticated** (`POST /v2/admin/login` to get a token): tenant onboarding, corridor entitlements, compliance hold review, settlement retry/reversal, notification dead-letter queue, ledger reconciliation — see `cmd/server/router.go` for the full list.
 - **Inbound webhooks** (self-verified by signature, not tenant/admin auth): settlement provider callbacks, Busha deposit notifications.
 
 Full OpenAPI 3.0 spec: [`docs/openapi.yaml`](docs/openapi.yaml) — hand-maintained, update it alongside any route change in `cmd/server/router.go`.
