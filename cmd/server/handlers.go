@@ -204,9 +204,16 @@ func (h *adminHandlers) resolveSessionHold(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, toSessionResponse(sess))
 }
 
-// POST /admin/tenants/{tenantID}/api-keys — step 4, credential issuance.
-// Refused by tenant.IssueAPIKey unless the tenant is already active (i.e.
-// KYB-approved) — nothing is issued before KYB clears.
+// POST /admin/tenants/{tenantID}/api-keys {"permissions": ["sessions:read"]} —
+// step 4, credential issuance. Refused by tenant.IssueAPIKey unless the
+// tenant is already active (i.e. KYB-approved) — nothing is issued before
+// KYB clears. permissions is optional and admin-only — the portal's own
+// self-service issuance (portalHandlers.issueAPIKey) always issues an
+// unrestricted key, since a tenant scoping its own key down is a
+// nice-to-have nobody's asked for; an admin handing out a deliberately
+// scoped key (e.g. read-only, for a reporting integration) is the actual
+// use case this exists for. Omitted/empty means unrestricted, same as
+// every existing key issued before this field existed.
 func (h *adminHandlers) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 	tenantID, err := uuid.Parse(chi.URLParam(r, "tenantID"))
 	if err != nil {
@@ -214,7 +221,17 @@ func (h *adminHandlers) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiKey, hmacSecret, err := h.tenant.IssueAPIKey(r.Context(), tenantID)
+	var req struct {
+		Permissions []string `json:"permissions"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+
+	apiKey, hmacSecret, err := h.tenant.IssueAPIKey(r.Context(), tenantID, req.Permissions...)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

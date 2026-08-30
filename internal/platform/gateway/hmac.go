@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -29,11 +30,12 @@ const (
 )
 
 var (
-	ErrMissingHeaders = errors.New("missing X-API-Key/X-Timestamp/X-Signature headers")
-	ErrUnknownAPIKey  = errors.New("unknown api key")
-	ErrClockSkew      = errors.New("timestamp outside allowed window")
-	ErrBadSignature   = errors.New("signature mismatch")
-	ErrIPNotAllowed   = errors.New("source ip not in this key's allowlist")
+	ErrMissingHeaders   = errors.New("missing X-API-Key/X-Timestamp/X-Signature headers")
+	ErrUnknownAPIKey    = errors.New("unknown api key")
+	ErrClockSkew        = errors.New("timestamp outside allowed window")
+	ErrBadSignature     = errors.New("signature mismatch")
+	ErrIPNotAllowed     = errors.New("source ip not in this key's allowlist")
+	ErrPermissionDenied = errors.New("api key not permitted for this action")
 )
 
 // tierLimits maps a tenant API key's rate_limit_tier to its per-minute
@@ -54,24 +56,43 @@ func limitForTier(tier string) int {
 	return tierLimits["basic"]
 }
 
+// Permission constants for RequirePermission — the full catalog of scopable
+// actions behind the tenant gateway today. Kept here rather than in a
+// business module: this is a route-layer concept (which endpoint a key may
+// call), not something session/tenant/etc. need to know about internally.
+const (
+	PermissionSessionsWrite = "sessions:write"
+	PermissionSessionsRead  = "sessions:read"
+)
+
 // CredentialLookup resolves an API key to the tenant's HMAC secret, the
 // key's own row ID (for audit attribution — see audit.Record.APIKeyID),
-// its rate-limit tier, and its optional CIDR allowlist. The tenant module
-// (Phase 2) implements this against its own storage — gateway depends only
-// on this interface, never on tenant directly, so the module boundary
-// stays a hard one and this package is fully testable before tenant
-// exists.
+// its rate-limit tier, its optional CIDR allowlist, and its optional
+// permission list. The tenant module (Phase 2) implements this against its
+// own storage — gateway depends only on this interface, never on tenant
+// directly, so the module boundary stays a hard one and this package is
+// fully testable before tenant exists.
 type CredentialLookup interface {
-	LookupHMACSecret(ctx context.Context, apiKey string) (secret string, tenantID uuid.UUID, apiKeyID uuid.UUID, rateLimitTier string, allowedCIDRs []string, ok bool, err error)
+	LookupHMACSecret(ctx context.Context, apiKey string) (secret string, tenantID uuid.UUID, apiKeyID uuid.UUID, rateLimitTier string, allowedCIDRs []string, permissions []string, ok bool, err error)
 }
 
 type tenantIDKey struct{}
+type permissionsKey struct{}
 
 // TenantIDFromContext returns the authenticated tenant's ID set by
 // HMACMiddleware after successful verification.
 func TenantIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	id, ok := ctx.Value(tenantIDKey{}).(uuid.UUID)
 	return id, ok
+}
+
+// permissionsFromContext returns the authenticated key's permission list
+// set by HMACMiddleware. An empty (including nil, i.e. not found) list
+// means unrestricted — same convention as allowedCIDRs — so callers must
+// check length, not just presence.
+func permissionsFromContext(ctx context.Context) []string {
+	perms, _ := ctx.Value(permissionsKey{}).([]string)
+	return perms
 }
 
 // HMACMiddleware verifies the X-API-Key/X-Timestamp/X-Signature headers.
@@ -114,7 +135,7 @@ func HMACMiddleware(lookup CredentialLookup, maxClockSkew time.Duration, limiter
 				return
 			}
 
-			secret, tenantID, apiKeyID, rateLimitTier, allowedCIDRs, ok, err := lookup.LookupHMACSecret(r.Context(), apiKey)
+			secret, tenantID, apiKeyID, rateLimitTier, allowedCIDRs, permissions, ok, err := lookup.LookupHMACSecret(r.Context(), apiKey)
 			if err != nil {
 				http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 				return
@@ -153,6 +174,7 @@ func HMACMiddleware(lookup CredentialLookup, maxClockSkew time.Duration, limiter
 			}
 
 			ctx := context.WithValue(r.Context(), tenantIDKey{}, tenantID)
+			ctx = context.WithValue(ctx, permissionsKey{}, permissions)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -178,6 +200,28 @@ func ipAllowed(clientIP string, allowedCIDRs []string) bool {
 		}
 	}
 	return false
+}
+
+// RequirePermission gates one route on the authenticated key's permission
+// list (set into context by HMACMiddleware) containing perm. An empty list
+// — the default for every key issued before this existed, and for any key
+// issued without an explicit scope — means unrestricted, same opt-in
+// convention as the IP allowlist: nothing to configure for a tenant that
+// doesn't need scoping. Mounted per-route (not on the whole protected
+// router), since not every route needs the same permission.
+func RequirePermission(perm string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			perms := permissionsFromContext(r.Context())
+			if len(perms) == 0 || slices.Contains(perms, perm) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": ErrPermissionDenied.Error()})
+		})
+	}
 }
 
 func writeRateLimitError(w http.ResponseWriter) {

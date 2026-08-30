@@ -15,17 +15,18 @@ import (
 )
 
 type fakeLookup struct {
-	secret   string
-	tenantID uuid.UUID
-	apiKeyID uuid.UUID
-	known    bool
+	secret      string
+	tenantID    uuid.UUID
+	apiKeyID    uuid.UUID
+	known       bool
+	permissions []string
 }
 
-func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, bool, error) {
+func (f fakeLookup) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, []string, bool, error) {
 	if !f.known {
-		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, nil, false, nil
 	}
-	return f.secret, f.tenantID, f.apiKeyID, "", nil, true, nil
+	return f.secret, f.tenantID, f.apiKeyID, "", nil, f.permissions, true, nil
 }
 
 func newSignedRequest(t *testing.T, secret, method, path string, body []byte, ts time.Time) *http.Request {
@@ -153,5 +154,64 @@ func TestHMACMiddleware_WrongSecret(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for wrong secret, got %d", rec.Code)
+	}
+}
+
+func TestRequirePermission_EmptyListUnrestricted(t *testing.T) {
+	tenantID := uuid.New()
+	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true} // no permissions set
+
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(
+		gateway.RequirePermission(gateway.PermissionSessionsWrite)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})),
+	)
+
+	body := []byte(`{}`)
+	req := newSignedRequest(t, "s3cret", http.MethodPost, "/v1/sessions", body, time.Now())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a key with no permission list configured, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRequirePermission_ScopedKeyAllowed(t *testing.T) {
+	tenantID := uuid.New()
+	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true, permissions: []string{gateway.PermissionSessionsRead}}
+
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(
+		gateway.RequirePermission(gateway.PermissionSessionsRead)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})),
+	)
+
+	req := newSignedRequest(t, "s3cret", http.MethodGet, "/v1/sessions/abc", nil, time.Now())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a key scoped to the required permission, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRequirePermission_ScopedKeyDenied(t *testing.T) {
+	tenantID := uuid.New()
+	lookup := fakeLookup{secret: "s3cret", tenantID: tenantID, known: true, permissions: []string{gateway.PermissionSessionsRead}}
+
+	handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(
+		gateway.RequirePermission(gateway.PermissionSessionsWrite)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("handler should not be reached")
+		})),
+	)
+
+	body := []byte(`{}`)
+	req := newSignedRequest(t, "s3cret", http.MethodPost, "/v1/sessions", body, time.Now())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a key scoped away from the required permission, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

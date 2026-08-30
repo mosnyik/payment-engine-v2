@@ -451,10 +451,27 @@ paths:
       summary: "Issue an API key + HMAC secret for a tenant (onboarding step 4)"
       description: >
         Refused unless the tenant is already active (KYB-approved). The raw
-        secret is shown once and is never retrievable again.
+        secret is shown once and is never retrievable again. permissions is
+        optional and admin-only (the tenant's own self-service issuance at
+        /portal/api-keys always issues an unrestricted key) — omitted or
+        empty means unrestricted, same as every key issued before this field
+        existed.
       security: [{ adminAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/tenantID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                permissions:
+                  type: array
+                  items:
+                    type: string
+                    enum: [sessions:write, sessions:read]
+                  description: "Scopes this key to only these actions. Omitted/empty = unrestricted."
       responses:
         "201":
           description: Credential issued
