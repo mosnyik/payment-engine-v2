@@ -101,7 +101,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// pre-auth is by client IP, not tenant/tier.
 	r.With(publicLimit).Post("/portal/register", ph.register)
 	r.With(publicLimit).Post("/portal/login", ph.login)
-	r.With(publicLimit).Post("/portal/verify", ph.verify)
+	r.With(publicLimit).Get("/portal/verify", ph.verify)
 
 	r.Route("/portal", func(portal chi.Router) {
 		portal.Use(tenant.PortalMiddleware(stores.tenant))

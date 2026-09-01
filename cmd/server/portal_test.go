@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -122,7 +123,7 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 	var verifyResp struct {
 		Token string `json:"token"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/verify", "", map[string]string{"token": token}, &verifyResp)
+	resp = doJSON(t, client, http.MethodGet, srv.URL+"/v2/portal/verify?token="+url.QueryEscape(token), "", nil, &verifyResp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("verify: expected 200, got %d", resp.StatusCode)
 	}
@@ -132,7 +133,7 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 	}
 
 	// The same magic link can't be redeemed twice.
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/verify", "", map[string]string{"token": token}, nil)
+	resp = doJSON(t, client, http.MethodGet, srv.URL+"/v2/portal/verify?token="+url.QueryEscape(token), "", nil, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected re-verifying a consumed magic link to fail, got %d", resp.StatusCode)
 	}
@@ -337,7 +338,7 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 	var otherVerifyResp struct {
 		Token string `json:"token"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/verify", "", map[string]string{"token": otherToken}, &otherVerifyResp)
+	resp = doJSON(t, client, http.MethodGet, srv.URL+"/v2/portal/verify?token="+url.QueryEscape(otherToken), "", nil, &otherVerifyResp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("verify other tenant: expected 200, got %d", resp.StatusCode)
 	}
