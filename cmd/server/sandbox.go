@@ -55,12 +55,22 @@ func parseSandboxCorridors(spec string) ([]sandboxCorridorSpec, error) {
 // submissions still must declare a non-empty declared_currencies, just with
 // nothing actually required in it, so sandbox onboarding isn't blocked by
 // requirements the sandbox doesn't know about.
-func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, complianceStore *compliance.Store, spec string) error {
+func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, complianceStore *compliance.Store, spec string, collectionProviders ...string) error {
+	collection := treasury.SandboxProviderName
+	if len(collectionProviders) > 0 && collectionProviders[0] != "" {
+		collection = collectionProviders[0]
+	}
+	if collection != "sandbox" && collection != "busha" {
+		return fmt.Errorf("sandbox: unsupported collection provider %q", collection)
+	}
 	specs, err := parseSandboxCorridors(spec)
 	if err != nil {
 		return err
 	}
 	for _, s := range specs {
+		if collection == "busha" && (s.cryptoNetwork == "SANDBOX" || s.cryptoNetwork == "") {
+			return fmt.Errorf("sandbox: Busha requires a real network code in SANDBOX_CORRIDORS, such as USDT:TRX:NGN")
+		}
 		if _, err := complianceStore.UpsertJurisdictionRequirement(ctx, s.fiatCurrency, "sandbox", []string{}); err != nil {
 			return fmt.Errorf("sandbox: upsert jurisdiction requirement for %s: %w", s.fiatCurrency, err)
 		}
@@ -85,12 +95,25 @@ func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, co
 			providerName string
 		}{
 			{corridor.ProviderTypeCompliance, compliance.SandboxProviderName},
-			{corridor.ProviderTypeCollection, treasury.SandboxProviderName},
+			{corridor.ProviderTypeCollection, collection},
 			{corridor.ProviderTypeSettlement, settlement.SandboxProviderName},
 		}
 		for _, b := range bindings {
 			if _, err := corridorStore.UpsertProviderBinding(ctx, corridorID, b.providerType, b.providerName, 0, true, nil); err != nil {
 				return fmt.Errorf("sandbox: upsert %s provider binding for %s/%s/%s: %w", b.providerType, s.cryptoAsset, s.cryptoNetwork, s.fiatCurrency, err)
+			}
+		}
+		// Disable other collection bindings, including a previously seeded fake.
+		// A Busha error must never silently produce a timer-confirmed fake deposit.
+		active, err := corridorStore.ListActiveProviders(ctx, corridorID, corridor.ProviderTypeCollection)
+		if err != nil {
+			return err
+		}
+		for _, b := range active {
+			if b.ProviderName != collection {
+				if _, err := corridorStore.UpsertProviderBinding(ctx, corridorID, corridor.ProviderTypeCollection, b.ProviderName, b.Priority, false, nil); err != nil {
+					return err
+				}
 			}
 		}
 	}

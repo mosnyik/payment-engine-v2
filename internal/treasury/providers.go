@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // CustodyType records which custody model a collection provider uses — a
@@ -31,6 +34,17 @@ type ProviderAddress struct {
 	Address           string
 	AddressTag        string // memo/tag, empty when the chain doesn't use one
 	ProviderReference string // the provider's own id for this address/wallet
+	Amount            string
+	ExpiresAt         *time.Time
+}
+
+// DepositRequest supplies the amount required by quote-based collection APIs.
+type DepositRequest struct {
+	Amount decimal.Decimal
+}
+
+type quotedCollectionProvider interface {
+	ReserveDeposit(context.Context, uuid.UUID, string, string, DepositRequest) (ProviderAddress, error)
 }
 
 // CollectionProvider is a crypto-collection adapter bound to a corridor via
@@ -42,8 +56,7 @@ type ProviderAddress struct {
 // this is — self-custody derives from that tenant's own segregated HD
 // account (see hdwallet.go), and the tenant-provided-wallet adapter looks
 // up that tenant's registered address; bushaProvider currently ignores it
-// (a future extension point for a per-tenant Busha sub-account, once
-// Busha's real API is known).
+// because collection currently credits the configured business balance.
 type CollectionProvider interface {
 	Name() string
 	IsEnabled() bool
@@ -63,20 +76,8 @@ type CollectionProviderConfig struct {
 
 const httpProviderTimeout = 8 * time.Second
 
-// bushaProvider is the Busha (partner-custodied) collection adapter.
-//
-// TODO: plug in the real Busha collection API.
-//  1. Set BUSHA_TREASURY_ENABLED=true, BUSHA_TREASURY_API_URL,
-//     BUSHA_TREASURY_API_KEY, BUSHA_TREASURY_WEBHOOK_SECRET.
-//  2. Update reserveAddressRequest with the correct path/auth headers.
-//  3. Update parseReserveAddressResponse to extract address/tag/reference
-//     from the real response shape.
-//  4. Update VerifyWebhookSignature (webhook.go) with Busha's real
-//     signature scheme once known.
-//
-// No real endpoint/response shape is supplied yet — same TODO-stub
-// convention already established for rate/providers.go's Busha/LiquidRamp/
-// Anchor adapters. Disabled by default.
+// bushaProvider collects into a Busha Business balance using quotes and transfers.
+// See docs/BUSHA_SANDBOX.md for sandbox configuration and API sources.
 type bushaProvider struct {
 	cfg    CollectionProviderConfig
 	client *http.Client
@@ -93,59 +94,90 @@ func (p *bushaProvider) Name() string             { return "busha" }
 func (p *bushaProvider) IsEnabled() bool          { return p.cfg.Enabled }
 func (p *bushaProvider) CustodyType() CustodyType { return CustodyTypePartner }
 
-func (p *bushaProvider) ReserveAddress(ctx context.Context, _ uuid.UUID, cryptoAsset, cryptoNetwork string) (ProviderAddress, error) {
-	req, err := p.buildRequest(ctx, cryptoAsset, cryptoNetwork)
-	if err != nil {
-		return ProviderAddress{}, fmt.Errorf("treasury: build busha request: %w", err)
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return ProviderAddress{}, fmt.Errorf("treasury: call busha: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return ProviderAddress{}, fmt.Errorf("treasury: busha returned status %d", resp.StatusCode)
-	}
-
-	// TODO: replace with the real Busha response shape.
-	var parsed struct {
-		Address     string `json:"address"`
-		Tag         string `json:"tag"`
-		ReferenceID string `json:"reference_id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return ProviderAddress{}, fmt.Errorf("treasury: parse busha response: %w", err)
-	}
-	if parsed.Address == "" {
-		return ProviderAddress{}, fmt.Errorf("treasury: busha response missing address")
-	}
-
-	return ProviderAddress{
-		Address:           parsed.Address,
-		AddressTag:        parsed.Tag,
-		ProviderReference: parsed.ReferenceID,
-	}, nil
+func (p *bushaProvider) ReserveAddress(context.Context, uuid.UUID, string, string) (ProviderAddress, error) {
+	return ProviderAddress{}, fmt.Errorf("treasury: Busha Business requires a deposit amount")
 }
 
-func (p *bushaProvider) buildRequest(ctx context.Context, cryptoAsset, cryptoNetwork string) (*http.Request, error) {
-	// TODO: replace with the real Busha deposit-address endpoint/payload
-	// shape — asset/network field names below are a placeholder guess.
-	body, err := json.Marshal(struct {
-		Asset   string `json:"asset"`
-		Network string `json:"network"`
-	}{Asset: cryptoAsset, Network: cryptoNetwork})
-	if err != nil {
-		return nil, err
+// ReserveDeposit creates a same-currency quote and finalizes it to generate
+// a deposit address in the configured business account. It never requests a payout.
+func (p *bushaProvider) ReserveDeposit(ctx context.Context, _ uuid.UUID, asset, network string, deposit DepositRequest) (ProviderAddress, error) {
+	if !p.cfg.Enabled || strings.TrimSpace(p.cfg.APIKey) == "" || strings.TrimSpace(p.cfg.WebhookSecret) == "" {
+		return ProviderAddress{}, fmt.Errorf("treasury: Busha collection is disabled or missing credentials")
 	}
-	req, err := http.NewRequest(http.MethodPost, p.cfg.APIURL+"/TODO/addresses", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	if !deposit.Amount.IsPositive() || asset == "" || network == "" {
+		return ProviderAddress{}, fmt.Errorf("treasury: Busha requires a positive amount, asset and network")
 	}
-	req = req.WithContext(ctx)
+	var quote struct {
+		ID string `json:"id"`
+	}
+	err := p.post(ctx, "/v1/quotes", map[string]any{
+		"source_currency": asset, "target_currency": asset,
+		"source_amount": deposit.Amount.String(),
+		"pay_in":        map[string]string{"type": "address", "network": network},
+	}, &quote)
+	if err != nil {
+		return ProviderAddress{}, err
+	}
+	if quote.ID == "" {
+		return ProviderAddress{}, fmt.Errorf("treasury: Busha quote missing id")
+	}
+	var transfer bushaTransfer
+	if err := p.post(ctx, "/v1/transfers", map[string]string{"quote_id": quote.ID}, &transfer); err != nil {
+		return ProviderAddress{}, err
+	}
+	if transfer.ID == "" || transfer.PayIn.Address == "" || transfer.PayIn.Type != "address" ||
+		transfer.SourceCurrency != asset || transfer.TargetCurrency != asset || transfer.PayIn.Network != network ||
+		!transfer.SourceAmount.Equal(deposit.Amount) || transfer.PayIn.ExpiresAt == nil || !transfer.PayIn.ExpiresAt.After(time.Now()) {
+		return ProviderAddress{}, fmt.Errorf("treasury: Busha returned incomplete or mismatched deposit instructions")
+	}
+	return ProviderAddress{Address: transfer.PayIn.Address, AddressTag: transfer.PayIn.Memo,
+		ProviderReference: transfer.ID, Amount: transfer.SourceAmount.String(), ExpiresAt: transfer.PayIn.ExpiresAt}, nil
+}
+
+type bushaTransfer struct {
+	ID             string          `json:"id"`
+	SourceCurrency string          `json:"source_currency"`
+	TargetCurrency string          `json:"target_currency"`
+	SourceAmount   decimal.Decimal `json:"source_amount"`
+	Status         string          `json:"status"`
+	PayIn          struct {
+		Type      string     `json:"type"`
+		Address   string     `json:"address"`
+		Network   string     `json:"network"`
+		Memo      string     `json:"memo"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	} `json:"pay_in"`
+}
+
+func (p *bushaProvider) post(ctx context.Context, path string, payload, result any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.cfg.APIURL, "/")+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("treasury: build Busha request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	return req, nil
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("treasury: Busha %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("treasury: Busha %s returned HTTP %d", path, resp.StatusCode)
+	}
+	var envelope struct {
+		Status string          `json:"status"`
+		Data   json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil {
+		return fmt.Errorf("treasury: decode Busha response: %w", err)
+	}
+	if envelope.Status != "success" || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		return fmt.Errorf("treasury: Busha response was not successful")
+	}
+	return json.Unmarshal(envelope.Data, result)
 }

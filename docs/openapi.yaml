@@ -178,15 +178,27 @@ paths:
       tags: [webhooks]
       summary: Busha partner-custodied deposit notification
       description: >
-        Self-verified via X-Webhook-Signature (treasury.VerifyWebhookSignature).
+        Self-verified via X-BU-Signature (base64 HMAC-SHA256 of the raw body).
         Self-custody deposit detection instead runs via watcher polling, so
         this path is Busha-specific rather than a generic {providerName}.
       security: []
+      parameters:
+        - in: header
+          name: X-BU-Signature
+          required: true
+          schema: { type: string }
       requestBody:
         required: true
         content:
           application/json:
-            schema: { type: object, description: Busha-shaped payload. }
+            schema:
+              type: object
+              required: [event, data]
+              properties:
+                event: { type: string, example: transfer.funds_received }
+                data:
+                  type: object
+                  description: Busha Business transfer including id, status, source_currency, target_currency and source_amount.
       responses:
         "200":
           description: Accepted
@@ -928,6 +940,18 @@ components:
         crypto_asset: { type: string }
         crypto_network: { type: string }
         deposit_reservation_id: { type: string, format: uuid, nullable: true }
+        deposit_instructions:
+          type: object
+          description: Persisted collection instructions, present after a session enters pending.
+          properties:
+            reservation_id: { type: string, format: uuid }
+            provider: { type: string, example: busha }
+            crypto_asset: { type: string, example: USDT }
+            crypto_network: { type: string, example: TRX }
+            address: { type: string }
+            address_tag: { type: string }
+            amount: { type: string, description: Exact crypto amount to send. }
+            expires_at: { type: string, format: date-time }
         created_at: { type: string }
 
     ComplianceCase:

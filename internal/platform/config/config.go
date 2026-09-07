@@ -8,6 +8,7 @@ package config
 import (
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -40,7 +41,8 @@ type Config struct {
 	// entry at startup, with compliance/collection/settlement provider
 	// bindings pointed at the sandbox fakes, only when SandboxMode is set.
 	// Only meaningful in sandbox mode; ignored otherwise.
-	SandboxCorridors string
+	SandboxCorridors          string
+	SandboxCollectionProvider string
 
 	DatabaseURL string
 
@@ -326,6 +328,7 @@ func Load(source Source) (*Config, error) {
 	environment := stringOrDefault(source, "APP_ENV", "development")
 	sandboxMode := boolOrDefault(source, "SANDBOX_MODE", false)
 	sandboxCorridors := stringOrDefault(source, "SANDBOX_CORRIDORS", "USDT:SANDBOX:NGN")
+	sandboxCollection := stringOrDefault(source, "SANDBOX_COLLECTION_PROVIDER", "sandbox")
 
 	databaseURL := requireString(source, "DATABASE_URL", &errs)
 	if environment == "production" && databaseURL == localDevDatabaseURL {
@@ -436,6 +439,23 @@ func Load(source Source) (*Config, error) {
 		RedirectURL:  stringOrDefault(source, "ADMIN_OIDC_REDIRECT_URL", ""),
 	}
 
+	if sandboxCollection != "sandbox" && sandboxCollection != "busha" {
+		errs = append(errs, "SANDBOX_COLLECTION_PROVIDER must be sandbox or busha")
+	}
+	if sandboxMode && sandboxCollection == "busha" && !treasury.Busha.Enabled {
+		errs = append(errs, "Busha sandbox collection requires BUSHA_TREASURY_ENABLED=true")
+	}
+	if treasury.Busha.Enabled {
+		if strings.TrimSpace(treasury.Busha.APIKey) == "" || strings.TrimSpace(treasury.Busha.WebhookSecret) == "" {
+			errs = append(errs, "Busha collection requires BUSHA_TREASURY_API_KEY and BUSHA_TREASURY_WEBHOOK_SECRET")
+		}
+		u, err := url.Parse(treasury.Busha.APIURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			errs = append(errs, "BUSHA_TREASURY_API_URL must be an HTTPS origin without /v1")
+		} else if sandboxMode && u.Host != "api.sandbox.busha.so" {
+			errs = append(errs, "sandbox mode requires Busha's sandbox origin https://api.sandbox.busha.so")
+		}
+	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("config: invalid configuration:\n  - %s", strings.Join(errs, "\n  - "))
 	}
@@ -444,6 +464,7 @@ func Load(source Source) (*Config, error) {
 		Environment:                    environment,
 		SandboxMode:                    sandboxMode,
 		SandboxCorridors:               sandboxCorridors,
+		SandboxCollectionProvider:      sandboxCollection,
 		DatabaseURL:                    databaseURL,
 		TenantSecretEncryptionKey:      tenantSecretEncryptionKey,
 		HMACClockSkew:                  hmacClockSkew,

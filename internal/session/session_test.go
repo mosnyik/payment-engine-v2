@@ -277,29 +277,20 @@ func TestDepositEvents_DriveSessionThroughDetectedAndConfirmed(t *testing.T) {
 	assertOutboxEvent(t, env, "session.deposit_confirmed", sess.ID)
 }
 
-func TestDepositEvents_OutOfOrderConfirmedIsANoOp(t *testing.T) {
+func TestDepositEvents_ConfirmedBeforeDetected(t *testing.T) {
 	env := setupTestEnv(t, "always-approve", compliance.Decision{Approved: true, Reason: "ok"})
 	sess := env.createSession(t, decimal.NewFromInt(100))
-
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go env.bus.Run(runCtx, 50*time.Millisecond)
-
-	// deposit_confirmed with no prior deposit_detected: the CAS predicate
-	// (status = 'deposit_detected') never matches, so this must be a safe
-	// no-op, not an error that blocks the dispatcher — same discipline
-	// eventbus.Handler's doc comment requires for redelivered/out-of-order
-	// events.
 	publishReservationEvent(t, env, "treasury.deposit_confirmed", *sess.DepositReservationID)
-
-	// Give the dispatcher a moment, then assert status is unchanged.
-	time.Sleep(300 * time.Millisecond)
+	waitForStatus(t, env, sess.ID, session.StatusDepositConfirmed)
+	assertOutboxEvent(t, env, "session.deposit_confirmed", sess.ID)
+	publishReservationEvent(t, env, "treasury.deposit_detected", *sess.DepositReservationID)
+	time.Sleep(150 * time.Millisecond)
 	got, err := env.session.GetSession(context.Background(), sess.ID)
-	if err != nil {
-		t.Fatalf("get session: %v", err)
-	}
-	if got.Status != session.StatusPending {
-		t.Fatalf("expected status to remain pending, got %s", got.Status)
+	if err != nil || got.Status != session.StatusDepositConfirmed {
+		t.Fatalf("late detection changed confirmed session: %v %v", got, err)
 	}
 }
 

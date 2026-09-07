@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,45 +22,52 @@ import (
 var (
 	ErrInvalidWebhookSignature = errors.New("treasury: invalid webhook signature")
 	ErrUnknownReservation      = errors.New("treasury: webhook references an unknown reservation")
+	ErrInvalidDepositEvent     = errors.New("treasury: invalid Busha deposit event")
 )
 
-// DepositEventType is the event type a collection provider's webhook
-// reports. TODO: confirm these match Busha's real event names once known.
+// DepositEventType identifies a Busha Business transfer event.
 type DepositEventType string
 
 const (
-	DepositEventDetected  DepositEventType = "deposit.detected"
-	DepositEventConfirmed DepositEventType = "deposit.confirmed"
+	DepositEventDetected  DepositEventType = "transfer.processing"
+	DepositEventConfirmed DepositEventType = "transfer.funds_received"
 )
 
-// bushaWebhookPayload is a TODO-shaped inbound webhook body — replace with
-// Busha's real payload once known, same swap providers.go's outbound
-// request/response TODOs describe.
+// bushaWebhookPayload is the Busha Business event envelope.
 type bushaWebhookPayload struct {
-	EventType         DepositEventType `json:"event_type"`
-	ProviderReference string           `json:"reference_id"`
-	Address           string           `json:"address"`
-	Amount            decimal.Decimal  `json:"amount"`
-	TxReference       string           `json:"tx_reference"`
+	EventType DepositEventType `json:"event"`
+	Data      bushaTransfer    `json:"data"`
 }
 
-// ComputeWebhookSignature computes the HMAC-SHA256 signature of body under
-// secret.
-//
-// TODO: confirm this matches Busha's real signing scheme (which
-// algorithm, which header(s) it covers) once their webhook docs exist —
-// this is a placeholder, structured so swapping the real scheme in later
-// doesn't change VerifyWebhookSignature's callers.
+// ComputeWebhookSignature retains the hexadecimal format for tenant notifications.
 func ComputeWebhookSignature(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// ComputeBushaSignature implements Busha Business's base64 HMAC-SHA256.
+// Tenant notifications retain their existing hexadecimal signature format.
+func ComputeBushaSignature(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func VerifyBushaSignature(secret string, body []byte, signature string) error {
+	if strings.TrimSpace(secret) == "" || signature == "" || !hmac.Equal([]byte(ComputeBushaSignature(secret, body)), []byte(signature)) {
+		return ErrInvalidWebhookSignature
+	}
+	return nil
+}
+
 // VerifyWebhookSignature checks signatureHeader against body using a
 // constant-time compare — every provider callback must be
 // signature-verified, no exceptions (ARCHITECTURE.md §4, audit lesson #4).
 func VerifyWebhookSignature(secret string, body []byte, signatureHeader string) error {
+	if strings.TrimSpace(secret) == "" || signatureHeader == "" {
+		return ErrInvalidWebhookSignature
+	}
 	expected := ComputeWebhookSignature(secret, body)
 	if !hmac.Equal([]byte(expected), []byte(signatureHeader)) {
 		return ErrInvalidWebhookSignature
@@ -74,25 +83,63 @@ func VerifyWebhookSignature(secret string, body []byte, signatureHeader string) 
 // deposit; a 'confirmed' arriving before its 'detected' still lands
 // correctly since the row is created directly as 'confirmed' in that case.
 func (s *Store) HandleDepositWebhook(ctx context.Context, body []byte, signatureHeader string) error {
-	if err := VerifyWebhookSignature(s.bushaWebhookSecret, body, signatureHeader); err != nil {
+	provider, ok := s.providers["busha"]
+	if !ok || !provider.IsEnabled() {
+		return ErrInvalidWebhookSignature
+	}
+	if err := VerifyBushaSignature(s.bushaWebhookSecret, body, signatureHeader); err != nil {
 		return err
 	}
 
 	var payload bushaWebhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return fmt.Errorf("treasury: parse webhook payload: %w", err)
+		return fmt.Errorf("%w: malformed JSON", ErrInvalidDepositEvent)
 	}
-
-	reservationID, err := s.findReservationByProviderReference(ctx, payload.ProviderReference, payload.Address)
+	status, relevant, err := classifyBushaDeposit(payload)
 	if err != nil {
 		return err
 	}
-
-	status := "detected"
-	if payload.EventType == DepositEventConfirmed {
-		status = "confirmed"
+	if !relevant {
+		return nil
 	}
-	return s.recordDepositTransition(ctx, reservationID, status, payload.Amount, payload.TxReference, body)
+	transfer := payload.Data
+	reservationID, err := s.findReservationByProviderReference(ctx, transfer.ID)
+	if err != nil {
+		return err
+	}
+	r, err := s.GetReservation(ctx, reservationID)
+	if err != nil {
+		return err
+	}
+	if transfer.SourceCurrency != r.CryptoAsset || transfer.TargetCurrency != r.CryptoAsset ||
+		(transfer.PayIn.Network != "" && transfer.PayIn.Network != r.CryptoNetwork) ||
+		(transfer.PayIn.Address != "" && transfer.PayIn.Address != r.Address) ||
+		(transfer.PayIn.Type != "" && transfer.PayIn.Type != "address") {
+		return fmt.Errorf("%w: transfer does not match reservation", ErrInvalidDepositEvent)
+	}
+	// Transfer IDs are stable across processing, funds_received and completed;
+	// blockchain hashes are not present in every event. Never count one transfer twice.
+	return s.recordDepositTransition(ctx, reservationID, status, transfer.SourceAmount, transfer.ID, body)
+}
+
+func classifyBushaDeposit(payload bushaWebhookPayload) (string, bool, error) {
+	status := ""
+	want := ""
+	switch payload.EventType {
+	case DepositEventDetected:
+		status, want = "detected", "processing"
+	case DepositEventConfirmed:
+		status, want = "confirmed", "funds_received"
+	case "transfer.completed":
+		status, want = "confirmed", "completed"
+	default:
+		return "", false, nil // pending is not evidence of a deposit
+	}
+	t := payload.Data
+	if t.ID == "" || t.Status != want || !t.SourceAmount.IsPositive() || !t.SourceAmount.Equal(t.SourceAmount.Round(8)) || t.SourceCurrency == "" || t.TargetCurrency == "" {
+		return "", false, ErrInvalidDepositEvent
+	}
+	return status, true, nil
 }
 
 // recordDepositTransition is the shared state-machine step both the Busha
@@ -132,9 +179,9 @@ func (s *Store) recordDepositTransition(ctx context.Context, reservationID uuid.
 		// The row already existed (created by an earlier 'detected' write) and
 		// this call confirms it — compare-and-set, never a blind write.
 		tag, err := tx.Exec(ctx,
-			`UPDATE treasury_deposits SET status = 'confirmed', confirmed_at = $3, updated_at = now()
+			`UPDATE treasury_deposits SET status = 'confirmed', confirmed_at = $3, amount = $4, provider_payload = $5, updated_at = now()
 			 WHERE reservation_id = $1 AND tx_reference = $2 AND status = 'detected'`,
-			reservationID, txReference, now,
+			reservationID, txReference, now, amount, rawPayload,
 		)
 		if err != nil {
 			return fmt.Errorf("treasury: confirm deposit: %w", err)
@@ -167,13 +214,13 @@ func (s *Store) recordDepositTransition(ctx context.Context, reservationID uuid.
 	return tx.Commit(ctx)
 }
 
-func (s *Store) findReservationByProviderReference(ctx context.Context, providerReference, address string) (uuid.UUID, error) {
+func (s *Store) findReservationByProviderReference(ctx context.Context, providerReference string) (uuid.UUID, error) {
 	var id uuid.UUID
 	err := s.pool.QueryRow(ctx,
 		`SELECT id FROM treasury_address_reservations
-		 WHERE (provider_reference = $1 AND provider_reference <> '') OR address = $2
+		 WHERE provider_name = 'busha' AND provider_reference = $1 AND provider_reference <> ''
 		 ORDER BY reserved_at DESC LIMIT 1`,
-		providerReference, address,
+		providerReference,
 	).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrUnknownReservation

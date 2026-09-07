@@ -1,0 +1,661 @@
+{
+  "info": {
+    "name": "Payment Engine v2 — Sandbox",
+    "description": "Organized by actor: Admin (staff/ops), Tenant (portal + HMAC-authenticated self-service), Onboarding (one-time per-tenant setup: register -> KYB -> credentials). A 4th folder, 'Complete Transaction Flow (Ordered)', duplicates just the requests needed for one end-to-end transaction in actual call order — Admin/Tenant/Onboarding requests don't execute in a single valid sequence top-to-bottom on their own, since a real flow interleaves actors (e.g. corridor entitlement is an Admin call that must happen after Onboarding's KYB step but before Tenant's session creation). Run the 4th folder with Collection Runner for a full happy-path test; use the other three to browse/exercise the API by permission surface.\n\nAssumes SANDBOX_MODE=true (base URL http://localhost:3701/v2) — see docs/SANDBOX_PLAN.md and docs/TRANSACTION_FLOW.md.\n\nOne manual step: after 'Request Magic Link', the login token is only ever delivered by email (or readable directly from the tenant_magic_links table) — no API returns it. Paste it into the `magic_link_token` collection variable before running 'Verify Magic Link'.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:3701/v2" },
+    { "key": "admin_email", "value": "admin@example.com" },
+    { "key": "admin_password", "value": "changeme" },
+    { "key": "admin_token", "value": "" },
+    { "key": "tenant_name", "value": "Test Tenant" },
+    { "key": "tenant_email", "value": "test-tenant@example.com" },
+    { "key": "tenant_id", "value": "" },
+    { "key": "magic_link_token", "value": "" },
+    { "key": "portal_token", "value": "" },
+    { "key": "kyb_case_id", "value": "" },
+    { "key": "api_key", "value": "" },
+    { "key": "hmac_secret", "value": "" },
+    { "key": "corridor_id", "value": "" },
+    { "key": "crypto_asset", "value": "USDT" },
+    { "key": "crypto_network", "value": "SANDBOX" },
+    { "key": "fiat_currency", "value": "NGN" },
+    { "key": "fiat_amount", "value": "100.00" },
+    { "key": "session_id", "value": "" },
+    { "key": "webhook_url", "value": "https://example.com/webhooks/payment-engine" },
+    { "key": "x_timestamp", "value": "" },
+    { "key": "x_signature", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Admin",
+      "description": "Staff/ops surface — every request here needs `Authorization: Bearer {{admin_token}}` from 'Admin Login'. Admin can also perform onboarding steps directly (tenant creation, KYB resolution, scoped key issuance) as an alternative to the tenant self-service portal path.",
+      "item": [
+        {
+          "name": "Admin Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{admin_email}}\",\n  \"password\": \"{{admin_password}}\"\n}" },
+            "url": { "raw": "{{base_url}}/admin/login", "host": ["{{base_url}}"], "path": ["admin", "login"] },
+            "description": "Requires an admin already provisioned via `go run ./cmd/adminctl -email=... -password=...`. Returns an opaque bearer token (not a JWT)."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('login succeeded', () => pm.response.to.have.status(200));",
+              "if (json.token) { pm.collectionVariables.set('admin_token', json.token); pm.environment.set('admin_token', json.token); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "[Alt] Create Tenant (instead of self-service register)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "url": { "raw": "{{base_url}}/admin/tenants", "host": ["{{base_url}}"], "path": ["admin", "tenants"] },
+            "description": "Staff-initiated onboarding — functionally identical to Onboarding > Register Tenant (same underlying call, same 'pending_kyb' status), but returns tenant_id directly. The tenant still needs to complete portal magic-link login afterwards, since KYB can only be submitted through the portal."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('tenant created', () => pm.response.to.have.status(201));",
+              "if (json.id) { pm.collectionVariables.set('tenant_id', json.id); pm.environment.set('tenant_id', json.id); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "List Compliance Holds (KYB)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/compliance/holds?case_type=kyb",
+              "host": ["{{base_url}}"], "path": ["admin", "compliance", "holds"],
+              "query": [{ "key": "case_type", "value": "kyb" }]
+            },
+            "description": "Only relevant if Onboarding > Submit KYB didn't auto-approve (status came back 'hold' instead of 'approved' — won't happen in sandbox mode, whose compliance provider auto-approves everything). Lists cases awaiting manual review."
+          }
+        },
+        {
+          "name": "Resolve KYB Hold",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"approved\": true,\n  \"reason\": \"manual approval\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/admin/compliance/holds/{{kyb_case_id}}/resolve",
+              "host": ["{{base_url}}"], "path": ["admin", "compliance", "holds", "{{kyb_case_id}}", "resolve"]
+            },
+            "description": "Approving flips the tenant to 'active', unblocking API key issuance and corridor entitlement."
+          }
+        },
+        {
+          "name": "[Alt] Issue Scoped API Key (instead of unrestricted self-service key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"permissions\": [\"sessions:write\", \"sessions:read\"]\n}" },
+            "url": {
+              "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/api-keys",
+              "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "api-keys"]
+            },
+            "description": "Only path that can scope a key to specific permissions ('sessions:write'/'sessions:read' are the only two that exist today). Requires tenant_id and tenant status 'active' (KYB approved)."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('api key issued', () => pm.response.to.have.status(201));",
+              "if (json.api_key) { pm.collectionVariables.set('api_key', json.api_key); pm.environment.set('api_key', json.api_key); }",
+              "if (json.hmac_secret) { pm.collectionVariables.set('hmac_secret', json.hmac_secret); pm.environment.set('hmac_secret', json.hmac_secret); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "List Corridors",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/corridors?active=true",
+              "host": ["{{base_url}}"], "path": ["admin", "corridors"],
+              "query": [{ "key": "active", "value": "true" }]
+            },
+            "description": "In sandbox mode, USDT:SANDBOX:NGN is auto-seeded at boot (SANDBOX_CORRIDORS env var). There is no HTTP endpoint to create a corridor — only sandbox auto-seed or a direct migration/ops runbook."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('corridors listed', () => pm.response.to.have.status(200));",
+              "const list = Array.isArray(json) ? json : (json.corridors || json.items || []);",
+              "const match = list.find(c => c.crypto_asset === pm.collectionVariables.get('crypto_asset') && c.crypto_network === pm.collectionVariables.get('crypto_network') && c.fiat_currency === pm.collectionVariables.get('fiat_currency')) || list[0];",
+              "if (match && match.id) { pm.collectionVariables.set('corridor_id', match.id); pm.environment.set('corridor_id', match.id); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "Entitle Tenant to Corridor",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"active\": true,\n  \"fee_bps_override\": null\n}" },
+            "url": {
+              "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/corridors/{{corridor_id}}",
+              "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "corridors", "{{corridor_id}}"]
+            },
+            "description": "Gated on approved KYB covering the corridor's fiat_currency. Corridors existing globally does NOT mean a given tenant can trade on them — this per-tenant entitlement is a separate, required step."
+          }
+        },
+        {
+          "name": "[Alt] Set Webhook URL (Admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"url\": \"{{webhook_url}}\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/webhook",
+              "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "webhook"]
+            },
+            "description": "Staff-side alternative to Tenant > Set Webhook URL (Portal). Same SSRF-validated URL, same response shape."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Tenant",
+      "description": "Ongoing self-service actions once onboarding is complete. Portal-bearer requests need `Authorization: Bearer {{portal_token}}`; the transaction requests are HMAC-signed via X-API-Key/X-Timestamp/X-Signature, computed in each request's Pre-request Script from api_key + hmac_secret.",
+      "item": [
+        {
+          "name": "Set Webhook URL (Portal)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{portal_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"url\": \"{{webhook_url}}\"\n}" },
+            "url": { "raw": "{{base_url}}/portal/webhook", "host": ["{{base_url}}"], "path": ["portal", "webhook"] },
+            "description": "Optional — only needed to test outbound delivery notifications for session status changes. Response includes webhook_signing_secret only the first time it's generated."
+          }
+        },
+        {
+          "name": "Get Profile",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": { "raw": "{{base_url}}/portal/me", "host": ["{{base_url}}"], "path": ["portal", "me"] }
+          }
+        },
+        {
+          "name": "List API Keys",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": { "raw": "{{base_url}}/portal/api-keys", "host": ["{{base_url}}"], "path": ["portal", "api-keys"] },
+            "description": "Never re-exposes the secret — only useful for confirming a key exists / revoking it."
+          }
+        },
+        {
+          "name": "Ping (auth smoke test)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "url": { "raw": "{{base_url}}/ping", "host": ["{{base_url}}"], "path": ["ping"] },
+            "description": "Verifies HMAC signing is correct before attempting a real session — returns {\"tenant_id\": \"...\"}."
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'GET';",
+              "const path = '/v2/ping';",
+              "const timestamp = Date.now().toString();",
+              "const body = '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } }
+          ]
+        },
+        {
+          "name": "Create Session (Transaction)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"crypto_asset\": \"{{crypto_asset}}\",\n  \"crypto_network\": \"{{crypto_network}}\",\n  \"fiat_currency\": \"{{fiat_currency}}\",\n  \"fiat_amount\": \"{{fiat_amount}}\",\n  \"payout_destination\": {}\n}" },
+            "url": { "raw": "{{base_url}}/sessions", "host": ["{{base_url}}"], "path": ["sessions"] },
+            "description": "tenant_id comes from the HMAC-authenticated key, never the body. payout_destination is left empty because the sandbox corridor has no required_destination_fields configured; for a real corridor, check Admin > List Corridors' required_destination_fields for that corridor and fill this object accordingly. Response status will be 'pending' — in sandbox mode a background job auto-confirms the deposit ~10s later and settlement auto-completes shortly after, reaching 'settled' with no further action needed."
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'POST';",
+              "const path = '/v2/sessions';",
+              "const timestamp = Date.now().toString();",
+              "const body = pm.request.body && pm.request.body.mode === 'raw' ? pm.request.body.raw : '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } },
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('session created', () => pm.response.to.have.status(201));",
+              "if (json.id) { pm.collectionVariables.set('session_id', json.id); pm.environment.set('session_id', json.id); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "Get Session Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "url": { "raw": "{{base_url}}/sessions/{{session_id}}", "host": ["{{base_url}}"], "path": ["sessions", "{{session_id}}"] },
+            "description": "Re-run every few seconds after Create Session. Expected progression in sandbox mode: pending -> deposit_confirmed -> settled, over roughly 15-20 seconds total."
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'GET';",
+              "const path = '/v2/sessions/' + pm.collectionVariables.get('session_id');",
+              "const timestamp = Date.now().toString();",
+              "const body = '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } }
+          ]
+        },
+        {
+          "name": "List Settlements",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": { "raw": "{{base_url}}/portal/settlements", "host": ["{{base_url}}"], "path": ["portal", "settlements"] }
+          }
+        },
+        {
+          "name": "Get Balance",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/portal/balance?fiat_currency={{fiat_currency}}",
+              "host": ["{{base_url}}"], "path": ["portal", "balance"],
+              "query": [{ "key": "fiat_currency", "value": "{{fiat_currency}}" }]
+            },
+            "description": "fiat_currency query param is required (400 if omitted)."
+          }
+        },
+        {
+          "name": "List Notifications",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": { "raw": "{{base_url}}/portal/notifications", "host": ["{{base_url}}"], "path": ["portal", "notifications"] },
+            "description": "Outbound webhook delivery log — only populated if a webhook URL was configured."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding",
+      "description": "One-time per-tenant setup: register -> verify identity -> submit KYB -> get credentials. Ends once you have a working api_key/hmac_secret and an active tenant (corridor entitlement is a separate Admin step, since it's staff-gated, not tenant-initiated).",
+      "item": [
+        {
+          "name": "Register Tenant",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "url": { "raw": "{{base_url}}/portal/register", "host": ["{{base_url}}"], "path": ["portal", "register"] },
+            "description": "Public. Creates a tenant in 'pending_kyb' status. Returns 202 with no tenant_id — best-effort sends a magic-link email. Use Admin > [Alt] Create Tenant instead if you need tenant_id returned directly."
+          }
+        },
+        {
+          "name": "Request Magic Link",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "url": { "raw": "{{base_url}}/portal/login", "host": ["{{base_url}}"], "path": ["portal", "login"] },
+            "description": "Public, always returns 202 regardless of whether the email is registered (anti-enumeration). Sends a magic-link email IF Resend is configured (NOTIFICATION_EMAIL_PROVIDER=resend).\n\nMANUAL STEP: retrieve the raw token from the email, or read it from Postgres (only the sha256 hash is stored server-side, so the raw token must come from wherever it was actually sent/logged: SELECT * FROM tenant_magic_links ORDER BY created_at DESC LIMIT 1;). Paste it into the `magic_link_token` collection variable before running Verify Magic Link."
+          }
+        },
+        {
+          "name": "Verify Magic Link",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/portal/verify?token={{magic_link_token}}",
+              "host": ["{{base_url}}"], "path": ["portal", "verify"],
+              "query": [{ "key": "token", "value": "{{magic_link_token}}" }]
+            },
+            "description": "Exchanges the single-use magic-link token for a portal bearer session token. GET with a query param (not POST+body) because the email link must be directly clickable."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('verify succeeded', () => pm.response.to.have.status(200));",
+              "if (json.token) { pm.collectionVariables.set('portal_token', json.token); pm.environment.set('portal_token', json.token); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "Submit KYB",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{portal_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"submitted_data\": {\n    \"cac_registration_number\": \"RC1234567\",\n    \"tin\": \"12345678-0001\",\n    \"proof_of_business_address\": \"https://example.com/proof.pdf\",\n    \"business_description\": \"Sandbox test merchant\",\n    \"director_name\": \"Jane Doe\",\n    \"director_bvn\": \"22212345678\",\n    \"expected_transaction_volume\": \"1000000\"\n  },\n  \"declared_currencies\": [\"{{fiat_currency}}\"]\n}" },
+            "url": { "raw": "{{base_url}}/portal/kyb", "host": ["{{base_url}}"], "path": ["portal", "kyb"] },
+            "description": "Portal-only — there is no admin-side KYB submission path. In sandbox mode, jurisdiction requirements are seeded empty and the compliance provider auto-approves, so submitted_data content doesn't need to satisfy real NGN requirements — declared_currencies just needs to be non-empty and match the corridor's fiat_currency. On approval the tenant flips to 'active' immediately. If not auto-approved, use Admin > List Compliance Holds / Resolve KYB Hold."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('kyb submitted', () => pm.response.to.have.status(201));",
+              "if (json.ID) { pm.collectionVariables.set('kyb_case_id', json.ID); pm.environment.set('kyb_case_id', json.ID); }",
+              "if (json.ReferenceID) { pm.collectionVariables.set('tenant_id', json.ReferenceID); pm.environment.set('tenant_id', json.ReferenceID); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "Issue API Key (Portal)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "body": { "mode": "raw", "raw": "" },
+            "url": { "raw": "{{base_url}}/portal/api-keys", "host": ["{{base_url}}"], "path": ["portal", "api-keys"] },
+            "description": "No body. Only succeeds once the tenant is 'active' (KYB approved). Always issues an UNRESTRICTED key — use Admin > [Alt] Issue Scoped API Key for permission-scoped keys. Response shown once only — save api_key and hmac_secret now."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('api key issued', () => pm.response.to.have.status(201));",
+              "if (json.api_key) { pm.collectionVariables.set('api_key', json.api_key); pm.environment.set('api_key', json.api_key); }",
+              "if (json.hmac_secret) { pm.collectionVariables.set('hmac_secret', json.hmac_secret); pm.environment.set('hmac_secret', json.hmac_secret); }"
+            ] } }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Complete Transaction Flow (Ordered)",
+      "description": "Run this folder with Collection Runner, top to bottom, for one full onboarding-through-settlement test. Duplicates the requests above in actual call order — the Admin/Tenant/Onboarding folders are for reference/browsing and don't execute correctly as a single top-to-bottom run, since a real flow interleaves those three actors repeatedly. Pause after step 03 to paste the magic-link token.",
+      "item": [
+        {
+          "name": "01 · Admin Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{admin_email}}\",\n  \"password\": \"{{admin_password}}\"\n}" },
+            "url": { "raw": "{{base_url}}/admin/login", "host": ["{{base_url}}"], "path": ["admin", "login"] }
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('login succeeded', () => pm.response.to.have.status(200));",
+              "if (json.token) { pm.collectionVariables.set('admin_token', json.token); pm.environment.set('admin_token', json.token); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "02 · Register Tenant",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "url": { "raw": "{{base_url}}/portal/register", "host": ["{{base_url}}"], "path": ["portal", "register"] }
+          }
+        },
+        {
+          "name": "03 · Request Magic Link",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "url": { "raw": "{{base_url}}/portal/login", "host": ["{{base_url}}"], "path": ["portal", "login"] },
+            "description": "MANUAL STEP after this request: set the `magic_link_token` collection variable from the email/DB before continuing to step 04."
+          }
+        },
+        {
+          "name": "04 · Verify Magic Link",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/portal/verify?token={{magic_link_token}}",
+              "host": ["{{base_url}}"], "path": ["portal", "verify"],
+              "query": [{ "key": "token", "value": "{{magic_link_token}}" }]
+            }
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('verify succeeded', () => pm.response.to.have.status(200));",
+              "if (json.token) { pm.collectionVariables.set('portal_token', json.token); pm.environment.set('portal_token', json.token); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "05 · Submit KYB",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{portal_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"submitted_data\": {\n    \"cac_registration_number\": \"RC1234567\",\n    \"tin\": \"12345678-0001\",\n    \"proof_of_business_address\": \"https://example.com/proof.pdf\",\n    \"business_description\": \"Sandbox test merchant\",\n    \"director_name\": \"Jane Doe\",\n    \"director_bvn\": \"22212345678\",\n    \"expected_transaction_volume\": \"1000000\"\n  },\n  \"declared_currencies\": [\"{{fiat_currency}}\"]\n}" },
+            "url": { "raw": "{{base_url}}/portal/kyb", "host": ["{{base_url}}"], "path": ["portal", "kyb"] },
+            "description": "Auto-approves in sandbox mode — tenant becomes 'active' immediately."
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('kyb submitted', () => pm.response.to.have.status(201));",
+              "if (json.ID) { pm.collectionVariables.set('kyb_case_id', json.ID); pm.environment.set('kyb_case_id', json.ID); }",
+              "if (json.ReferenceID) { pm.collectionVariables.set('tenant_id', json.ReferenceID); pm.environment.set('tenant_id', json.ReferenceID); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "06 · Issue API Key",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "body": { "mode": "raw", "raw": "" },
+            "url": { "raw": "{{base_url}}/portal/api-keys", "host": ["{{base_url}}"], "path": ["portal", "api-keys"] }
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('api key issued', () => pm.response.to.have.status(201));",
+              "if (json.api_key) { pm.collectionVariables.set('api_key', json.api_key); pm.environment.set('api_key', json.api_key); }",
+              "if (json.hmac_secret) { pm.collectionVariables.set('hmac_secret', json.hmac_secret); pm.environment.set('hmac_secret', json.hmac_secret); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "07 · List Corridors",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{admin_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/admin/corridors?active=true",
+              "host": ["{{base_url}}"], "path": ["admin", "corridors"],
+              "query": [{ "key": "active", "value": "true" }]
+            }
+          },
+          "event": [
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('corridors listed', () => pm.response.to.have.status(200));",
+              "const list = Array.isArray(json) ? json : (json.corridors || json.items || []);",
+              "const match = list.find(c => c.crypto_asset === pm.collectionVariables.get('crypto_asset') && c.crypto_network === pm.collectionVariables.get('crypto_network') && c.fiat_currency === pm.collectionVariables.get('fiat_currency')) || list[0];",
+              "if (match && match.id) { pm.collectionVariables.set('corridor_id', match.id); pm.environment.set('corridor_id', match.id); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "08 · Entitle Tenant to Corridor",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"active\": true,\n  \"fee_bps_override\": null\n}" },
+            "url": {
+              "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/corridors/{{corridor_id}}",
+              "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "corridors", "{{corridor_id}}"]
+            }
+          }
+        },
+        {
+          "name": "09 · Ping (verify HMAC signing)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "url": { "raw": "{{base_url}}/ping", "host": ["{{base_url}}"], "path": ["ping"] }
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'GET';",
+              "const path = '/v2/ping';",
+              "const timestamp = Date.now().toString();",
+              "const body = '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } }
+          ]
+        },
+        {
+          "name": "10 · Create Session (the transaction)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"crypto_asset\": \"{{crypto_asset}}\",\n  \"crypto_network\": \"{{crypto_network}}\",\n  \"fiat_currency\": \"{{fiat_currency}}\",\n  \"fiat_amount\": \"{{fiat_amount}}\",\n  \"payout_destination\": {}\n}" },
+            "url": { "raw": "{{base_url}}/sessions", "host": ["{{base_url}}"], "path": ["sessions"] }
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'POST';",
+              "const path = '/v2/sessions';",
+              "const timestamp = Date.now().toString();",
+              "const body = pm.request.body && pm.request.body.mode === 'raw' ? pm.request.body.raw : '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } },
+            { "listen": "test", "script": { "exec": [
+              "const json = pm.response.json();",
+              "pm.test('session created', () => pm.response.to.have.status(201));",
+              "if (json.id) { pm.collectionVariables.set('session_id', json.id); pm.environment.set('session_id', json.id); }"
+            ] } }
+          ]
+        },
+        {
+          "name": "11 · Get Session Status (poll until settled)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-API-Key", "value": "{{api_key}}" },
+              { "key": "X-Timestamp", "value": "{{x_timestamp}}" },
+              { "key": "X-Signature", "value": "{{x_signature}}" }
+            ],
+            "url": { "raw": "{{base_url}}/sessions/{{session_id}}", "host": ["{{base_url}}"], "path": ["sessions", "{{session_id}}"] },
+            "description": "In Collection Runner this'll fire once — re-run it manually a few times a couple seconds apart until status is 'settled' (sandbox: pending -> deposit_confirmed -> settled, ~15-20s total)."
+          },
+          "event": [
+            { "listen": "prerequest", "script": { "exec": [
+              "const method = 'GET';",
+              "const path = '/v2/sessions/' + pm.collectionVariables.get('session_id');",
+              "const timestamp = Date.now().toString();",
+              "const body = '';",
+              "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+              "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+              "const secret = pm.collectionVariables.get('hmac_secret');",
+              "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+              "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+            ] } }
+          ]
+        },
+        {
+          "name": "12 · List Settlements",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": { "raw": "{{base_url}}/portal/settlements", "host": ["{{base_url}}"], "path": ["portal", "settlements"] }
+          }
+        },
+        {
+          "name": "13 · Get Balance",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{portal_token}}" }],
+            "url": {
+              "raw": "{{base_url}}/portal/balance?fiat_currency={{fiat_currency}}",
+              "host": ["{{base_url}}"], "path": ["portal", "balance"],
+              "query": [{ "key": "fiat_currency", "value": "{{fiat_currency}}" }]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

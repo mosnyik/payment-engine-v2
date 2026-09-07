@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/gateway"
 	"github.com/sirfi/payment-engine-v2/internal/session"
+	"github.com/sirfi/payment-engine-v2/internal/treasury"
 )
 
 // sessionHandlers implements Phase 5's tenant-facing surface. Both routes
@@ -25,18 +26,20 @@ type sessionHandlers struct {
 // consistent with ARCHITECTURE.md §5's rule that a tenant only ever sees a
 // generic status, never the specific screening reason behind a hold.
 type sessionResponse struct {
-	ID                   uuid.UUID  `json:"id"`
-	Status               string     `json:"status"`
-	FiatCurrency         string     `json:"fiat_currency"`
-	FiatAmount           string     `json:"fiat_amount"`
-	CryptoAsset          string     `json:"crypto_asset"`
-	CryptoNetwork        string     `json:"crypto_network"`
-	DepositReservationID *uuid.UUID `json:"deposit_reservation_id,omitempty"`
-	CreatedAt            string     `json:"created_at"`
+	DepositInstructions  *treasury.DepositInstructions `json:"deposit_instructions,omitempty"`
+	ID                   uuid.UUID                     `json:"id"`
+	Status               string                        `json:"status"`
+	FiatCurrency         string                        `json:"fiat_currency"`
+	FiatAmount           string                        `json:"fiat_amount"`
+	CryptoAsset          string                        `json:"crypto_asset"`
+	CryptoNetwork        string                        `json:"crypto_network"`
+	DepositReservationID *uuid.UUID                    `json:"deposit_reservation_id,omitempty"`
+	CreatedAt            string                        `json:"created_at"`
 }
 
 func toSessionResponse(s *session.Session) sessionResponse {
 	return sessionResponse{
+		DepositInstructions:  s.DepositInstructions,
 		ID:                   s.ID,
 		Status:               string(s.Status),
 		FiatCurrency:         s.FiatCurrency,
