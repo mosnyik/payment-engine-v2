@@ -335,6 +335,119 @@ func (s *Store) CreateCorridor(ctx context.Context, in UpsertCorridorInput, bind
 	return c, created, nil
 }
 
+// UpdateCorridor applies apply to the current corridor row and writes the
+// result back, holding a row lock for the whole read-modify-write so two
+// concurrent admin edits can't silently overwrite each other. apply gets a
+// copy of the current values and may mutate any field except ID and the
+// natural key (CryptoAsset/CryptoNetwork/FiatCurrency), which are never
+// written; returning an error aborts without writing. Returns the row as it
+// was before and after the update. ErrNotFound if id doesn't exist.
+func (s *Store) UpdateCorridor(ctx context.Context, id uuid.UUID, apply func(c *Corridor) error) (before, after *Corridor, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: update corridor: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	before, err = scanCorridor(tx.QueryRow(ctx,
+		`SELECT `+corridorColumns+` FROM corridors WHERE id = $1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: update corridor: %w", err)
+	}
+
+	next := *before
+	next.RequiredDestinationFields = append([]string(nil), before.RequiredDestinationFields...)
+	if err := apply(&next); err != nil {
+		return nil, nil, err
+	}
+	fields := next.RequiredDestinationFields
+	if fields == nil {
+		fields = []string{}
+	}
+
+	after, err = scanCorridor(tx.QueryRow(ctx,
+		`UPDATE corridors SET
+			active = $2,
+			min_amount_fiat = $3,
+			max_amount_fiat = $4,
+			travel_rule_threshold_fiat = $5,
+			travel_rule_window_seconds = $6,
+			compliance_hold_timeout_seconds = $7,
+			required_destination_fields = $8,
+			updated_at = now()
+		 WHERE id = $1
+		 RETURNING `+corridorColumns,
+		id, next.Active, next.MinAmountFiat, next.MaxAmountFiat, next.TravelRuleThresholdFiat,
+		int(next.TravelRuleWindow.Seconds()), int(next.ComplianceHoldTimeout.Seconds()), fields,
+	))
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: update corridor: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("corridor: update corridor: commit: %w", err)
+	}
+	return before, after, nil
+}
+
+// ReplaceProviderBindings makes bindings the corridor's complete set of
+// active provider bindings, in one transaction. Bindings not in the new set
+// are deactivated, not deleted, so their history and config survive and
+// re-adding one later reactivates the same row; bindings in the set are
+// (re)activated with the given priority, keeping any existing config.
+// Returns the resulting active bindings. ErrNotFound if the corridor
+// doesn't exist. Provider names are validated by the caller, as with
+// CreateCorridor.
+func (s *Store) ReplaceProviderBindings(ctx context.Context, corridorID uuid.UUID, bindings []NewProviderBinding) ([]ProviderBinding, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("corridor: replace provider bindings: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Locking the corridor row serializes concurrent replaces for the same
+	// corridor (and doubles as the existence check).
+	var locked uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT id FROM corridors WHERE id = $1 FOR UPDATE`, corridorID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("corridor: replace provider bindings: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE corridor_providers SET active = false WHERE corridor_id = $1`, corridorID,
+	); err != nil {
+		return nil, fmt.Errorf("corridor: replace provider bindings: deactivate: %w", err)
+	}
+
+	out := make([]ProviderBinding, 0, len(bindings))
+	for _, b := range bindings {
+		pb := ProviderBinding{CorridorID: corridorID, ProviderType: b.ProviderType, ProviderName: b.ProviderName, Priority: b.Priority, Active: true}
+		err := tx.QueryRow(ctx,
+			`INSERT INTO corridor_providers (corridor_id, provider_type, provider_name, priority, active)
+			 VALUES ($1, $2, $3, $4, true)
+			 ON CONFLICT (corridor_id, provider_type, provider_name) DO UPDATE SET
+				active = true,
+				priority = EXCLUDED.priority
+			 RETURNING id, config`,
+			corridorID, string(b.ProviderType), b.ProviderName, b.Priority,
+		).Scan(&pb.ID, &pb.Config)
+		if err != nil {
+			return nil, fmt.Errorf("corridor: replace provider bindings: upsert %s/%s: %w", b.ProviderType, b.ProviderName, err)
+		}
+		out = append(out, pb)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("corridor: replace provider bindings: commit: %w", err)
+	}
+	return out, nil
+}
+
 // isUniqueViolation detects a Postgres unique-constraint violation (SQLSTATE
 // 23505) — same helper shape internal/tenant already uses.
 func isUniqueViolation(err error) bool {

@@ -156,6 +156,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
 		admin.Post("/corridors", ch.createCorridor)
+		admin.Patch("/corridors/{corridorID}", ch.updateCorridor)
+		admin.Put("/corridors/{corridorID}/providers", ch.replaceProviders)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)
 		admin.Get("/settlements", sth.listSettlements)
