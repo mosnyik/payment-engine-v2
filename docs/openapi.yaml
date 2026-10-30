@@ -18,6 +18,8 @@ tags:
     description: Tenant-authenticated (API key + HMAC signature)
   - name: admin
     description: Admin-authenticated (bearer token from /admin/login)
+  - name: portal
+    description: Tenant self-service, portal session token (from /portal/verify)
   - name: webhooks
     description: Inbound, self-verified by provider signature
 
@@ -531,6 +533,77 @@ paths:
                 properties:
                   active: { type: boolean }
 
+  /portal/corridors:
+    get:
+      tags: [portal]
+      summary: "List active platform corridors with this tenant's entitlement state"
+      description: >
+        Corridors are platform config, managed by admins — a tenant can only
+        opt in to existing ones. Inactive corridors are not listed. Travel
+        Rule and compliance-hold settings are deliberately omitted from this
+        tenant-facing shape.
+      security: [{ portalAuth: [] }]
+      responses:
+        "200":
+          description: Corridors
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PortalCorridor" }
+        "401":
+          description: Missing or invalid portal session
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /portal/corridors/{corridorID}:
+    post:
+      tags: [portal]
+      summary: "Enable or disable a corridor for this tenant (self-service onboarding step 5)"
+      description: >
+        Self-service counterpart to POST /admin/tenants/{tenantID}/corridors/{corridorID}.
+        Enabling requires an active tenant whose approved KYB declared the
+        corridor's fiat currency, and is refused if an admin disabled this
+        entitlement (only an admin can re-grant it). A tenant cannot set a
+        fee override; an admin-set override is preserved. Disabling is
+        always allowed.
+      security: [{ portalAuth: [] }]
+      parameters:
+        - name: corridorID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+      responses:
+        "200":
+          description: Entitlement set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+        "400":
+          description: "Missing active field, invalid corridor ID, tenant not active, or no approved KYB covers the corridor's currency"
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "403":
+          description: Disabled by an admin; only an admin can re-enable it
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "404":
+          description: Corridor not found or not active
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
   /admin/tenants/{tenantID}/webhook:
     post:
       tags: [admin]
@@ -829,6 +902,10 @@ components:
       type: http
       scheme: bearer
       description: Token obtained from POST /admin/login.
+    portalAuth:
+      type: http
+      scheme: bearer
+      description: Portal session token obtained from GET /portal/verify (magic link).
 
   schemas:
     Error:
@@ -867,6 +944,19 @@ components:
         travel_rule_window_seconds: { type: integer }
         compliance_hold_timeout_seconds: { type: integer }
         required_destination_fields: { type: array, items: { type: string } }
+
+    PortalCorridor:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        crypto_asset: { type: string }
+        crypto_network: { type: string }
+        fiat_currency: { type: string }
+        min_amount_fiat: { type: string, nullable: true }
+        max_amount_fiat: { type: string, nullable: true }
+        required_destination_fields: { type: array, items: { type: string } }
+        entitled: { type: boolean, description: "Enabled for this tenant" }
+        disabled_by_admin: { type: boolean, description: "An admin switched it off; only an admin can re-enable it" }
 
     AdminSession:
       description: >

@@ -76,6 +76,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	ph := &portalHandlers{
 		tenant:       stores.tenant,
 		compliance:   stores.compliance,
+		corridor:     stores.corridor,
 		session:      stores.session,
 		settlement:   stores.settlement,
 		notification: stores.notification,
@@ -120,6 +121,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Get("/api-keys", ph.listAPIKeys)
 		portal.Post("/api-keys/{keyID}/revoke", ph.revokeAPIKey)
 		portal.Put("/webhook", ph.setWebhookURL)
+		portal.Get("/corridors", ph.listCorridors)
+		portal.Post("/corridors/{corridorID}", ph.setCorridorEntitlement)
 	})
 
 	// Public, unauthenticated — same tier as /admin/login, deliberately not

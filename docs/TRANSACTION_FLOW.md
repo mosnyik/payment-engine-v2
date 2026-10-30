@@ -4,13 +4,13 @@ A narrative companion to `ARCHITECTURE.md` — that doc records design decisions
 
 ## Phase 1 — Onboarding a tenant
 
-Tenant creation, credential issuance, and webhook config each have **two equally-real paths — admin-driven or tenant self-service** (`/v2/portal/...`, the tenant's own passwordless login, Phase 9a); both call the identical store method underneath, so which one ran is a business-process choice, not a different code path with different guarantees. KYB review and corridor entitlement stay admin-only — both are judgment calls, not paperwork:
+Tenant creation, credential issuance, corridor entitlement, and webhook config each have **two equally-real paths — admin-driven or tenant self-service** (`/v2/portal/...`, the tenant's own passwordless login, Phase 9a); both call the identical store method underneath, so which one ran is a business-process choice, not a different code path with different guarantees. KYB review stays admin-only — it's a judgment call, not paperwork. Corridor entitlement is the one exception to "identical store method": the self-service path is narrower (see step 5):
 
 1. **`POST /admin/tenants`** `{name, email}` (staff-initiated) **or `POST /portal/register`** `{name, email}` (self-service, Phase 9a — also auto-sends the login magic link) → both call `tenant.RegisterTenant`, creating an identical tenant record with a `contact_email`. Either way, can't call the API yet, and can't submit KYB either until it logs into the portal.
 2. **Portal login + KYB submission** — **portal-only, never admin-submitted on the tenant's behalf** (Phase 12), regardless of which path created the record: the tenant requests a magic link (`POST /portal/login`), redeems it by clicking the emailed link (`GET /portal/verify?token=...`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
 3. **KYB review** — **admin-only, no self-service path** → automated provider decision, or if no provider is configured for that case, it drops into the manual hold queue — `GET /admin/compliance/holds` / `POST /admin/compliance/holds/{caseID}/resolve`, an analyst approves or rejects.
 4. **`POST /admin/tenants/{tenantID}/api-keys`** (staff-initiated) **or `POST /portal/api-keys`** (self-service, Phase 9a) → both call `tenant.IssueAPIKey`, only reachable after KYB clears (`status == active`) either way. Issues the tenant's API key + HMAC secret (mTLS cert registration stays admin-only). **This is the gate** — nothing below is callable before this.
-5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** — **admin-only, no self-service path** → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected.
+5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** (staff-initiated) **or `POST /portal/corridors/{corridorID}`** `{active}` (self-service; `GET /portal/corridors` lists what's available) → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected. Corridors themselves are platform config — tenants only opt in to existing, active ones, never create them. Both paths enforce the same jurisdiction gate (an approved KYB case must declare the corridor's fiat currency). The self-service path additionally: can't set `fee_bps_override` (and leaves an admin-set one intact), requires `status == active`, and can't re-enable an entitlement an admin revoked (`disabled_by_admin`, 403) — only an admin re-grant lifts that.
 6. **`POST /admin/tenants/{tenantID}/webhook`** (staff-initiated) **or `PUT /portal/webhook`** (self-service, Phase 9a) → tenant's callback URL, SSRF-validated (private/loopback ranges rejected) either way.
 
 Only after step 4 can the tenant call anything at all; only after step 5 can they use a given corridor.
@@ -54,13 +54,18 @@ sequenceDiagram
     end
     note over TenantM: both call IssueAPIKey(tenantID) — gated on status == active either way
 
-    Ops->>TenantM: POST /admin/tenants/{id}/corridors/{corridorID}
+    alt admin-granted
+        Ops->>TenantM: POST /admin/tenants/{id}/corridors/{corridorID}
+    else self-service
+        Rep->>TenantM: POST /portal/corridors/{corridorID} {active: true}
+        note over TenantM: refused (403) if disabled_by_admin; never sets fee_bps_override
+    end
     TenantM->>Corridor: FiatCurrencyForCorridor(corridorID)
     TenantM->>Compliance: IsJurisdictionApproved(tenantID, fiatCurrency)
     alt approved KYB case covers that currency
-        TenantM-->>Ops: entitlement granted — admin-only, no self-service path
+        TenantM-->>Ops: entitlement granted
     else not covered
-        TenantM-->>Ops: 422 — jurisdiction not approved
+        TenantM-->>Ops: 400 — jurisdiction not approved
     end
 
     alt admin-configured

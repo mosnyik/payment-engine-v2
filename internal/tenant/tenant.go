@@ -98,6 +98,13 @@ var (
 	// corridor's fiat currency — the corridor's jurisdiction was never
 	// cleared, so the entitlement can't activate.
 	ErrJurisdictionNotApproved = errors.New("tenant: jurisdiction not approved by KYB")
+	// ErrEntitlementDisabledByAdmin is returned by EnableCorridorSelfService
+	// when an admin switched this entitlement off — only an admin can turn
+	// it back on.
+	ErrEntitlementDisabledByAdmin = errors.New("tenant: corridor disabled by an admin")
+	// ErrTenantNotActive is returned by EnableCorridorSelfService for a
+	// tenant that hasn't cleared KYB yet (or was suspended).
+	ErrTenantNotActive = errors.New("tenant: tenant is not active")
 )
 
 type Tenant struct {
@@ -705,14 +712,17 @@ func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uu
 }
 
 // SetCorridorEntitlement grants or revokes a tenant's access to a corridor,
-// with an optional per-corridor fee override.
+// with an optional per-corridor fee override. This is the admin path: a
+// revoke here marks the row disabled_by_admin, which blocks the tenant from
+// re-enabling it via EnableCorridorSelfService; a grant clears it.
 func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, active bool, feeBpsOverride *int) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, fee_bps_override)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, fee_bps_override, disabled_by_admin)
+		 VALUES ($1, $2, $3, $4, NOT $3)
 		 ON CONFLICT (tenant_id, corridor_id) DO UPDATE SET
 			active = EXCLUDED.active,
-			fee_bps_override = EXCLUDED.fee_bps_override`,
+			fee_bps_override = EXCLUDED.fee_bps_override,
+			disabled_by_admin = EXCLUDED.disabled_by_admin`,
 		tenantID, corridorID, active, feeBpsOverride,
 	)
 	if err != nil {
@@ -730,24 +740,119 @@ func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID
 // should call SetCorridorEntitlement(ctx, tenantID, corridorID, false, ...)
 // directly, since a compliance check has no bearing on turning access off.
 func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, feeBpsOverride *int) error {
+	if err := s.checkCorridorJurisdiction(ctx, tenantID, corridorID); err != nil {
+		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+	}
+	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, feeBpsOverride)
+}
+
+// checkCorridorJurisdiction is the Phase 10 compliance gate shared by the
+// admin grant and the tenant self-service enable: the tenant must hold an
+// approved KYB case covering the corridor's fiat currency.
+func (s *Store) checkCorridorJurisdiction(ctx context.Context, tenantID, corridorID uuid.UUID) error {
 	if s.fiatLookup == nil || s.jurisdictionChecker == nil {
 		return errors.New("tenant: jurisdiction gate not configured — call SetJurisdictionGate at startup")
 	}
 
 	fiatCurrency, err := s.fiatLookup.FiatCurrencyForCorridor(ctx, corridorID)
 	if err != nil {
-		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+		return err
 	}
 
 	approved, err := s.jurisdictionChecker.IsJurisdictionApproved(ctx, tenantID, fiatCurrency)
 	if err != nil {
-		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+		return err
 	}
 	if !approved {
 		return fmt.Errorf("%w: no approved KYB case covers %s", ErrJurisdictionNotApproved, fiatCurrency)
 	}
+	return nil
+}
 
-	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, feeBpsOverride)
+// EnableCorridorSelfService is the tenant portal's counterpart to
+// GrantCorridorEntitlement: same tenant-status and jurisdiction gates, but
+// it never touches fee_bps_override (a tenant must not set its own fee, and
+// an admin-set override survives a tenant re-enable), and it refuses a row
+// an admin disabled — the conditional upsert makes that check and the write
+// one atomic statement.
+func (s *Store) EnableCorridorSelfService(ctx context.Context, tenantID, corridorID uuid.UUID) error {
+	t, err := s.GetTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if t.Status != StatusActive {
+		return fmt.Errorf("%w: status %q", ErrTenantNotActive, t.Status)
+	}
+	if err := s.checkCorridorJurisdiction(ctx, tenantID, corridorID); err != nil {
+		return fmt.Errorf("tenant: enable corridor: %w", err)
+	}
+
+	var id uuid.UUID
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active)
+		 VALUES ($1, $2, true)
+		 ON CONFLICT (tenant_id, corridor_id) DO UPDATE SET active = true
+		 WHERE NOT tenant_corridor_entitlements.disabled_by_admin
+		 RETURNING id`,
+		tenantID, corridorID,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrEntitlementDisabledByAdmin
+	}
+	if err != nil {
+		return fmt.Errorf("tenant: enable corridor: %w", err)
+	}
+	return nil
+}
+
+// DisableCorridorSelfService switches off the tenant's own entitlement.
+// Always allowed, never marks the row disabled_by_admin (the tenant can
+// re-enable it later), and a no-op when no entitlement exists.
+func (s *Store) DisableCorridorSelfService(ctx context.Context, tenantID, corridorID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tenant_corridor_entitlements SET active = false
+		 WHERE tenant_id = $1 AND corridor_id = $2`,
+		tenantID, corridorID,
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: disable corridor: %w", err)
+	}
+	return nil
+}
+
+// CorridorEntitlement is one tenant_corridor_entitlements row, as the
+// tenant portal reports it.
+type CorridorEntitlement struct {
+	CorridorID      uuid.UUID
+	Active          bool
+	DisabledByAdmin bool
+}
+
+// ListCorridorEntitlements returns every entitlement row the tenant has,
+// keyed by corridor ID — a corridor with no row was never enabled.
+func (s *Store) ListCorridorEntitlements(ctx context.Context, tenantID uuid.UUID) (map[uuid.UUID]CorridorEntitlement, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT corridor_id, active, disabled_by_admin
+		 FROM tenant_corridor_entitlements WHERE tenant_id = $1`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("tenant: list corridor entitlements: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]CorridorEntitlement)
+	for rows.Next() {
+		var e CorridorEntitlement
+		if err := rows.Scan(&e.CorridorID, &e.Active, &e.DisabledByAdmin); err != nil {
+			return nil, fmt.Errorf("tenant: list corridor entitlements: scan: %w", err)
+		}
+		out[e.CorridorID] = e
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("tenant: list corridor entitlements: %w", err)
+	}
+	return out, nil
 }
 
 // CheckEntitlement reports whether a tenant may use a corridor. No row at

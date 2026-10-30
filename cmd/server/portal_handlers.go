@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/sirfi/payment-engine-v2/internal/compliance"
+	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/session"
@@ -28,6 +29,7 @@ import (
 type portalHandlers struct {
 	tenant       *tenant.Store
 	compliance   *compliance.Store
+	corridor     *corridor.Store
 	session      *session.Store
 	settlement   *settlement.Store
 	notification *notification.Store
@@ -475,4 +477,130 @@ func (h *portalHandlers) setWebhookURL(w http.ResponseWriter, r *http.Request) {
 		resp["webhook_signing_secret"] = signingSecret
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// portalCorridorResponse is the tenant-facing corridor shape — deliberately
+// narrower than admin_browse_handlers.go's corridorResponse: no Travel Rule
+// threshold/window or compliance hold timeout, since a tenant knowing the
+// exact reporting threshold is exactly what makes structuring under it easy.
+type portalCorridorResponse struct {
+	ID                        uuid.UUID `json:"id"`
+	CryptoAsset               string    `json:"crypto_asset"`
+	CryptoNetwork             string    `json:"crypto_network"`
+	FiatCurrency              string    `json:"fiat_currency"`
+	MinAmountFiat             *string   `json:"min_amount_fiat,omitempty"`
+	MaxAmountFiat             *string   `json:"max_amount_fiat,omitempty"`
+	RequiredDestinationFields []string  `json:"required_destination_fields,omitempty"`
+	Entitled                  bool      `json:"entitled"`
+	DisabledByAdmin           bool      `json:"disabled_by_admin"`
+}
+
+func toPortalCorridorResponse(c *corridor.Corridor, e tenant.CorridorEntitlement) portalCorridorResponse {
+	resp := portalCorridorResponse{
+		ID:                        c.ID,
+		CryptoAsset:               c.CryptoAsset,
+		CryptoNetwork:             c.CryptoNetwork,
+		FiatCurrency:              c.FiatCurrency,
+		RequiredDestinationFields: c.RequiredDestinationFields,
+		Entitled:                  e.Active,
+		DisabledByAdmin:           e.DisabledByAdmin,
+	}
+	if c.MinAmountFiat != nil {
+		s := c.MinAmountFiat.String()
+		resp.MinAmountFiat = &s
+	}
+	if c.MaxAmountFiat != nil {
+		s := c.MaxAmountFiat.String()
+		resp.MaxAmountFiat = &s
+	}
+	return resp
+}
+
+// GET /v2/portal/corridors — every active platform corridor, each flagged
+// with whether this tenant has it enabled. Corridors themselves are
+// platform config (admin-managed); a tenant only opts in to existing ones.
+func (h *portalHandlers) listCorridors(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := portalTenantID(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
+		return
+	}
+	corridors, _, err := h.corridor.ListCorridors(r.Context(), true, 0, 0)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	entitlements, err := h.tenant.ListCorridorEntitlements(r.Context(), tenantID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	resp := make([]portalCorridorResponse, len(corridors))
+	for i := range corridors {
+		resp[i] = toPortalCorridorResponse(&corridors[i], entitlements[corridors[i].ID])
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// POST /v2/portal/corridors/{corridorID} {"active": true|false} — tenant
+// self-service counterpart to adminHandlers.setCorridorEntitlement. Enabling
+// is gated on an active tenant whose approved KYB covers the corridor's
+// currency, and refused (403) if an admin disabled it; fee_bps_override is
+// admin-only and not accepted here. Disabling is always allowed.
+func (h *portalHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := portalTenantID(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
+		return
+	}
+	corridorID, err := uuid.Parse(chi.URLParam(r, "corridorID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	var req struct {
+		Active *bool `json:"active"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Active == nil {
+		writeErr(w, http.StatusBadRequest, errors.New("active is required"))
+		return
+	}
+
+	// Inactive corridors are invisible to tenants (listCorridors filters
+	// them out), so enabling or disabling one is a 404, not a 400.
+	c, err := h.corridor.GetCorridorByID(r.Context(), corridorID)
+	if errors.Is(err, corridor.ErrNotFound) || (err == nil && !c.Active) {
+		writeErr(w, http.StatusNotFound, corridor.ErrNotFound)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if !*req.Active {
+		if err := h.tenant.DisableCorridorSelfService(r.Context(), tenantID, corridorID); err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"active": false})
+		return
+	}
+
+	err = h.tenant.EnableCorridorSelfService(r.Context(), tenantID, corridorID)
+	switch {
+	case errors.Is(err, tenant.ErrEntitlementDisabledByAdmin):
+		writeErr(w, http.StatusForbidden, err)
+	case errors.Is(err, tenant.ErrJurisdictionNotApproved), errors.Is(err, tenant.ErrTenantNotActive):
+		writeErr(w, http.StatusBadRequest, err)
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]bool{"active": true})
+	}
 }
