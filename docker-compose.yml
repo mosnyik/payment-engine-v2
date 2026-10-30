@@ -16,4 +16,4 @@ services:
       - .env
     network_mode: host
     environment:
-      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+      COINMARKETCAP_API_KEY: ${COINMARKETCAP_API_KEY:-}

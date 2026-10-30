@@ -46,26 +46,26 @@ func TestComputeAndPersistCurrentRate_PersistsTheWinningQuote(t *testing.T) {
 	}
 }
 
-// TestComputeAndPersistCurrentRate_CoinGeckoIsPartOfTheSelection proves
+// TestComputeAndPersistCurrentRate_CoinMarketCapIsPartOfTheSelection proves
 // providers.go's readOnlyProvider is actually wired into GetBestQuote's
 // provider list — a provider_rates row written the way cmd/ratefetcher
-// writes it (UpsertProviderRate, provider=ProviderCoinGecko) competes on
+// writes it (UpsertProviderRate, provider=ProviderCoinMarketCap) competes on
 // equal footing with the system ceiling, without CurrentRateJob (or
-// anything else) ever making a live call to CoinGecko itself.
-func TestComputeAndPersistCurrentRate_CoinGeckoIsPartOfTheSelection(t *testing.T) {
+// anything else) ever making a live call to CoinMarketCap itself.
+func TestComputeAndPersistCurrentRate_CoinMarketCapIsPartOfTheSelection(t *testing.T) {
 	pool := openTestPool(t)
 	ctx := context.Background()
 	s := newStoreWithNoExternalProviders(pool)
 
 	fiat := uniqueFiat(t)
-	// System ceiling higher than CoinGecko's quote — selectBest picks the
+	// System ceiling higher than CoinMarketCap's quote — selectBest picks the
 	// lower one (ARCHITECTURE.md §7: the system rate can only push the
 	// locked rate down, external providers can win when they're lower).
 	if err := s.SetSystemRate(ctx, fiat, decimal.NewFromInt(2000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
 	if err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
-		Provider:  rate.ProviderCoinGecko,
+		Provider:  rate.ProviderCoinMarketCap,
 		Rate:      decimal.NewFromInt(1600),
 		FetchedAt: time.Now(),
 	}, fiat); err != nil {
@@ -76,8 +76,8 @@ func TestComputeAndPersistCurrentRate_CoinGeckoIsPartOfTheSelection(t *testing.T
 	if err != nil {
 		t.Fatalf("compute and persist current rate: %v", err)
 	}
-	if cr.Provider != rate.ProviderCoinGecko {
-		t.Fatalf("expected coingecko (the lower quote) to win, got %q", cr.Provider)
+	if cr.Provider != rate.ProviderCoinMarketCap {
+		t.Fatalf("expected coinmarketcap (the lower quote) to win, got %q", cr.Provider)
 	}
 	if !cr.Rate.Equal(decimal.NewFromInt(1600)) {
 		t.Fatalf("expected rate 1600, got %s", cr.Rate)

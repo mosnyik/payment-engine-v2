@@ -1,6 +1,6 @@
 // The persisted "best rate" pipeline: CurrentRateJob periodically computes
 // GetBestQuote (system_rates ceiling vs. every enabled provider's quote,
-// including CoinGecko via cmd/ratefetcher's provider_rates writes) and
+// including CoinMarketCap via cmd/ratefetcher's provider_rates writes) and
 // persists the result into current_rates. LockRate and the public
 // GET /v2/rate/{fiatCurrency} endpoint both read that one persisted value
 // rather than each re-deriving their own live selection.

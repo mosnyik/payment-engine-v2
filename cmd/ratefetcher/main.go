@@ -1,7 +1,7 @@
 // Command ratefetcher is a standalone service, deployed as its own
 // container independent of cmd/server (no shared process, no startup-order
 // dependency on it — only on Postgres being reachable). It fetches the
-// USD/<fiat> rate from CoinGecko (coingecko.go) on a fixed interval and
+// USD/<fiat> rate from CoinMarketCap (coinmarketcap.go) on a fixed interval and
 // persists it into provider_rates via rate.UpsertProviderRate — the same
 // table/upsert path the main app's own in-process rate.FetchJob already
 // uses for other providers (see internal/rate/rate.go's package doc
@@ -24,11 +24,11 @@ import (
 )
 
 type config struct {
-	databaseURL     string
-	coinGeckoAPIURL string
-	coinGeckoAPIKey string
-	fiatCurrency    string
-	fetchInterval   time.Duration
+	databaseURL         string
+	coinMarketCapAPIURL string
+	coinMarketCapAPIKey string
+	fiatCurrency        string
+	fetchInterval       time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -36,22 +36,27 @@ func loadConfig() (config, error) {
 	if databaseURL == "" {
 		return config{}, fmt.Errorf("ratefetcher: DATABASE_URL is required")
 	}
+	// Same variable cmd/server reads for asset pricing — one key serves both.
+	coinMarketCapAPIKey := os.Getenv("COINMARKETCAP_API_KEY")
+	if coinMarketCapAPIKey == "" {
+		return config{}, fmt.Errorf("ratefetcher: COINMARKETCAP_API_KEY is required")
+	}
 
 	fetchInterval := 20 * time.Minute
-	if v := os.Getenv("COINGECKO_FETCH_INTERVAL"); v != "" {
+	if v := os.Getenv("RATEFETCHER_FETCH_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return config{}, fmt.Errorf("ratefetcher: COINGECKO_FETCH_INTERVAL: invalid duration %q: %w", v, err)
+			return config{}, fmt.Errorf("ratefetcher: RATEFETCHER_FETCH_INTERVAL: invalid duration %q: %w", v, err)
 		}
 		fetchInterval = d
 	}
 
 	return config{
-		databaseURL:     databaseURL,
-		coinGeckoAPIURL: stringOrDefault("COINGECKO_API_URL", "https://api.coingecko.com/api/v3"),
-		coinGeckoAPIKey: os.Getenv("COINGECKO_API_KEY"),
-		fiatCurrency:    stringOrDefault("COINGECKO_FIAT_CURRENCY", "NGN"),
-		fetchInterval:   fetchInterval,
+		databaseURL:         databaseURL,
+		coinMarketCapAPIURL: stringOrDefault("COINMARKETCAP_API_URL", "https://pro-api.coinmarketcap.com"),
+		coinMarketCapAPIKey: coinMarketCapAPIKey,
+		fiatCurrency:        stringOrDefault("RATEFETCHER_FIAT_CURRENCY", "NGN"),
+		fetchInterval:       fetchInterval,
 	}, nil
 }
 
@@ -93,9 +98,9 @@ func run() error {
 	}
 	log.Println("ratefetcher: db connected, migrations applied")
 
-	client := newCoinGeckoClient(cfg.coinGeckoAPIURL, cfg.coinGeckoAPIKey)
+	client := newCoinMarketCapClient(cfg.coinMarketCapAPIURL, cfg.coinMarketCapAPIKey)
 
-	log.Printf("ratefetcher: fetching %s/USD from coingecko every %s", cfg.fiatCurrency, cfg.fetchInterval)
+	log.Printf("ratefetcher: fetching %s/USD from coinmarketcap every %s", cfg.fiatCurrency, cfg.fetchInterval)
 	runFetchLoop(ctx, pool, client, cfg.fiatCurrency, cfg.fetchInterval)
 	log.Println("ratefetcher: shutting down")
 	return nil
@@ -106,7 +111,7 @@ func run() error {
 // rate.FetchJob.Run already establishes), then every interval. A single
 // failed fetch is logged and never crashes the process — the next tick
 // tries again.
-func runFetchLoop(ctx context.Context, pool *db.Pool, client *coinGeckoClient, fiatCurrency string, interval time.Duration) {
+func runFetchLoop(ctx context.Context, pool *db.Pool, client *coinMarketCapClient, fiatCurrency string, interval time.Duration) {
 	fetchOnce(ctx, pool, client, fiatCurrency)
 
 	ticker := time.NewTicker(interval)
@@ -121,7 +126,7 @@ func runFetchLoop(ctx context.Context, pool *db.Pool, client *coinGeckoClient, f
 	}
 }
 
-func fetchOnce(ctx context.Context, pool *db.Pool, client *coinGeckoClient, fiatCurrency string) {
+func fetchOnce(ctx context.Context, pool *db.Pool, client *coinMarketCapClient, fiatCurrency string) {
 	rateValue, err := client.FetchUSDFiatRate(ctx, fiatCurrency)
 	if err != nil {
 		log.Printf("ratefetcher: fetch %s rate: %v", fiatCurrency, err)
@@ -130,7 +135,7 @@ func fetchOnce(ctx context.Context, pool *db.Pool, client *coinGeckoClient, fiat
 
 	fetchedAt := time.Now()
 	err = rate.UpsertProviderRate(ctx, pool, rate.Quote{
-		Provider:  rate.ProviderCoinGecko,
+		Provider:  rate.ProviderCoinMarketCap,
 		Rate:      rateValue,
 		FetchedAt: fetchedAt,
 	}, fiatCurrency)
@@ -138,5 +143,5 @@ func fetchOnce(ctx context.Context, pool *db.Pool, client *coinGeckoClient, fiat
 		log.Printf("ratefetcher: store %s rate: %v", fiatCurrency, err)
 		return
 	}
-	log.Printf("ratefetcher: %s/USD = %s (coingecko)", fiatCurrency, rateValue)
+	log.Printf("ratefetcher: %s/USD = %s (coinmarketcap)", fiatCurrency, rateValue)
 }

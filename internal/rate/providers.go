@@ -19,9 +19,9 @@ import (
 
 // maxStaleAge rejects a cached provider rate older than this — the fetch
 // job has either stopped running or that provider has been failing. 25
-// minutes, not 5: cmd/ratefetcher (readOnlyProvider/CoinGecko, below)
+// minutes, not 5: cmd/ratefetcher (readOnlyProvider/CoinMarketCap, below)
 // writes on a 20-minute cadence, so this must comfortably exceed that or a
-// perfectly healthy CoinGecko row would spend most of its life looking
+// perfectly healthy CoinMarketCap row would spend most of its life looking
 // stale between two of its own writes. Busha/LiquidRamp/Anchor's
 // in-process 30s FetchJob cadence is unaffected either way — they're
 // disabled TODO stubs today.
@@ -134,7 +134,7 @@ func fetchCachedProviderRate(ctx context.Context, pool *db.Pool, name, fiatCurre
 // drives LiveFetcher-implementing providers) never tries to duplicate a
 // live HTTP call this provider's data-gathering already happens elsewhere
 // for (cmd/ratefetcher, a wholly separate process/container, for
-// ProviderCoinGecko). Always enabled: if nothing has written its row yet,
+// ProviderCoinMarketCap). Always enabled: if nothing has written its row yet,
 // FetchRate fails the same way any other provider's does, and
 // GetAllQuotes already treats a single failing provider as skippable, not
 // fatal.

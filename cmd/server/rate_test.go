@@ -58,7 +58,7 @@ func TestGetRate_PublicEndpointReturnsPersistedCurrentRate(t *testing.T) {
 	// live dev database.
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
 	if err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
-		Provider:  rate.ProviderCoinGecko,
+		Provider:  rate.ProviderCoinMarketCap,
 		Rate:      decimal.RequireFromString("1354.735"),
 		FetchedAt: time.Now(),
 	}, fiatCurrency); err != nil {
@@ -88,7 +88,7 @@ func TestGetRate_PublicEndpointReturnsPersistedCurrentRate(t *testing.T) {
 func TestGetRate_SystemRateWinsWhenNoExternalProviderAvailable(t *testing.T) {
 	// Proves the full pipeline end to end over HTTP: system_rates is a
 	// legitimate winning input to GetBestQuote (the "ceiling" — see
-	// ARCHITECTURE.md §7), not just CoinGecko, and CurrentRateJob's compute
+	// ARCHITECTURE.md §7), not just CoinMarketCap, and CurrentRateJob's compute
 	// step is what makes that selection visible to this public endpoint.
 	srv, stores, _ := newRateTestServer(t)
 	client := srv.Client()
