@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/ratefetcher ./cmd/ratefetcher
 
 # alpine, not scratch/distroless: db.Migrate needs migrations/ on disk at a
-# relative path, and CA certs are needed for HTTPS calls to CoinGecko.
+# relative path, and CA certs are needed for HTTPS calls to CoinMarketCap.
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
