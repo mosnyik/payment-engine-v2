@@ -121,6 +121,13 @@ type Store struct {
 	bus *eventbus.Bus
 }
 
+// HasProvider reports whether name is a registered settlement adapter
+// (enabled or not) — the admin corridor-create endpoint's binding check.
+func (s *Store) HasProvider(name string) bool {
+	_, ok := s.providers[name]
+	return ok
+}
+
 func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, feeResolver FeeResolver, cfg Config) *Store {
 	cngn := newCNGNProvider(cfg.CNGN)
 	flutterwave := newFlutterwaveProvider(cfg.Flutterwave)

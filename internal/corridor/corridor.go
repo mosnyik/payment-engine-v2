@@ -25,6 +25,10 @@ var (
 	// tenant-supplied payout destination is missing a field this corridor
 	// requires (ARCHITECTURE.md §8 "Payout destination").
 	ErrDestinationInvalid = errors.New("corridor: payout destination invalid")
+	// ErrAlreadyExists is returned by CreateCorridor when a corridor with the
+	// same (crypto_asset, crypto_network, fiat_currency) already exists, or
+	// when one of its provider bindings is duplicated.
+	ErrAlreadyExists = errors.New("corridor: already exists")
 )
 
 type Corridor struct {
@@ -253,6 +257,92 @@ func (s *Store) UpsertCorridor(ctx context.Context, in UpsertCorridorInput) (uui
 		return uuid.Nil, fmt.Errorf("corridor: upsert corridor: %w", err)
 	}
 	return id, nil
+}
+
+// NewProviderBinding is one provider binding passed to CreateCorridor.
+type NewProviderBinding struct {
+	ProviderType ProviderType
+	ProviderName string
+	Priority     int
+}
+
+// CreateCorridor inserts a new corridor and its provider bindings in one
+// transaction — the admin API's create path. Unlike UpsertCorridor it never
+// overwrites: an existing corridor with the same natural key is
+// ErrAlreadyExists, so a create can't silently replace a live corridor's
+// limits or compliance thresholds. Provider names are not validated here
+// (this package doesn't know which adapters exist); the caller does that.
+func (s *Store) CreateCorridor(ctx context.Context, in UpsertCorridorInput, bindings []NewProviderBinding) (*Corridor, []ProviderBinding, error) {
+	fields := in.RequiredDestinationFields
+	if fields == nil {
+		fields = []string{}
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: create corridor: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	c, err := scanCorridor(tx.QueryRow(ctx,
+		`INSERT INTO corridors (
+			crypto_asset, crypto_network, fiat_currency, active,
+			min_amount_fiat, max_amount_fiat, travel_rule_threshold_fiat,
+			travel_rule_window_seconds, compliance_hold_timeout_seconds,
+			required_destination_fields
+		 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 RETURNING `+corridorColumns,
+		in.CryptoAsset, in.CryptoNetwork, in.FiatCurrency, in.Active,
+		in.MinAmountFiat, in.MaxAmountFiat, in.TravelRuleThresholdFiat,
+		int(in.TravelRuleWindow.Seconds()), int(in.ComplianceHoldTimeout.Seconds()),
+		fields,
+	))
+	if isUniqueViolation(err) {
+		return nil, nil, fmt.Errorf("%w: %s/%s/%s", ErrAlreadyExists, in.CryptoAsset, in.CryptoNetwork, in.FiatCurrency)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: create corridor: %w", err)
+	}
+
+	created := make([]ProviderBinding, 0, len(bindings))
+	for _, b := range bindings {
+		pb := ProviderBinding{
+			CorridorID:   c.ID,
+			ProviderType: b.ProviderType,
+			ProviderName: b.ProviderName,
+			Priority:     b.Priority,
+			Active:       true,
+			Config:       json.RawMessage(`{}`),
+		}
+		err := tx.QueryRow(ctx,
+			`INSERT INTO corridor_providers (corridor_id, provider_type, provider_name, priority, active)
+			 VALUES ($1, $2, $3, $4, true)
+			 RETURNING id`,
+			c.ID, string(b.ProviderType), b.ProviderName, b.Priority,
+		).Scan(&pb.ID)
+		if isUniqueViolation(err) {
+			return nil, nil, fmt.Errorf("%w: duplicate %s provider %q", ErrAlreadyExists, b.ProviderType, b.ProviderName)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("corridor: create provider binding: %w", err)
+		}
+		created = append(created, pb)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("corridor: create corridor: commit: %w", err)
+	}
+	return c, created, nil
+}
+
+// isUniqueViolation detects a Postgres unique-constraint violation (SQLSTATE
+// 23505) — same helper shape internal/tenant already uses.
+func isUniqueViolation(err error) bool {
+	var pgErr interface{ SQLState() string }
+	if errors.As(err, &pgErr) {
+		return pgErr.SQLState() == "23505"
+	}
+	return false
 }
 
 // UpsertProviderBinding wires an existing adapter (identified by

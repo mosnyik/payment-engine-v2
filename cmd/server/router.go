@@ -73,6 +73,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	nh := &notificationHandlers{notification: stores.notification}
 	lh := &ledgerHandlers{ledger: stores.ledger}
 	rh := &rateHandlers{rate: stores.rate}
+	ch := &corridorAdminHandlers{corridor: stores.corridor, settlement: stores.settlement, treasury: stores.treasury, compliance: stores.compliance, admin: stores.admin}
 	ph := &portalHandlers{
 		tenant:       stores.tenant,
 		compliance:   stores.compliance,
@@ -154,6 +155,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
+		admin.Post("/corridors", ch.createCorridor)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)
 		admin.Get("/settlements", sth.listSettlements)

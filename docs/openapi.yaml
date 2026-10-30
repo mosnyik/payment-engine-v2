@@ -330,6 +330,74 @@ paths:
                       items:
                         type: array
                         items: { $ref: "#/components/schemas/Corridor" }
+    post:
+      tags: [admin]
+      summary: "Create a corridor and its provider bindings"
+      description: >
+        Create-only: an existing crypto_asset/crypto_network/fiat_currency
+        combination returns 409 and is never overwritten. The corridor and
+        its provider bindings are written in one transaction. Asset, network
+        and currency are trimmed and uppercased. Provider names must match an
+        adapter registered in this server (collection, settlement or
+        compliance), so a typo is a 400 rather than a corridor whose sessions
+        can't find a provider. Recorded in the admin audit log as
+        corridor.create.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [crypto_asset, crypto_network, fiat_currency]
+              properties:
+                crypto_asset: { type: string, example: USDT }
+                crypto_network: { type: string, example: TRC20 }
+                fiat_currency: { type: string, example: NGN }
+                active: { type: boolean, default: true }
+                min_amount_fiat: { type: string, description: "Positive decimal", nullable: true }
+                max_amount_fiat: { type: string, description: "Positive decimal, >= min_amount_fiat", nullable: true }
+                travel_rule_threshold_fiat: { type: string, description: "Positive decimal; omit for no Travel Rule check", nullable: true }
+                travel_rule_window_seconds: { type: integer, default: 86400, minimum: 1 }
+                compliance_hold_timeout_seconds: { type: integer, default: 86400, minimum: 1 }
+                required_destination_fields: { type: array, items: { type: string } }
+                providers:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, name]
+                    properties:
+                      type: { type: string, enum: [collection, settlement, compliance] }
+                      name: { type: string, example: busha }
+                      priority: { type: integer, default: 0, minimum: 0, description: "Lower is tried first" }
+      responses:
+        "201":
+          description: Corridor created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Corridor"
+                  - type: object
+                    properties:
+                      providers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            type: { type: string }
+                            name: { type: string }
+                            priority: { type: integer }
+                            active: { type: boolean }
+        "400":
+          description: Missing or invalid field, unknown provider, or duplicate binding
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "409":
+          description: A corridor with this asset/network/fiat already exists
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
   /admin/corridors/{corridorID}:
     get:
