@@ -26,10 +26,10 @@ var (
 	ErrLockNotFound      = errors.New("rate: lock not found")
 )
 
-// ProviderCoinGecko names the provider_rates rows cmd/ratefetcher writes —
+// ProviderCoinMarketCap names the provider_rates rows cmd/ratefetcher writes —
 // shared between that binary's writes and readOnlyProvider's reads
 // (providers.go) so the string can't drift between the two.
-const ProviderCoinGecko = "coingecko"
+const ProviderCoinMarketCap = "coinmarketcap"
 
 // slippageBuffer is subtracted from the selected quote before locking (see
 // ARCHITECTURE.md §7). Not an operational config knob like the tunables in
@@ -114,7 +114,7 @@ func New(pool *db.Pool, cfg Config) *Store {
 			newBushaProvider(pool, cfg.Busha),
 			newLiquidRampProvider(pool, cfg.LiquidRamp),
 			newAnchorProvider(pool, cfg.Anchor),
-			&readOnlyProvider{name: ProviderCoinGecko, pool: pool},
+			&readOnlyProvider{name: ProviderCoinMarketCap, pool: pool},
 		},
 	}
 }

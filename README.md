@@ -13,7 +13,7 @@ Go, PostgreSQL (`pgx`, `golang-migrate`, no ORM), `chi` for HTTP routing, gorout
 ```
 cmd/
   server/       the main HTTP app — every module wired together (see cmd/server/router.go)
-  ratefetcher/  standalone service: fetches USD/<fiat> from CoinGecko every 20 min, writes to Postgres
+  ratefetcher/  standalone service: fetches USD/<fiat> from CoinMarketCap every 20 min, writes to Postgres
   adminctl/     one-off provisioning CLI (create admin accounts, init the self-custody HD wallet seed)
 internal/
   ledger/       double-entry source of truth for every value movement
@@ -100,7 +100,7 @@ go tool air
 
 Copy `.env.example` to `.env` and fill in what you need. Only `DATABASE_URL` and `TENANT_SECRET_ENCRYPTION_KEY` are required; everything else defaults to sensible values or "disabled" until configured — see the comments in `.env.example` for what each section controls (rate providers, treasury/collection adapters, self-custody chains, settlement providers, notifications).
 
-`cmd/ratefetcher` and `cmd/adminctl` are separate binaries with their own minimal env surfaces — see `.env.example`'s `COINGECKO_*` section for the fetcher.
+`cmd/ratefetcher` and `cmd/adminctl` are separate binaries with their own minimal env surfaces — see `.env.example`'s `cmd/ratefetcher` section for the fetcher.
 
 ## Provisioning
 

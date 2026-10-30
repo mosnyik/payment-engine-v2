@@ -42,4 +42,4 @@ services:
       # Deliberately the exact same mechanism the main stack's ratefetcher
       # uses to keep provider_rates warm — sandbox rates are not
       # special-cased or hardcoded (see .env.sandbox's rate engine comment).
-      COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}
+      COINMARKETCAP_API_KEY: ${COINMARKETCAP_API_KEY:-}
