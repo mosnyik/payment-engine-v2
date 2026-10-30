@@ -48,7 +48,8 @@ func (s *Store) transitionByReservation(ctx context.Context, tx pgx.Tx, reservat
 	var sessionID, tenantID uuid.UUID
 	err := tx.QueryRow(ctx,
 		`UPDATE sessions SET status = $3, updated_at = now()
-		 WHERE deposit_reservation_id = $1 AND status = $2
+		 WHERE deposit_reservation_id = $1 AND (status = $2
+		   OR ($3 = 'deposit_confirmed' AND status = 'pending'))
 		 RETURNING id, tenant_id`,
 		reservationID, from, to,
 	).Scan(&sessionID, &tenantID)

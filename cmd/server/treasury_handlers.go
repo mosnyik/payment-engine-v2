@@ -8,14 +8,12 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/treasury"
 )
 
-// treasuryWebhookSignatureHeader mirrors settlementWebhookSignatureHeader —
-// same placeholder status as treasury.ComputeWebhookSignature's doc comment
-// (Busha's real header name isn't known yet).
-const treasuryWebhookSignatureHeader = "X-Webhook-Signature"
+// Busha Business signs the raw body with base64 HMAC-SHA256.
+const treasuryWebhookSignatureHeader = "X-BU-Signature"
 
 // treasuryHandlers implements the collection-provider inbound webhook.
 // Deliberately unauthenticated by the gateway/adminauth middlewares — it's
-// self-verified via treasury.VerifyWebhookSignature instead, same tier as
+// self-verified via treasury.VerifyBushaSignature instead, same tier as
 // /webhooks/settlement/{providerName}.
 type treasuryHandlers struct {
 	treasury *treasury.Store
@@ -32,6 +30,9 @@ func (h *treasuryHandlers) handleDepositWebhook(w http.ResponseWriter, r *http.R
 
 	err = h.treasury.HandleDepositWebhook(r.Context(), body, signature)
 	switch {
+	case errors.Is(err, treasury.ErrInvalidDepositEvent):
+		writeErr(w, http.StatusBadRequest, err)
+		return
 	case errors.Is(err, treasury.ErrInvalidWebhookSignature):
 		writeErr(w, http.StatusUnauthorized, err)
 		return

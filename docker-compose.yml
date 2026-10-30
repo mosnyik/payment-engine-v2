@@ -1,10 +1,4 @@
-# Two independent services against the native host Postgres — no bundled
-# postgres container. Both load DATABASE_URL from .env unmodified; the
-# extra_hosts entry makes "localhost" inside each container resolve to the
-# host machine (Docker Desktop's host-gateway) instead of the container
-# itself, so the exact same .env value that works for `go run` on the host
-# also works here. This is the one and only DATABASE_URL for the whole
-# system now — no per-service overrides.
+# Both services use the Linux VPS network to reach host PostgreSQL.
 services:
   server:
     build:
@@ -12,10 +6,7 @@ services:
       dockerfile: cmd/server/Dockerfile
     env_file:
       - .env
-    extra_hosts:
-      - "localhost:host-gateway"
-    ports:
-      - "3700:3700"
+    network_mode: host
 
   ratefetcher:
     build:
@@ -23,7 +14,6 @@ services:
       dockerfile: cmd/ratefetcher/Dockerfile
     env_file:
       - .env
-    extra_hosts:
-      - "localhost:host-gateway"
+    network_mode: host
     environment:
       COINGECKO_API_KEY: ${COINGECKO_API_KEY:-}

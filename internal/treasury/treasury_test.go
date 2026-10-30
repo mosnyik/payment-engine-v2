@@ -197,13 +197,15 @@ func TestReserveAddress_NoActiveProvider(t *testing.T) {
 	}
 }
 
-func webhookBody(t *testing.T, eventType, referenceID, txReference string, amount decimal.Decimal) []byte {
+func webhookBody(t *testing.T, eventType, referenceID, asset string, amount decimal.Decimal) []byte {
 	t.Helper()
+	status := "processing"
+	if eventType == string(DepositEventConfirmed) {
+		status = "funds_received"
+	}
 	body, err := json.Marshal(bushaWebhookPayload{
-		EventType:         DepositEventType(eventType),
-		ProviderReference: referenceID,
-		TxReference:       txReference,
-		Amount:            amount,
+		EventType: DepositEventType(eventType),
+		Data:      bushaTransfer{ID: referenceID, SourceCurrency: asset, TargetCurrency: asset, SourceAmount: amount, Status: status},
 	})
 	if err != nil {
 		t.Fatalf("marshal webhook body: %v", err)
@@ -214,13 +216,13 @@ func webhookBody(t *testing.T, eventType, referenceID, txReference string, amoun
 func reserveTestAddress(t *testing.T, s *Store, corridorID uuid.UUID, providerRef string) *AddressReservation {
 	t.Helper()
 	fake := &fakeCollectionProvider{
-		name: "webhooktest", enabled: true, custody: CustodyTypePartner,
+		name: "busha", enabled: true, custody: CustodyTypePartner,
 		address: ProviderAddress{Address: "addr-" + providerRef, ProviderReference: providerRef},
 	}
-	s.providers["webhooktest"] = fake
+	s.providers["busha"] = fake
 	ctx := context.Background()
 	cs := s.corridorStore
-	if _, err := cs.UpsertProviderBinding(ctx, corridorID, corridor.ProviderTypeCollection, "webhooktest", 1, true, nil); err != nil {
+	if _, err := cs.UpsertProviderBinding(ctx, corridorID, corridor.ProviderTypeCollection, "busha", 1, true, nil); err != nil {
 		t.Fatalf("upsert provider binding: %v", err)
 	}
 	r, err := s.ReserveAddress(ctx, createTestTenant(t, s.pool), corridorID)
@@ -251,12 +253,12 @@ func TestHandleDepositWebhook_DetectedThenConfirmed(t *testing.T) {
 	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
 	ctx := context.Background()
 
-	detectedBody := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig := ComputeWebhookSignature(s.bushaWebhookSecret, detectedBody)
+	detectedBody := webhookBody(t, string(DepositEventDetected), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig := ComputeBushaSignature(s.bushaWebhookSecret, detectedBody)
 	if err := s.HandleDepositWebhook(ctx, detectedBody, sig); err != nil {
 		t.Fatalf("handle detected webhook: %v", err)
 	}
-	d, err := s.GetDeposit(ctx, r.ID, "tx-1")
+	d, err := s.GetDeposit(ctx, r.ID, r.ProviderReference)
 	if err != nil {
 		t.Fatalf("get deposit: %v", err)
 	}
@@ -264,12 +266,12 @@ func TestHandleDepositWebhook_DetectedThenConfirmed(t *testing.T) {
 		t.Fatalf("expected status detected, got %s", d.Status)
 	}
 
-	confirmedBody := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig = ComputeWebhookSignature(s.bushaWebhookSecret, confirmedBody)
+	confirmedBody := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig = ComputeBushaSignature(s.bushaWebhookSecret, confirmedBody)
 	if err := s.HandleDepositWebhook(ctx, confirmedBody, sig); err != nil {
 		t.Fatalf("handle confirmed webhook: %v", err)
 	}
-	d, err = s.GetDeposit(ctx, r.ID, "tx-1")
+	d, err = s.GetDeposit(ctx, r.ID, r.ProviderReference)
 	if err != nil {
 		t.Fatalf("get deposit after confirm: %v", err)
 	}
@@ -288,12 +290,12 @@ func TestHandleDepositWebhook_ConfirmedBeforeDetected(t *testing.T) {
 	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
 	ctx := context.Background()
 
-	body := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig := ComputeWebhookSignature(s.bushaWebhookSecret, body)
+	body := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig := ComputeBushaSignature(s.bushaWebhookSecret, body)
 	if err := s.HandleDepositWebhook(ctx, body, sig); err != nil {
 		t.Fatalf("handle confirmed-first webhook: %v", err)
 	}
-	d, err := s.GetDeposit(ctx, r.ID, "tx-1")
+	d, err := s.GetDeposit(ctx, r.ID, r.ProviderReference)
 	if err != nil {
 		t.Fatalf("get deposit: %v", err)
 	}
@@ -309,15 +311,15 @@ func TestHandleDepositWebhook_ReplayIsNoOp(t *testing.T) {
 	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
 	ctx := context.Background()
 
-	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig := ComputeWebhookSignature(s.bushaWebhookSecret, body)
+	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig := ComputeBushaSignature(s.bushaWebhookSecret, body)
 	if err := s.HandleDepositWebhook(ctx, body, sig); err != nil {
 		t.Fatalf("first webhook: %v", err)
 	}
 	if err := s.HandleDepositWebhook(ctx, body, sig); err != nil {
 		t.Fatalf("replayed webhook should be a no-op, got error: %v", err)
 	}
-	d, err := s.GetDeposit(ctx, r.ID, "tx-1")
+	d, err := s.GetDeposit(ctx, r.ID, r.ProviderReference)
 	if err != nil {
 		t.Fatalf("get deposit: %v", err)
 	}
@@ -347,8 +349,8 @@ func TestHandleDepositWebhook_PublishesEventsOnlyOnRealTransitions(t *testing.T)
 		return n
 	}
 
-	detectedBody := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig := ComputeWebhookSignature(s.bushaWebhookSecret, detectedBody)
+	detectedBody := webhookBody(t, string(DepositEventDetected), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig := ComputeBushaSignature(s.bushaWebhookSecret, detectedBody)
 	if err := s.HandleDepositWebhook(ctx, detectedBody, sig); err != nil {
 		t.Fatalf("handle detected webhook: %v", err)
 	}
@@ -365,8 +367,8 @@ func TestHandleDepositWebhook_PublishesEventsOnlyOnRealTransitions(t *testing.T)
 		t.Fatalf("expected replay not to publish a duplicate event, still got %d", n)
 	}
 
-	confirmedBody := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig = ComputeWebhookSignature(s.bushaWebhookSecret, confirmedBody)
+	confirmedBody := webhookBody(t, string(DepositEventConfirmed), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig = ComputeBushaSignature(s.bushaWebhookSecret, confirmedBody)
 	if err := s.HandleDepositWebhook(ctx, confirmedBody, sig); err != nil {
 		t.Fatalf("handle confirmed webhook: %v", err)
 	}
@@ -394,8 +396,8 @@ func TestHandleDepositWebhook_NoEventBusIsSafe(t *testing.T) {
 	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
 	ctx := context.Background()
 
-	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
-	sig := ComputeWebhookSignature(s.bushaWebhookSecret, body)
+	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
+	sig := ComputeBushaSignature(s.bushaWebhookSecret, body)
 	if err := s.HandleDepositWebhook(ctx, body, sig); err != nil {
 		t.Fatalf("handle detected webhook with no event bus configured: %v", err)
 	}
@@ -408,7 +410,7 @@ func TestHandleDepositWebhook_InvalidSignature(t *testing.T) {
 	r := reserveTestAddress(t, s, corridorID, "ref-"+uniqueAsset(t))
 	ctx := context.Background()
 
-	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, "tx-1", decimal.NewFromInt(1))
+	body := webhookBody(t, string(DepositEventDetected), r.ProviderReference, r.CryptoAsset, decimal.NewFromInt(1))
 	err := s.HandleDepositWebhook(ctx, body, "not-the-real-signature")
 	if !errors.Is(err, ErrInvalidWebhookSignature) {
 		t.Fatalf("expected ErrInvalidWebhookSignature, got %v", err)

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -208,7 +209,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	var verifyResp struct {
 		Token string `json:"token"`
 	}
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/verify", "", map[string]string{"token": magicLinkToken}, &verifyResp)
+	resp = doJSON(t, client, http.MethodGet, srv.URL+"/v2/portal/verify?token="+url.QueryEscape(magicLinkToken), "", nil, &verifyResp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("portal verify: expected 200, got %d", resp.StatusCode)
 	}

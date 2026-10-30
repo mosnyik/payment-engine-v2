@@ -620,7 +620,11 @@ func (s *Store) RestoreAccount(ctx context.Context, tenantID uuid.UUID) error {
 // The raw secret is returned once and never stored — only its encrypted
 // form is persisted. Issuing credentials for a non-active tenant is
 // refused: nothing is issued before KYB clears (ARCHITECTURE.md §5).
-func (s *Store) IssueAPIKey(ctx context.Context, tenantID uuid.UUID) (apiKey, hmacSecret string, err error) {
+// permissions is optional and variadic purely so every existing call site
+// (portal self-issuance, every test fixture) keeps compiling unchanged —
+// omitted or empty means unrestricted, same convention LookupHMACSecret and
+// gateway.RequirePermission already apply to allowedCIDRs/permissions.
+func (s *Store) IssueAPIKey(ctx context.Context, tenantID uuid.UUID, permissions ...string) (apiKey, hmacSecret string, err error) {
 	t, err := s.GetTenant(ctx, tenantID)
 	if err != nil {
 		return "", "", err
@@ -645,9 +649,16 @@ func (s *Store) IssueAPIKey(ctx context.Context, tenantID uuid.UUID) (apiKey, hm
 		return "", "", fmt.Errorf("tenant: encrypt hmac secret: %w", err)
 	}
 
+	// A nil slice (the variadic's zero value when no permissions are passed)
+	// encodes as SQL NULL, not '{}' — the column is NOT NULL, so this must
+	// be non-nil even when empty.
+	if permissions == nil {
+		permissions = []string{}
+	}
+
 	_, err = s.pool.Exec(ctx,
-		`INSERT INTO tenant_api_keys (tenant_id, api_key, hmac_secret_encrypted) VALUES ($1, $2, $3)`,
-		tenantID, apiKey, encrypted,
+		`INSERT INTO tenant_api_keys (tenant_id, api_key, hmac_secret_encrypted, permissions) VALUES ($1, $2, $3, $4)`,
+		tenantID, apiKey, encrypted, permissions,
 	)
 	if err != nil {
 		return "", "", fmt.Errorf("tenant: issue api key: %w", err)
@@ -660,7 +671,7 @@ func (s *Store) IssueAPIKey(ctx context.Context, tenantID uuid.UUID) (apiKey, hm
 // non-active tenant both resolve to "unknown" (ok=false) — from the
 // gateway's perspective there is no meaningful difference between "this key
 // never existed" and "this key must no longer authenticate".
-func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, bool, error) {
+func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uuid.UUID, uuid.UUID, string, []string, []string, bool, error) {
 	var keyID uuid.UUID
 	var tenantID uuid.UUID
 	var encryptedSecret string
@@ -668,28 +679,29 @@ func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uu
 	var tenantStatus string
 	var rateLimitTier string
 	var allowedCIDRs []string
+	var permissions []string
 	err := s.pool.QueryRow(ctx,
-		`SELECT k.id, k.tenant_id, k.hmac_secret_encrypted, k.active, t.status, k.rate_limit_tier, k.allowed_cidrs
+		`SELECT k.id, k.tenant_id, k.hmac_secret_encrypted, k.active, t.status, k.rate_limit_tier, k.allowed_cidrs, k.permissions
 		 FROM tenant_api_keys k
 		 JOIN tenants t ON t.id = k.tenant_id
 		 WHERE k.api_key = $1`,
 		apiKey,
-	).Scan(&keyID, &tenantID, &encryptedSecret, &keyActive, &tenantStatus, &rateLimitTier, &allowedCIDRs)
+	).Scan(&keyID, &tenantID, &encryptedSecret, &keyActive, &tenantStatus, &rateLimitTier, &allowedCIDRs, &permissions)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, nil, false, nil
 	}
 	if err != nil {
-		return "", uuid.Nil, uuid.Nil, "", nil, false, fmt.Errorf("tenant: lookup hmac secret: %w", err)
+		return "", uuid.Nil, uuid.Nil, "", nil, nil, false, fmt.Errorf("tenant: lookup hmac secret: %w", err)
 	}
 	if !keyActive || Status(tenantStatus) != StatusActive {
-		return "", uuid.Nil, uuid.Nil, "", nil, false, nil
+		return "", uuid.Nil, uuid.Nil, "", nil, nil, false, nil
 	}
 
 	secret, err := s.crypto.Decrypt(encryptedSecret)
 	if err != nil {
-		return "", uuid.Nil, uuid.Nil, "", nil, false, fmt.Errorf("tenant: decrypt hmac secret: %w", err)
+		return "", uuid.Nil, uuid.Nil, "", nil, nil, false, fmt.Errorf("tenant: decrypt hmac secret: %w", err)
 	}
-	return secret, tenantID, keyID, rateLimitTier, allowedCIDRs, true, nil
+	return secret, tenantID, keyID, rateLimitTier, allowedCIDRs, permissions, true, nil
 }
 
 // SetCorridorEntitlement grants or revokes a tenant's access to a corridor,

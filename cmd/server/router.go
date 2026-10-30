@@ -63,8 +63,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	})
 
 	sh := &sessionHandlers{session: stores.session}
-	protected.Post("/sessions", sh.createSession)
-	protected.Get("/sessions/{sessionID}", sh.getSession)
+	protected.With(gateway.RequirePermission(gateway.PermissionSessionsWrite)).Post("/sessions", sh.createSession)
+	protected.With(gateway.RequirePermission(gateway.PermissionSessionsRead)).Get("/sessions/{sessionID}", sh.getSession)
 
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
 	bh := &adminBrowseHandlers{tenant: stores.tenant, corridor: stores.corridor, session: stores.session, admin: stores.admin, requestAudit: stores.audit}
@@ -101,7 +101,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// pre-auth is by client IP, not tenant/tier.
 	r.With(publicLimit).Post("/portal/register", ph.register)
 	r.With(publicLimit).Post("/portal/login", ph.login)
-	r.With(publicLimit).Post("/portal/verify", ph.verify)
+	r.With(publicLimit).Get("/portal/verify", ph.verify)
 
 	r.Route("/portal", func(portal chi.Router) {
 		portal.Use(tenant.PortalMiddleware(stores.tenant))

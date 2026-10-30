@@ -34,6 +34,8 @@ var (
 // AddressReservation is a persisted record of one deposit address handed
 // out for a corridor.
 type AddressReservation struct {
+	Amount            string
+	ExpiresAt         *time.Time
 	ID                uuid.UUID
 	TenantID          uuid.UUID
 	CorridorID        uuid.UUID
@@ -53,13 +55,15 @@ type AddressReservation struct {
 // GetDepositInstructions — what Phase 5's session module hands to a
 // depositor.
 type DepositInstructions struct {
-	ReservationID uuid.UUID
-	TenantID      uuid.UUID
-	ProviderName  string
-	CryptoAsset   string
-	CryptoNetwork string
-	Address       string
-	AddressTag    string
+	ReservationID uuid.UUID  `json:"reservation_id"`
+	TenantID      uuid.UUID  `json:"-"`
+	ProviderName  string     `json:"provider"`
+	CryptoAsset   string     `json:"crypto_asset"`
+	CryptoNetwork string     `json:"crypto_network"`
+	Address       string     `json:"address"`
+	AddressTag    string     `json:"address_tag,omitempty"`
+	Amount        string     `json:"amount"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 }
 
 // Deposit is the webhook-driven state of one deposit against a
@@ -198,7 +202,7 @@ func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 // the next binding on error, same failover shape corridor's provider
 // bindings already establish for other provider types. tenantID is whose
 // deposit this reservation is for — see CollectionProvider's doc comment.
-func (s *Store) ReserveAddress(ctx context.Context, tenantID, corridorID uuid.UUID) (*AddressReservation, error) {
+func (s *Store) ReserveAddress(ctx context.Context, tenantID, corridorID uuid.UUID, requests ...DepositRequest) (*AddressReservation, error) {
 	corr, err := s.corridorStore.GetCorridorByID(ctx, corridorID)
 	if err != nil {
 		return nil, fmt.Errorf("treasury: reserve address: %w", err)
@@ -215,7 +219,12 @@ func (s *Store) ReserveAddress(ctx context.Context, tenantID, corridorID uuid.UU
 		if !ok || !provider.IsEnabled() {
 			continue
 		}
-		addr, err := provider.ReserveAddress(ctx, tenantID, corr.CryptoAsset, corr.CryptoNetwork)
+		var addr ProviderAddress
+		if quoted, ok := provider.(quotedCollectionProvider); ok && len(requests) > 0 {
+			addr, err = quoted.ReserveDeposit(ctx, tenantID, corr.CryptoAsset, corr.CryptoNetwork, requests[0])
+		} else {
+			addr, err = provider.ReserveAddress(ctx, tenantID, corr.CryptoAsset, corr.CryptoNetwork)
+		}
 		if err != nil {
 			lastErr = err
 			continue
@@ -230,6 +239,8 @@ func (s *Store) ReserveAddress(ctx context.Context, tenantID, corridorID uuid.UU
 
 func (s *Store) persistReservation(ctx context.Context, tenantID, corridorID uuid.UUID, provider CollectionProvider, cryptoAsset, cryptoNetwork string, addr ProviderAddress) (*AddressReservation, error) {
 	r := &AddressReservation{
+		Amount:            addr.Amount,
+		ExpiresAt:         addr.ExpiresAt,
 		TenantID:          tenantID,
 		CorridorID:        corridorID,
 		ProviderName:      provider.Name(),
@@ -282,12 +293,14 @@ func (s *Store) GetReservation(ctx context.Context, id uuid.UUID) (*AddressReser
 // GetDepositInstructions is the method Phase 5's session module actually
 // calls: reserves an address and formats it into the caller-facing DTO a
 // depositor is shown.
-func (s *Store) GetDepositInstructions(ctx context.Context, tenantID, corridorID uuid.UUID) (*DepositInstructions, error) {
-	r, err := s.ReserveAddress(ctx, tenantID, corridorID)
+func (s *Store) GetDepositInstructions(ctx context.Context, tenantID, corridorID uuid.UUID, requests ...DepositRequest) (*DepositInstructions, error) {
+	r, err := s.ReserveAddress(ctx, tenantID, corridorID, requests...)
 	if err != nil {
 		return nil, err
 	}
 	return &DepositInstructions{
+		Amount:        r.Amount,
+		ExpiresAt:     r.ExpiresAt,
 		ReservationID: r.ID,
 		TenantID:      r.TenantID,
 		ProviderName:  r.ProviderName,

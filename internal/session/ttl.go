@@ -63,7 +63,8 @@ func (s *Store) expirePreDeposit(ctx context.Context) error {
 	cutoff := time.Now().Add(-SessionTTL)
 	_, err := s.pool.Exec(ctx,
 		`UPDATE sessions SET status = 'expired', updated_at = now()
-		 WHERE status IN ('screening', 'pending') AND created_at < $1`,
+		 WHERE status IN ('screening', 'pending') AND (created_at < $1
+		   OR (deposit_instructions->>'expires_at')::timestamptz < now())`,
 		cutoff,
 	)
 	if err != nil {

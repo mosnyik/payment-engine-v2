@@ -7,7 +7,7 @@ A narrative companion to `ARCHITECTURE.md` — that doc records design decisions
 Tenant creation, credential issuance, and webhook config each have **two equally-real paths — admin-driven or tenant self-service** (`/v2/portal/...`, the tenant's own passwordless login, Phase 9a); both call the identical store method underneath, so which one ran is a business-process choice, not a different code path with different guarantees. KYB review and corridor entitlement stay admin-only — both are judgment calls, not paperwork:
 
 1. **`POST /admin/tenants`** `{name, email}` (staff-initiated) **or `POST /portal/register`** `{name, email}` (self-service, Phase 9a — also auto-sends the login magic link) → both call `tenant.RegisterTenant`, creating an identical tenant record with a `contact_email`. Either way, can't call the API yet, and can't submit KYB either until it logs into the portal.
-2. **Portal login + KYB submission** — **portal-only, never admin-submitted on the tenant's behalf** (Phase 12), regardless of which path created the record: the tenant requests a magic link (`POST /portal/login`), redeems it (`POST /portal/verify`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
+2. **Portal login + KYB submission** — **portal-only, never admin-submitted on the tenant's behalf** (Phase 12), regardless of which path created the record: the tenant requests a magic link (`POST /portal/login`), redeems it by clicking the emailed link (`GET /portal/verify?token=...`), then submits company/beneficial-ownership/licensing docs itself (`POST /portal/kyb`) into `compliance`.
 3. **KYB review** — **admin-only, no self-service path** → automated provider decision, or if no provider is configured for that case, it drops into the manual hold queue — `GET /admin/compliance/holds` / `POST /admin/compliance/holds/{caseID}/resolve`, an analyst approves or rejects.
 4. **`POST /admin/tenants/{tenantID}/api-keys`** (staff-initiated) **or `POST /portal/api-keys`** (self-service, Phase 9a) → both call `tenant.IssueAPIKey`, only reachable after KYB clears (`status == active`) either way. Issues the tenant's API key + HMAC secret (mTLS cert registration stays admin-only). **This is the gate** — nothing below is callable before this.
 5. **`POST /admin/tenants/{tenantID}/corridors/{corridorID}`** — **admin-only, no self-service path** → entitles the tenant to a specific corridor (an asset+network × fiat-currency pair, e.g. USDT-TRC20 → NGN). Without this, `CreateSession` on that corridor is rejected.
@@ -34,7 +34,7 @@ sequenceDiagram
 
     Rep->>TenantM: POST /portal/login {email}
     TenantM-->>Rep: magic link emailed (single-use, time-limited)
-    Rep->>TenantM: POST /portal/verify {token}
+    Rep->>TenantM: GET /portal/verify?token=...
     TenantM-->>Rep: portal session token
 
     Rep->>Compliance: POST /portal/kyb {docs, declaredCurrencies}

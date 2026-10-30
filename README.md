@@ -67,6 +67,8 @@ docker compose -f docker-compose.sandbox.yml up -d --build
 - Corridors are seeded automatically at startup from `.env.sandbox`'s `SANDBOX_CORRIDORS` (default `USDT:SANDBOX:NGN`) — no manual corridor/provider-binding setup needed.
 - Tear down: `docker compose -f docker-compose.sandbox.yml down` (add `-v` to also wipe the sandbox database).
 
+For crypto collection through **Busha Business sandbox**, see [Busha sandbox setup](docs/BUSHA_SANDBOX.md). This uses real sandbox API calls and signed transfer webhooks while retaining simulated compliance and fiat settlement.
+
 ### Against a database outside Docker
 
 Build and run the server image standalone, pointing at any reachable Postgres:

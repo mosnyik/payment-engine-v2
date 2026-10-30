@@ -28,7 +28,7 @@ A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, d
 | Compliance | Synchronous, blocking check at session creation; multi-provider, routed by settlement currency/corridor; manual-review hold queue as fallback where no provider is configured; Travel Rule thresholds configurable per currency (rolling-window volume check) |
 | FX / rates | In-house rate engine aggregating partner quotes vs. a DB-set system rate; system rate acts as a ceiling — external providers can only push the locked rate down, never up (ported from v1, confirmed to carry forward) |
 | Tenant auth | Per-tenant configurable: API key + HMAC signature, or mTLS |
-| Tenant portal auth | Separate passwordless surface for the tenant's own KYB submission: email magic link (`POST /portal/login`) → single-use, time-limited, hashed token → session token (`POST /portal/verify`). Own credential space (`tenant_magic_links`/`tenant_sessions`), never accepted on gateway (HMAC/mTLS) or admin routes, or vice versa |
+| Tenant portal auth | Separate passwordless surface for the tenant's own KYB submission: email magic link (`POST /portal/login`) → single-use, time-limited, hashed token → session token (`GET /portal/verify?token=...`). Own credential space (`tenant_magic_links`/`tenant_sessions`), never accepted on gateway (HMAC/mTLS) or admin routes, or vice versa |
 | Admin auth | Password (bcrypt hash + DB-backed session, per-admin identity) is the baseline; OIDC SSO is an additional front door onto the *same* session model — any OIDC-compliant IdP, invite-only (never self-provisions an `admin_users` row), binds to the IdP's `sub` claim. Password login stays as a break-glass fallback once SSO is configured, not deleted |
 | KYB jurisdiction requirements | Per-fiat-currency required-fields config (`jurisdiction_kyb_requirements`, admin-configurable; unconfigured currency = no extra requirement). Every KYB case declares which currencies/jurisdictions it's onboarding for (`declared_currencies`); validated against the union of those currencies' required fields before a case is even created |
 | Corridor entitlement grant | Activating an entitlement (`GrantCorridorEntitlement`) is gated on an approved KYB case whose `declared_currencies` cover the corridor's fiat currency — an approval for one jurisdiction can't be used to unlock a corridor under a different regulator. Revocation (`SetCorridorEntitlement(..., false, ...)`) doesn't need the gate |
@@ -166,7 +166,7 @@ sequenceDiagram
 
     Rep->>TenantM: POST /portal/login {email}
     TenantM-->>Rep: magic link emailed (single-use, time-limited)
-    Rep->>TenantM: POST /portal/verify {token}
+    Rep->>TenantM: GET /portal/verify?token=...
     TenantM-->>Rep: portal session token
 
     Rep->>Compliance: POST /portal/kyb {docs, declaredCurrencies}

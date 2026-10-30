@@ -94,18 +94,19 @@ func (h *portalHandlers) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"message": "if that email is registered, a login link has been sent"})
 }
 
-// POST /v2/portal/verify {"token": "..."} — redeems a magic link for a
-// real portal session token.
+// GET /v2/portal/verify?token=... — redeems a magic link for a real portal
+// session token. GET, not POST: the emailed link (tenant.magicLinkEmailBody)
+// is a plain clickable URL, so the endpoint it points at has to be
+// GET-able with the token in the query string rather than a JSON body a
+// browser navigation can't send.
 func (h *portalHandlers) verify(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("token query parameter is required"))
 		return
 	}
 
-	sessionToken, _, err := h.tenant.VerifyMagicLink(r.Context(), req.Token)
+	sessionToken, _, err := h.tenant.VerifyMagicLink(r.Context(), token)
 	if errors.Is(err, tenant.ErrInvalidMagicLink) {
 		writeErr(w, http.StatusUnauthorized, err)
 		return

@@ -72,6 +72,7 @@ type EntitlementChecker interface {
 }
 
 type Session struct {
+	DepositInstructions  *treasury.DepositInstructions
 	ID                   uuid.UUID
 	TenantID             uuid.UUID
 	CorridorID           uuid.UUID
@@ -123,7 +124,7 @@ func New(pool *db.Pool, corridorStore *corridor.Store, complianceStore *complian
 
 const sessionColumns = `id, tenant_id, corridor_id, status, fiat_currency, fiat_amount,
 	crypto_asset, crypto_network, compliance_case_id, rate_lock_id,
-	deposit_reservation_id, sla_breached_at, payout_destination, created_at, updated_at`
+	deposit_reservation_id, sla_breached_at, payout_destination, created_at, updated_at, deposit_instructions`
 
 func scanSession(row pgx.Row) (*Session, error) {
 	var sess Session
@@ -131,7 +132,7 @@ func scanSession(row pgx.Row) (*Session, error) {
 	err := row.Scan(
 		&sess.ID, &sess.TenantID, &sess.CorridorID, &status, &sess.FiatCurrency, &sess.FiatAmount,
 		&sess.CryptoAsset, &sess.CryptoNetwork, &sess.ComplianceCaseID, &sess.RateLockID,
-		&sess.DepositReservationID, &sess.SLABreachedAt, &sess.PayoutDestination, &sess.CreatedAt, &sess.UpdatedAt,
+		&sess.DepositReservationID, &sess.SLABreachedAt, &sess.PayoutDestination, &sess.CreatedAt, &sess.UpdatedAt, &sess.DepositInstructions,
 	)
 	if err != nil {
 		return nil, err
@@ -253,13 +254,34 @@ func (s *Store) transitionToRejected(ctx context.Context, id uuid.UUID, from Sta
 // ResolveComplianceHold's analyst-approves path (ARCHITECTURE.md §8) —
 // from distinguishes which.
 func (s *Store) transitionToPending(ctx context.Context, id, tenantID uuid.UUID, corr *corridor.Corridor, from Status) (*Session, error) {
+	current, err := s.GetSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	lock, err := s.rateStore.LockRate(ctx, corr.CryptoAsset, corr.FiatCurrency, rate.DefaultLockTTL)
 	if err != nil {
 		return nil, fmt.Errorf("session: lock rate: %w", err)
 	}
-	instructions, err := s.treasuryStore.GetDepositInstructions(ctx, tenantID, corr.ID)
+	// The ledger stores eight decimal places; stablecoins use six so the
+	// requested amount remains transferable on their six-decimal networks.
+	precision := int32(8)
+	if corr.CryptoAsset == "USDT" || corr.CryptoAsset == "USDC" {
+		precision = 6
+	}
+	amount := lock.FiatToCrypto(current.FiatAmount).RoundUp(precision)
+	instructions, err := s.treasuryStore.GetDepositInstructions(ctx, tenantID, corr.ID, treasury.DepositRequest{Amount: amount})
 	if err != nil {
 		return nil, fmt.Errorf("session: get deposit instructions: %w", err)
+	}
+	if instructions.Amount == "" {
+		instructions.Amount = amount.String()
+	}
+	expires := current.CreatedAt.Add(SessionTTL)
+	if lock.ExpiresAt.Before(expires) {
+		expires = lock.ExpiresAt
+	}
+	if instructions.ExpiresAt == nil || expires.Before(*instructions.ExpiresAt) {
+		instructions.ExpiresAt = &expires
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -269,10 +291,10 @@ func (s *Store) transitionToPending(ctx context.Context, id, tenantID uuid.UUID,
 	defer tx.Rollback(ctx) // no-op once committed
 
 	row := tx.QueryRow(ctx,
-		`UPDATE sessions SET status = 'pending', rate_lock_id = $2, deposit_reservation_id = $3, updated_at = now()
+		`UPDATE sessions SET status = 'pending', rate_lock_id = $2, deposit_reservation_id = $3, deposit_instructions = $5, updated_at = now()
 		 WHERE id = $1 AND status = $4
 		 RETURNING `+sessionColumns,
-		id, lock.ID, instructions.ReservationID, string(from),
+		id, lock.ID, instructions.ReservationID, string(from), instructions,
 	)
 	sess, err := scanSession(row)
 	if err != nil {

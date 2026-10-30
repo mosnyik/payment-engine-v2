@@ -79,7 +79,7 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	// warm-up run needs ListActiveFiatCurrencies to already see these), and
 	// before any request can reach session.CreateSession.
 	if cfg.SandboxMode {
-		if err := seedSandboxCorridors(ctx, corridorStore, complianceStore, cfg.SandboxCorridors); err != nil {
+		if err := seedSandboxCorridors(ctx, corridorStore, complianceStore, cfg.SandboxCorridors, cfg.SandboxCollectionProvider); err != nil {
 			return nil, fmt.Errorf("build stores: %w", err)
 		}
 	}
