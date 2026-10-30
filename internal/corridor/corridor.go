@@ -510,6 +510,22 @@ func (s *Store) ListActiveFiatCurrencies(ctx context.Context) ([]string, error) 
 	return currencies, nil
 }
 
+// HasActiveCorridorForFiat reports whether at least one active corridor
+// settles in fiatCurrency — the same set ListActiveFiatCurrencies (and so
+// the rate engine's CurrentRateJob) works from. The public rate endpoint
+// uses it so a currency whose corridors were all deactivated stops
+// publishing a rate the job no longer refreshes.
+func (s *Store) HasActiveCorridorForFiat(ctx context.Context, fiatCurrency string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM corridors WHERE active AND fiat_currency = $1)`, fiatCurrency,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("corridor: has active corridor for fiat: %w", err)
+	}
+	return exists, nil
+}
+
 // ListActiveProviders returns active provider bindings for a corridor,
 // ordered by priority (lowest first — the settlement retry policy fails
 // over down this list before retrying the one that just failed).

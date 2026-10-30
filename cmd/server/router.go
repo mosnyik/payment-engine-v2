@@ -72,7 +72,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}
 	lh := &ledgerHandlers{ledger: stores.ledger}
-	rh := &rateHandlers{rate: stores.rate}
+	rh := &rateHandlers{rate: stores.rate, corridor: stores.corridor}
 	ch := &corridorAdminHandlers{corridor: stores.corridor, settlement: stores.settlement, treasury: stores.treasury, compliance: stores.compliance, admin: stores.admin}
 	ph := &portalHandlers{
 		tenant:       stores.tenant,

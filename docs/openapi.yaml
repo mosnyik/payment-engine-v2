@@ -42,7 +42,8 @@ paths:
       description: >
         Returns the persisted "current rate" (internal/rate's CurrentRateJob
         output) — the same value LockRate locks transactions against, not a
-        live per-request recomputation.
+        live per-request recomputation. Only published for currencies with
+        at least one active corridor.
       security: []
       parameters:
         - name: fiatCurrency
@@ -59,7 +60,7 @@ paths:
                 properties:
                   rate: { type: string, example: "1,650.00" }
         "404":
-          description: No rate computed yet for this currency
+          description: No active corridor uses this currency, or no rate computed for it yet
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
