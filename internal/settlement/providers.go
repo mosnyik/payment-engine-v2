@@ -46,7 +46,7 @@ type PayoutRequest struct {
 	AttemptNumber         int
 	AttemptIdempotencyKey string
 	FiatCurrency          string
-	Amount                decimal.Decimal // the tenant-payable amount, post-fee
+	Amount                decimal.Decimal // the tenant-payable amount (the full locked fiat value; no fee)
 	// Destination is the bank-details payload this attempt pays to: an
 	// ops-corrected one from RetryPayout, else the previous attempt's, else
 	// the session's own payout_destination (dispatch.go resolveDestination).

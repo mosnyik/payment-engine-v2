@@ -108,7 +108,7 @@ func TestManualPayout_TerminalFailureGoesToTelegramThenButtonSettles(t *testing.
 		t.Fatalf("expected one manual-payout alert, got %d", len(sends))
 	}
 	text, _ := sends[0].Body["text"].(string)
-	for _, want := range []string{"Manual Settlement Required", "0123456789", "GTBank", "98010.00", "invalid account"} {
+	for _, want := range []string{"Manual Settlement Required", "0123456789", "GTBank", "99000.00", "invalid account"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("alert missing %q:\n%s", want, text)
 		}
@@ -159,8 +159,8 @@ func TestManualPayout_TerminalFailureGoesToTelegramThenButtonSettles(t *testing.
 	if bal := env.balance(t, l, &tid, "tenant_payable", env.fiat, "fiat"); !bal.IsZero() {
 		t.Fatalf("tenant_payable: expected 0 after manual settlement, got %s", bal)
 	}
-	if bal := env.balance(t, l, nil, "treasury_fiat_operating", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-98010)) {
-		t.Fatalf("treasury_fiat_operating: expected -98010, got %s", bal)
+	if bal := env.balance(t, l, nil, "treasury_fiat_operating", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-99000)) {
+		t.Fatalf("treasury_fiat_operating: expected -99000, got %s", bal)
 	}
 
 	// A second press is refused (told why), never a second settlement.

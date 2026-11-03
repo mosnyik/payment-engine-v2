@@ -140,7 +140,7 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 
 	ledgerStore := ledger.New(pool)
 	ledgerStore.SetEventBus(bus)
-	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, tenantStore, settlement.Config{
+	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, settlement.Config{
 		CNGN:        settlement.SettlementProviderConfig(cfg.Settlement.CNGN),
 		Flutterwave: settlement.SettlementProviderConfig(cfg.Settlement.Flutterwave),
 		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),

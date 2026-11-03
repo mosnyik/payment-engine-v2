@@ -72,7 +72,6 @@ type Settlement struct {
 	CryptoAmount           decimal.Decimal
 	FiatCurrency           string
 	FiatValue              decimal.Decimal
-	FeeAmount              decimal.Decimal
 	TenantPayableAmount    decimal.Decimal
 	AttemptCount           int
 	ConfirmationDeadlineAt *time.Time
@@ -83,14 +82,6 @@ type Settlement struct {
 	PendingDestination json.RawMessage
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
-}
-
-// FeeResolver is the one tenant-module capability settlement needs — a
-// narrow interface, not internal/tenant.Store directly, same convention
-// session.EntitlementChecker/treasury.TenantWebhookLookup already establish
-// for keeping the tenant module boundary hard everywhere else touches it.
-type FeeResolver interface {
-	EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error)
 }
 
 // Config is what main.go builds from *config.Config to construct a Store —
@@ -120,7 +111,6 @@ type Store struct {
 	sessionStore  *session.Store
 	treasuryStore *treasury.Store
 	rateStore     *rate.Store
-	feeResolver   FeeResolver
 
 	providers map[string]SettlementProvider
 
@@ -141,7 +131,7 @@ func (s *Store) HasProvider(name string) bool {
 	return ok
 }
 
-func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, feeResolver FeeResolver, cfg Config) *Store {
+func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, cfg Config) *Store {
 	cngn := newCNGNProvider(cfg.CNGN)
 	flutterwave := newFlutterwaveProvider(cfg.Flutterwave)
 	paystack := newPaystackProvider(cfg.Paystack)
@@ -167,7 +157,6 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 		sessionStore:  sessionStore,
 		treasuryStore: treasuryStore,
 		rateStore:     rateStore,
-		feeResolver:   feeResolver,
 		providers:     providers,
 		telegram:      newTelegramNotifier(cfg.Telegram),
 	}
@@ -180,7 +169,7 @@ func (s *Store) SetEventBus(bus *eventbus.Bus) {
 }
 
 const settlementColumns = `id, session_id, tenant_id, corridor_id, status, crypto_asset, crypto_amount,
-	fiat_currency, fiat_value, fee_amount, tenant_payable_amount, attempt_count,
+	fiat_currency, fiat_value, tenant_payable_amount, attempt_count,
 	confirmation_deadline_at, ops_paged_at, pending_destination, created_at, updated_at`
 
 func scanSettlement(row pgx.Row) (*Settlement, error) {
@@ -188,7 +177,7 @@ func scanSettlement(row pgx.Row) (*Settlement, error) {
 	var status string
 	err := row.Scan(
 		&st.ID, &st.SessionID, &st.TenantID, &st.CorridorID, &status, &st.CryptoAsset, &st.CryptoAmount,
-		&st.FiatCurrency, &st.FiatValue, &st.FeeAmount, &st.TenantPayableAmount, &st.AttemptCount,
+		&st.FiatCurrency, &st.FiatValue, &st.TenantPayableAmount, &st.AttemptCount,
 		&st.ConfirmationDeadlineAt, &st.OpsPagedAt, &st.PendingDestination, &st.CreatedAt, &st.UpdatedAt,
 	)
 	if err != nil {

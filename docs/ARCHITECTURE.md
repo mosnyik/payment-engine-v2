@@ -56,7 +56,7 @@ Nine business bounded contexts + one shared platform layer. Each module owns its
 
 | Module | Owns | Exposes (sync) | Publishes (async) | Subscribes |
 |---|---|---|---|---|
-| **tenant** | Tenant profile, fee schedule, corridor entitlements, API keys/HMAC secrets, mTLS cert refs, webhook config, portal magic links/sessions (passwordless tenant-representative login) | `GetTenant`, `ValidateCredentials`, `CheckEntitlement`, `GrantCorridorEntitlement` (jurisdiction-gated, calls into `compliance`/`corridor`) | `tenant.onboarded`, `tenant.suspended` | `compliance.kyb_decision` |
+| **tenant** | Tenant profile, corridor entitlements, API keys/HMAC secrets, mTLS cert refs, webhook config, portal magic links/sessions (passwordless tenant-representative login) | `GetTenant`, `ValidateCredentials`, `CheckEntitlement`, `GrantCorridorEntitlement` (jurisdiction-gated, calls into `compliance`/`corridor`) | `tenant.onboarded`, `tenant.suspended` | `compliance.kyb_decision` |
 | **compliance** | KYB cases (with declared currencies/jurisdictions), transaction screening cases, jurisdiction KYB requirements (required fields per fiat currency), provider registry (by corridor/currency), hold queue, rolling Travel Rule volume aggregates | `ScreenTenant()`, `ScreenSession()` — both sync, blocking; `IsJurisdictionApproved()` | `compliance.kyb_decision`, `compliance.session_decision`, `compliance.hold_created/resolved` | `session.deposit_confirmed` (updates rolling volume) |
 | **corridor** | Corridor definitions (asset+network × fiat currency), provider bindings + priority/failover, limits, Travel Rule thresholds, `compliance_hold_timeout` (default 24h, overridable per corridor), payout-destination field requirements per fiat currency | `GetCorridor`, `ListActiveProviders()` | `corridor.updated` | — |
 | **session** | Session state machine, deposit-address reference, rate-lock reference, compliance-decision reference, tenant-supplied payout destination | `CreateSession`, `GetSession` | `session.created`, `session.deposit_detected`, `session.deposit_confirmed`, `session.expired` | `treasury.deposit_detected/confirmed` |
@@ -343,17 +343,19 @@ CREATE TABLE ledger_balances (
 );
 ```
 
-**Account taxonomy**: `treasury_in_transit:{asset}`, `treasury_custody:{asset}`, `crypto_fx_clearing:{asset}`, `fiat_fx_clearing:{currency}`, `tenant_payable:{tenant}:{currency}`, `treasury_fiat_operating:{currency}`, `fee_revenue:{currency}`, `compliance_hold:{asset}`.
+**Account taxonomy**: `treasury_in_transit:{asset}`, `treasury_custody:{asset}`, `crypto_fx_clearing:{asset}`, `fiat_fx_clearing:{currency}`, `tenant_payable:{tenant}:{currency}`, `treasury_fiat_operating:{currency}`, `compliance_hold:{asset}`.
 
 **Invariant**: within a single `ledger_transactions.id`, entries balance *per asset_code*. A currency conversion is two linked, independently-balanced transactions (same `reference_id`), bridged through the `*_fx_clearing` accounts — never one mixed-unit transaction. Enforced entirely in the `ledger.Post()` code path; nothing else is allowed to write to `ledger_entries`.
 
-**Worked example** — 100 USDT-TRC20 → NGN, self-custody, 1% fee:
+**No fees.** 2Settle charges tenants nothing per transaction: the tenant is owed the full locked fiat value. The margin is the rate spread, i.e. the gap between the provider rate and the rate the session is locked at (`internal/rate` `LockRate`). The legacy `tenants.fee_bps`, `tenant_corridor_entitlements.fee_bps_override` and `settlements.fee_amount` columns are kept but unused.
+
+**Worked example** — 100 USDT-TRC20 → NGN, self-custody:
 
 | Step | Txn (`idempotency_key`) | Debit | Credit |
 |---|---|---|---|
 | Deposit confirmed (locked: 100 USDT = ₦162,000) | `deposit_confirmed:session_123` | `treasury_in_transit:USDT` 100 | `crypto_fx_clearing:USDT` 100 |
-| Fiat liability recognized | `fx_conversion:session_123` | `fiat_fx_clearing:NGN` 162,000 | `tenant_payable:{tenant}:NGN` 160,380 + `fee_revenue:NGN` 1,620 |
-| Settlement dispatched (fired by deposit_confirmed, not sweep) | `settlement_payout:session_123` | `tenant_payable:{tenant}:NGN` 160,380 | `treasury_fiat_operating:NGN` 160,380 |
+| Fiat liability recognized | `fx_conversion:session_123` | `fiat_fx_clearing:NGN` 162,000 | `tenant_payable:{tenant}:NGN` 162,000 |
+| Settlement dispatched (fired by deposit_confirmed, not sweep) | `settlement_payout:session_123` | `tenant_payable:{tenant}:NGN` 162,000 | `treasury_fiat_operating:NGN` 162,000 |
 | Sweep (async, batched per stablecoin policy) | `sweep:batch_456:session_123` | `treasury_custody:USDT` 100 | `treasury_in_transit:USDT` 100 |
 
 The `settlement_payout:session_123` idempotency key is the direct structural fix for v1's double-payout bug: `settlement` must successfully claim this ledger transaction (unique-constraint insert) *before* calling the external provider. If the insert is rejected as a duplicate, another trigger already claimed the payout — abort, don't call the provider. On provider-reported failure, a compensating `settlement_reversal:session_123` transaction reverses it, and a retry claims a new attempt-scoped key.
@@ -472,7 +474,7 @@ Not part of the original design pass — added after grounding Phase 6 in the ac
 
 **Per-session, not per-tenant.** A tenant can hold entitlements across multiple corridors at once (e.g. both an NGN and a ZMW corridor), and it's the corridor picked at session creation — not the tenant — that determines the settlement currency/country. The payout destination is therefore necessarily a property of *the session*: supplied by the tenant in the `CreateSession` request body, never a static field on the tenant record.
 
-**Corridor owns the requirement, not just the currency.** Corridor already determines the system rate (keyed by fiat currency), the effective fee (tenant's per-corridor override), and the settlement-provider failover list. Extending it to also define which destination fields a valid payout needs for that corridor (e.g. an NGN corridor requires account number + bank code; a ZMW corridor requires different fields) keeps one module as the single source of truth for "what does this corridor need to settle," instead of splitting that knowledge between `session` and whichever settlement provider adapter happens to run.
+**Corridor owns the requirement, not just the currency.** Corridor already determines the system rate (keyed by fiat currency) and the settlement-provider failover list. Extending it to also define which destination fields a valid payout needs for that corridor (e.g. an NGN corridor requires account number + bank code; a ZMW corridor requires different fields) keeps one module as the single source of truth for "what does this corridor need to settle," instead of splitting that knowledge between `session` and whichever settlement provider adapter happens to run.
 
 **Validated at `CreateSession`, immediately after the corridor lookup** — before compliance screening, rate lock, or deposit-address reservation ever run. An invalid or incomplete destination fails fast with a 400 there, rather than silently proceeding through the whole pipeline and only surfacing as a dispatch failure at settlement time, after crypto has already been collected.
 

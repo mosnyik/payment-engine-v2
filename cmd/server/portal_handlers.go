@@ -178,7 +178,6 @@ type portalTenantResponse struct {
 	ID         uuid.UUID `json:"id"`
 	Name       string    `json:"name"`
 	Status     string    `json:"status"`
-	FeeBps     int       `json:"fee_bps"`
 	WebhookURL *string   `json:"webhook_url,omitempty"`
 	CreatedAt  string    `json:"created_at"`
 }
@@ -199,7 +198,6 @@ func (h *portalHandlers) me(w http.ResponseWriter, r *http.Request) {
 		ID:         t.ID,
 		Name:       t.Name,
 		Status:     string(t.Status),
-		FeeBps:     t.FeeBps,
 		WebhookURL: t.WebhookURL,
 		CreatedAt:  t.CreatedAt.Format(http.TimeFormat),
 	})
@@ -545,8 +543,7 @@ func (h *portalHandlers) listCorridors(w http.ResponseWriter, r *http.Request) {
 // POST /v2/portal/corridors/{corridorID} {"active": true|false} — tenant
 // self-service counterpart to adminHandlers.setCorridorEntitlement. Enabling
 // is gated on an active tenant whose approved KYB covers the corridor's
-// currency, and refused (403) if an admin disabled it; fee_bps_override is
-// admin-only and not accepted here. Disabling is always allowed.
+// currency, and refused (403) if an admin disabled it. Disabling is always allowed.
 func (h *portalHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Request) {
 	tenantID, ok := portalTenantID(r)
 	if !ok {

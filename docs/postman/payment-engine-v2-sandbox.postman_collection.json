@@ -152,7 +152,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "Authorization", "value": "Bearer {{admin_token}}" }
             ],
-            "body": { "mode": "raw", "raw": "{\n  \"active\": true,\n  \"fee_bps_override\": null\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"active\": true\n}" },
             "url": {
               "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/corridors/{{corridor_id}}",
               "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "corridors", "{{corridor_id}}"]
@@ -542,7 +542,7 @@
               { "key": "Content-Type", "value": "application/json" },
               { "key": "Authorization", "value": "Bearer {{admin_token}}" }
             ],
-            "body": { "mode": "raw", "raw": "{\n  \"active\": true,\n  \"fee_bps_override\": null\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"active\": true\n}" },
             "url": {
               "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/corridors/{{corridor_id}}",
               "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "corridors", "{{corridor_id}}"]

@@ -10,21 +10,19 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/session"
 )
 
-// settlementAccounts is the six ledger accounts one settlement's postings
+// settlementAccounts is the five ledger accounts one settlement's postings
 // touch (ARCHITECTURE.md §6's account taxonomy / worked example).
 type settlementAccounts struct {
 	TreasuryInTransit     uuid.UUID
 	CryptoFXClearing      uuid.UUID
 	FiatFXClearing        uuid.UUID
 	TreasuryFiatOperating uuid.UUID
-	FeeRevenue            uuid.UUID
 	TenantPayable         uuid.UUID
 }
 
@@ -41,9 +39,6 @@ func (s *Store) resolveAccounts(ctx context.Context, tenantID uuid.UUID, cryptoA
 		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
 	}
 	if a.TreasuryFiatOperating, err = s.ledger.GetOrCreateAccount(ctx, nil, "treasury_fiat_operating", fiatCurrency, "fiat", "Treasury fiat operating: "+fiatCurrency); err != nil {
-		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
-	}
-	if a.FeeRevenue, err = s.ledger.GetOrCreateAccount(ctx, nil, "fee_revenue", fiatCurrency, "fiat", "Fee revenue: "+fiatCurrency); err != nil {
 		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
 	}
 	tid := tenantID
@@ -126,7 +121,7 @@ func (s *Store) claimNextPendingDispatch(ctx context.Context) (*Settlement, erro
 }
 
 // processSettlement is steps 1-8 of the plan: load the session's confirmed
-// deposit and rate lock, compute the fee split, post the previously-deferred
+// deposit and rate lock, post the previously-deferred
 // deposit_confirmed/fx_conversion ledger transactions (ARCHITECTURE.md §6's
 // worked example rows 1-2), transition both settlement and session to
 // settling, then dispatch the first payout attempt.
@@ -150,16 +145,10 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 	}
 	fiatValue := lock.CryptoToFiat(cryptoAmount)
 
-	feeBps, err := s.feeResolver.EffectiveFeeBps(ctx, sess.TenantID, sess.CorridorID)
-	if err != nil {
-		return fmt.Errorf("settlement: get effective fee bps: %w", err)
-	}
-	// tenantPayable is derived by subtraction, never independently rounded
-	// — ledger.Post rejects any transaction whose entries don't net to
-	// exactly zero per asset, so feeAmount + tenantPayable must equal
-	// fiatValue exactly.
-	feeAmount := fiatValue.Mul(decimal.NewFromInt(int64(feeBps))).Div(decimal.NewFromInt(10000)).Round(2)
-	tenantPayable := fiatValue.Sub(feeAmount)
+	// No fee is charged: the tenant is owed the full locked fiat value.
+	// 2Settle's margin is the spread already built into the locked rate
+	// (internal/rate LockRate), not a deduction here.
+	tenantPayable := fiatValue
 
 	accounts, err := s.resolveAccounts(ctx, sess.TenantID, sess.CryptoAsset, sess.FiatCurrency)
 	if err != nil {
@@ -189,7 +178,6 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 		Entries: []ledger.Entry{
 			{AccountID: accounts.FiatFXClearing, Direction: ledger.Debit, Amount: fiatValue, AssetCode: sess.FiatCurrency},
 			{AccountID: accounts.TenantPayable, Direction: ledger.Credit, Amount: tenantPayable, AssetCode: sess.FiatCurrency},
-			{AccountID: accounts.FeeRevenue, Direction: ledger.Credit, Amount: feeAmount, AssetCode: sess.FiatCurrency},
 		},
 	}); err != nil && !errors.Is(err, ledger.ErrAlreadyPosted) {
 		return fmt.Errorf("settlement: post fx_conversion: %w", err)
@@ -197,9 +185,9 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE settlements SET status = 'settling', crypto_asset = $2, crypto_amount = $3,
-		   fiat_currency = $4, fiat_value = $5, fee_amount = $6, tenant_payable_amount = $7, updated_at = now()
+		   fiat_currency = $4, fiat_value = $5, tenant_payable_amount = $6, updated_at = now()
 		 WHERE id = $1 AND status = 'dispatching'`,
-		st.ID, sess.CryptoAsset, cryptoAmount, sess.FiatCurrency, fiatValue, feeAmount, tenantPayable,
+		st.ID, sess.CryptoAsset, cryptoAmount, sess.FiatCurrency, fiatValue, tenantPayable,
 	); err != nil {
 		return fmt.Errorf("settlement: update to settling: %w", err)
 	}
@@ -214,7 +202,7 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 	st.TenantID, st.CorridorID = sess.TenantID, sess.CorridorID
 	st.CryptoAsset, st.CryptoAmount = sess.CryptoAsset, cryptoAmount
 	st.FiatCurrency, st.FiatValue = sess.FiatCurrency, fiatValue
-	st.FeeAmount, st.TenantPayableAmount = feeAmount, tenantPayable
+	st.TenantPayableAmount = tenantPayable
 	st.Status = StatusSettling
 
 	return s.dispatchAttempt(ctx, st)

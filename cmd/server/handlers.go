@@ -240,7 +240,7 @@ func (h *adminHandlers) issueAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"api_key": apiKey, "hmac_secret": hmacSecret})
 }
 
-// POST /admin/tenants/{tenantID}/corridors/{corridorID} {"active": true, "fee_bps_override": null} — step 5.
+// POST /admin/tenants/{tenantID}/corridors/{corridorID} {"active": true} — step 5.
 // Activation (active: true) is compliance-gated (Phase 10): it only
 // succeeds if the tenant has an approved KYB case declaring the corridor's
 // fiat currency. Deactivation (active: false) is never gated — revoking
@@ -258,8 +258,7 @@ func (h *adminHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Re
 	}
 
 	var req struct {
-		Active         bool `json:"active"`
-		FeeBpsOverride *int `json:"fee_bps_override"`
+		Active bool `json:"active"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -267,7 +266,7 @@ func (h *adminHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Re
 	}
 
 	if req.Active {
-		if err := h.tenant.GrantCorridorEntitlement(r.Context(), tenantID, corridorID, req.FeeBpsOverride); err != nil {
+		if err := h.tenant.GrantCorridorEntitlement(r.Context(), tenantID, corridorID); err != nil {
 			if errors.Is(err, tenant.ErrJurisdictionNotApproved) {
 				writeErr(w, http.StatusBadRequest, err)
 				return
@@ -275,7 +274,7 @@ func (h *adminHandlers) setCorridorEntitlement(w http.ResponseWriter, r *http.Re
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-	} else if err := h.tenant.SetCorridorEntitlement(r.Context(), tenantID, corridorID, false, req.FeeBpsOverride); err != nil {
+	} else if err := h.tenant.SetCorridorEntitlement(r.Context(), tenantID, corridorID, false); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}

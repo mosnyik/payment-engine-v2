@@ -88,7 +88,7 @@ func TestSessionCreateAndDepositFlowOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert corridor: %v", err)
 	}
-	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corridorID, true, nil); err != nil {
+	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corridorID, true); err != nil {
 		t.Fatalf("set corridor entitlement: %v", err)
 	}
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {

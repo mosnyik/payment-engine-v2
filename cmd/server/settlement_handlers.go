@@ -88,7 +88,6 @@ type settlementResponse struct {
 	CryptoAmount        string    `json:"crypto_amount"`
 	FiatCurrency        string    `json:"fiat_currency"`
 	FiatValue           string    `json:"fiat_value"`
-	FeeAmount           string    `json:"fee_amount"`
 	TenantPayableAmount string    `json:"tenant_payable_amount"`
 	AttemptCount        int       `json:"attempt_count"`
 	OpsPaged            bool      `json:"ops_paged"`
@@ -105,7 +104,6 @@ func toSettlementResponse(st *settlement.Settlement) settlementResponse {
 		CryptoAmount:        st.CryptoAmount.String(),
 		FiatCurrency:        st.FiatCurrency,
 		FiatValue:           st.FiatValue.String(),
-		FeeAmount:           st.FeeAmount.String(),
 		TenantPayableAmount: st.TenantPayableAmount.String(),
 		AttemptCount:        st.AttemptCount,
 		OpsPaged:            st.OpsPagedAt != nil,
@@ -147,7 +145,7 @@ func (h *settlementHandlers) retrySettlement(w http.ResponseWriter, r *http.Requ
 
 	var req struct {
 		CorrectedDestination json.RawMessage `json:"corrected_destination"`
-		ConfirmedFailed       bool            `json:"confirmed_failed"`
+		ConfirmedFailed      bool            `json:"confirmed_failed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)

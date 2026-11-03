@@ -221,6 +221,10 @@ Verified: `internal/settlement/hyparrow_test.go` (dispatch outcome table against
 
 *Ops to-do before go-live (config/data, not code): set `HYPARROW_*` and `TELEGRAM_*`, register both webhooks (see `.env.example`), bind the NGN corridor's settlement provider to `hyparrow`, and set its `required_destination_fields` to `account_number, bank_code, account_name`.*
 
+## Phase 15 — No transaction fees ✅ complete
+
+2Settle charges tenants no fee; its margin is the rate spread built into every rate lock (`internal/rate` `LockRate`). Settlement now credits the tenant the full locked fiat value: `fx_conversion` is a two-leg entry (`fiat_fx_clearing` → `tenant_payable`) with no `fee_revenue` leg. Removed `settlement.FeeResolver`, `tenant.Store.EffectiveFeeBps`, the `feeBpsOverride` parameter on `SetCorridorEntitlement`/`GrantCorridorEntitlement`, and the `fee_bps`/`fee_bps_override`/`fee_amount` API fields (an old client still sending `fee_bps_override` is ignored, not rejected). The DB columns are kept but unused; migration `000036` defaults `tenants.fee_bps` to 0 so new rows don't suggest a fee. Earlier phases' notes that mention the 1% fee describe what was built then.
+
 ## Dependency summary
 
 ```

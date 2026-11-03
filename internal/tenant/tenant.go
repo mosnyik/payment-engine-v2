@@ -1,5 +1,5 @@
 // Package tenant is the bank/fintech account that integrates with the
-// rail: profile, fee schedule, corridor entitlements, and credential
+// rail: profile, corridor entitlements, and credential
 // storage. Implements gateway.CredentialLookup so the tenant-facing API
 // gateway can authenticate requests without depending on this package
 // directly — only on the interface it satisfies.
@@ -111,7 +111,6 @@ type Tenant struct {
 	ID         uuid.UUID
 	Name       string
 	Status     Status
-	FeeBps     int
 	WebhookURL *string
 	CreatedAt  time.Time
 }
@@ -187,9 +186,9 @@ func (s *Store) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
 	var t Tenant
 	var status string
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, name, status, fee_bps, webhook_url, created_at FROM tenants WHERE id = $1`,
+		`SELECT id, name, status, webhook_url, created_at FROM tenants WHERE id = $1`,
 		id,
-	).Scan(&t.ID, &t.Name, &status, &t.FeeBps, &t.WebhookURL, &t.CreatedAt)
+	).Scan(&t.ID, &t.Name, &status, &t.WebhookURL, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -219,7 +218,7 @@ func (s *Store) ListTenants(ctx context.Context, status *Status, limit, offset i
 		return nil, 0, fmt.Errorf("tenant: list tenants: count: %w", err)
 	}
 
-	query := `SELECT id, name, status, fee_bps, webhook_url, created_at FROM tenants
+	query := `SELECT id, name, status, webhook_url, created_at FROM tenants
 		WHERE ($1::text IS NULL OR status = $1) ORDER BY created_at DESC`
 	args := []any{statusFilter}
 	if limit > 0 {
@@ -237,7 +236,7 @@ func (s *Store) ListTenants(ctx context.Context, status *Status, limit, offset i
 	for rows.Next() {
 		var t Tenant
 		var st string
-		if err := rows.Scan(&t.ID, &t.Name, &st, &t.FeeBps, &t.WebhookURL, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &st, &t.WebhookURL, &t.CreatedAt); err != nil {
 			return nil, 0, fmt.Errorf("tenant: list tenants: scan: %w", err)
 		}
 		t.Status = Status(st)
@@ -711,19 +710,18 @@ func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uu
 	return secret, tenantID, keyID, rateLimitTier, allowedCIDRs, permissions, true, nil
 }
 
-// SetCorridorEntitlement grants or revokes a tenant's access to a corridor,
-// with an optional per-corridor fee override. This is the admin path: a
+// SetCorridorEntitlement grants or revokes a tenant's access to a corridor.
+// This is the admin path: a
 // revoke here marks the row disabled_by_admin, which blocks the tenant from
 // re-enabling it via EnableCorridorSelfService; a grant clears it.
-func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, active bool, feeBpsOverride *int) error {
+func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, active bool) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, fee_bps_override, disabled_by_admin)
-		 VALUES ($1, $2, $3, $4, NOT $3)
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, disabled_by_admin)
+		 VALUES ($1, $2, $3, NOT $3)
 		 ON CONFLICT (tenant_id, corridor_id) DO UPDATE SET
 			active = EXCLUDED.active,
-			fee_bps_override = EXCLUDED.fee_bps_override,
 			disabled_by_admin = EXCLUDED.disabled_by_admin`,
-		tenantID, corridorID, active, feeBpsOverride,
+		tenantID, corridorID, active,
 	)
 	if err != nil {
 		return fmt.Errorf("tenant: set corridor entitlement: %w", err)
@@ -737,13 +735,13 @@ func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID
 // currency's jurisdiction, so an admin can't ride a tenant's original
 // (e.g. NGN) approval into a corridor under a different regulator (e.g.
 // KES) it never covered. Revocation doesn't go through this — callers
-// should call SetCorridorEntitlement(ctx, tenantID, corridorID, false, ...)
+// should call SetCorridorEntitlement(ctx, tenantID, corridorID, false)
 // directly, since a compliance check has no bearing on turning access off.
-func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, feeBpsOverride *int) error {
+func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID) error {
 	if err := s.checkCorridorJurisdiction(ctx, tenantID, corridorID); err != nil {
 		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
 	}
-	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, feeBpsOverride)
+	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true)
 }
 
 // checkCorridorJurisdiction is the Phase 10 compliance gate shared by the
@@ -771,8 +769,7 @@ func (s *Store) checkCorridorJurisdiction(ctx context.Context, tenantID, corrido
 
 // EnableCorridorSelfService is the tenant portal's counterpart to
 // GrantCorridorEntitlement: same tenant-status and jurisdiction gates, but
-// it never touches fee_bps_override (a tenant must not set its own fee, and
-// an admin-set override survives a tenant re-enable), and it refuses a row
+// it refuses a row
 // an admin disabled — the conditional upsert makes that check and the write
 // one atomic statement.
 func (s *Store) EnableCorridorSelfService(ctx context.Context, tenantID, corridorID uuid.UUID) error {
@@ -871,31 +868,6 @@ func (s *Store) CheckEntitlement(ctx context.Context, tenantID, corridorID uuid.
 		return false, fmt.Errorf("tenant: check entitlement: %w", err)
 	}
 	return active, nil
-}
-
-// EffectiveFeeBps resolves the fee (in basis points) settlement should apply
-// for a tenant on a corridor: the corridor entitlement's fee_bps_override if
-// set, else the tenant's flat FeeBps. Requires an entitlement row to exist
-// (i.e. CheckEntitlement must already have passed) — a tenant with no
-// entitlement on this corridor has nothing to fall back to but its own
-// FeeBps, so this deliberately doesn't try to guess a default from a
-// missing row the way CheckEntitlement's "no row = false" does.
-func (s *Store) EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error) {
-	var feeBps int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(e.fee_bps_override, t.fee_bps)
-		 FROM tenants t
-		 JOIN tenant_corridor_entitlements e ON e.tenant_id = t.id AND e.corridor_id = $2
-		 WHERE t.id = $1`,
-		tenantID, corridorID,
-	).Scan(&feeBps)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("tenant: effective fee bps: %w", ErrNotFound)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("tenant: effective fee bps: %w", err)
-	}
-	return feeBps, nil
 }
 
 // SetWebhookURL validates and stores a tenant's outbound webhook endpoint.

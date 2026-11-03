@@ -236,7 +236,7 @@ func TestCorridorEntitlement_GrantAndRevoke(t *testing.T) {
 		t.Fatal("expected no entitlement before it's granted")
 	}
 
-	if err := s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, nil); err != nil {
+	if err := s.SetCorridorEntitlement(ctx, tenantID, corridorID, true); err != nil {
 		t.Fatalf("grant entitlement: %v", err)
 	}
 	entitled, err = s.CheckEntitlement(ctx, tenantID, corridorID)
@@ -247,7 +247,7 @@ func TestCorridorEntitlement_GrantAndRevoke(t *testing.T) {
 		t.Fatal("expected entitlement after granting it")
 	}
 
-	if err := s.SetCorridorEntitlement(ctx, tenantID, corridorID, false, nil); err != nil {
+	if err := s.SetCorridorEntitlement(ctx, tenantID, corridorID, false); err != nil {
 		t.Fatalf("revoke entitlement: %v", err)
 	}
 	entitled, err = s.CheckEntitlement(ctx, tenantID, corridorID)
@@ -290,7 +290,7 @@ func TestGrantCorridorEntitlement_GateNotConfigured(t *testing.T) {
 
 	// SetJurisdictionGate was never called on this Store — must fail
 	// closed, not silently allow the grant through.
-	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil); err == nil {
+	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID); err == nil {
 		t.Fatal("expected an error when the jurisdiction gate isn't configured")
 	}
 }
@@ -310,7 +310,7 @@ func TestGrantCorridorEntitlement_UnapprovedJurisdictionRejected(t *testing.T) {
 	corridorID := mustCreateCorridor(t, pool, "ZAR")
 
 	// No KYB case at all yet for this tenant/currency.
-	err = s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil)
+	err = s.GrantCorridorEntitlement(ctx, tenantID, corridorID)
 	if !errors.Is(err, tenant.ErrJurisdictionNotApproved) {
 		t.Fatalf("expected ErrJurisdictionNotApproved, got %v", err)
 	}
@@ -344,7 +344,7 @@ func TestGrantCorridorEntitlement_ApprovedJurisdictionSucceeds(t *testing.T) {
 		t.Fatalf("screen tenant: %v", err)
 	}
 
-	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID, nil); err != nil {
+	if err := s.GrantCorridorEntitlement(ctx, tenantID, corridorID); err != nil {
 		t.Fatalf("grant corridor entitlement: %v", err)
 	}
 	entitled, err := s.CheckEntitlement(ctx, tenantID, corridorID)

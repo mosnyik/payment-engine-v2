@@ -115,7 +115,7 @@ func setupTestEnv(t *testing.T, providerName string, decision compliance.Decisio
 	if err != nil {
 		t.Fatalf("upsert corridor: %v", err)
 	}
-	if err := tenantStore.SetCorridorEntitlement(ctx, tenantID, corridorID, true, nil); err != nil {
+	if err := tenantStore.SetCorridorEntitlement(ctx, tenantID, corridorID, true); err != nil {
 		t.Fatalf("set corridor entitlement: %v", err)
 	}
 

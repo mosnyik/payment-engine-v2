@@ -1,6 +1,6 @@
 // Tenant self-service corridor entitlement: drives GET/POST
 // /v2/portal/corridors through the real router, proving the jurisdiction
-// gate, the admin-revoke lock, and that a tenant can never set its own fee.
+// gate and the admin-revoke lock.
 package main
 
 import (
@@ -179,21 +179,6 @@ func TestPortalCorridorSelfService(t *testing.T) {
 	}
 	if resp = setActive(approvedID, true); resp.StatusCode != http.StatusOK {
 		t.Fatalf("self re-enable: expected 200, got %d", resp.StatusCode)
-	}
-
-	// --- An admin-set fee override survives a tenant re-enable ---
-	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/tenants/"+tenantID.String()+"/corridors/"+approvedID.String(), adminLogin.Token, map[string]any{
-		"active": true, "fee_bps_override": 42,
-	}, nil)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("admin grant with fee override: expected 200, got %d", resp.StatusCode)
-	}
-	setActive(approvedID, false)
-	if resp = setActive(approvedID, true); resp.StatusCode != http.StatusOK {
-		t.Fatalf("re-enable after admin fee override: expected 200, got %d", resp.StatusCode)
-	}
-	if fee, err := stores.tenant.EffectiveFeeBps(ctx, tenantID, approvedID); err != nil || fee != 42 {
-		t.Fatalf("expected admin fee override 42 to survive a tenant re-enable, got %d (err %v)", fee, err)
 	}
 
 	// --- Admin revoke sticks: the tenant can't undo it ---

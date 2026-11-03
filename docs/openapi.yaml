@@ -696,9 +696,6 @@ paths:
               type: object
               properties:
                 active: { type: boolean }
-                fee_bps_override:
-                  type: integer
-                  nullable: true
       responses:
         "200":
           description: Entitlement set
@@ -740,9 +737,8 @@ paths:
         Self-service counterpart to POST /admin/tenants/{tenantID}/corridors/{corridorID}.
         Enabling requires an active tenant whose approved KYB declared the
         corridor's fiat currency, and is refused if an admin disabled this
-        entitlement (only an admin can re-grant it). A tenant cannot set a
-        fee override; an admin-set override is preserved. Disabling is
-        always allowed.
+        entitlement (only an admin can re-grant it). Disabling is always
+        allowed.
       security: [{ portalAuth: [] }]
       parameters:
         - name: corridorID
@@ -1102,7 +1098,6 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         status: { type: string, enum: [pending_kyb, active, suspended, deleted] }
-        fee_bps: { type: integer }
         webhook_url: { type: string, nullable: true }
         created_at: { type: string }
 
@@ -1249,7 +1244,6 @@ components:
         crypto_amount: { type: string }
         fiat_currency: { type: string }
         fiat_value: { type: string }
-        fee_amount: { type: string }
         tenant_payable_amount: { type: string }
         attempt_count: { type: integer }
         ops_paged: { type: boolean }

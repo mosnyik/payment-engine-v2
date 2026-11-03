@@ -297,7 +297,7 @@ func TestAdminUpdateAndDeactivateCorridor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register tenant: %v", err)
 	}
-	if err := env.stores.tenant.SetCorridorEntitlement(ctx, tenantID, id, true, nil); err != nil {
+	if err := env.stores.tenant.SetCorridorEntitlement(ctx, tenantID, id, true); err != nil {
 		t.Fatalf("set entitlement: %v", err)
 	}
 	if resp = patch(map[string]any{"active": false}, &got); resp.StatusCode != http.StatusOK || got.Active {
