@@ -14,6 +14,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
+	"github.com/sirfi/payment-engine-v2/internal/session"
 )
 
 // settlementAccounts is the six ledger accounts one settlement's postings
@@ -202,8 +203,12 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 	); err != nil {
 		return fmt.Errorf("settlement: update to settling: %w", err)
 	}
-	if _, err := s.sessionStore.TransitionToSettling(ctx, sess.ID); err != nil {
-		return fmt.Errorf("settlement: transition session to settling: %w", err)
+	// An ops retry (RetryPayout) has already moved the session back to
+	// settling itself; only a first dispatch comes from deposit_confirmed.
+	if sess.Status != session.StatusSettling {
+		if _, err := s.sessionStore.TransitionToSettling(ctx, sess.ID); err != nil {
+			return fmt.Errorf("settlement: transition session to settling: %w", err)
+		}
 	}
 
 	st.TenantID, st.CorridorID = sess.TenantID, sess.CorridorID
@@ -309,8 +314,12 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 		return fmt.Errorf("settlement: claim settlement_payout: %w", err)
 	}
 
-	attemptPayload := st.PendingDestination
-	if attemptPayload == nil {
+	destination, err := s.resolveDestination(ctx, st)
+	if err != nil {
+		return err
+	}
+	attemptPayload := destination
+	if len(attemptPayload) == 0 {
 		attemptPayload = json.RawMessage("{}")
 	}
 	var attemptID uuid.UUID
@@ -331,13 +340,11 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 
 	result, err := provider.Dispatch(ctx, PayoutRequest{
 		SessionID:             st.SessionID,
+		AttemptNumber:         attemptNumber,
 		AttemptIdempotencyKey: idempotencyKey,
 		FiatCurrency:          st.FiatCurrency,
 		Amount:                st.TenantPayableAmount,
-		// Destination: whatever ops supplied via RetryPayout's
-		// corrected-details path, if this is a retry — nil on a first
-		// attempt (no tenant-level payout-destination schema exists yet).
-		Destination: st.PendingDestination,
+		Destination:           destination,
 	})
 	if err != nil {
 		return fmt.Errorf("settlement: dispatch to %q: %w", provider.Name(), err)
@@ -362,6 +369,23 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 			return err
 		})
 		return err
+	case OutcomeUncertain:
+		// May be in flight: no reversal, no retry, no manual payout. Keep the
+		// reference so the provider's webhook can still resolve it, and page
+		// ops now rather than waiting out ConfirmationTimeout.
+		deadline := time.Now().Add(ConfirmationTimeout)
+		if _, err := s.transitionSettlementAndPublish(ctx, st, StatusSettling, StatusSettling, "settlement.dispatched", func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `UPDATE settlement_attempts SET provider_reference = $2, failure_reason = $3 WHERE id = $1`, attemptID, result.ProviderReference, result.FailureReason); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE settlements SET confirmation_deadline_at = $2, ops_paged_at = now() WHERE id = $1`, st.ID, deadline)
+			return err
+		}); err != nil {
+			return err
+		}
+		log.Printf("settlement: %s attempt %d outcome uncertain on %s, ops paged: %s", st.ID, attemptNumber, provider.Name(), result.FailureReason)
+		s.alertReview(ctx, st, result.ProviderReference, provider.Name()+": "+result.FailureReason)
+		return nil
 	case OutcomeRejectedTerminal:
 		return s.handleAttemptFailure(ctx, attempt, "failed_bucket4", result.FailureReason, true)
 	default: // OutcomeRejectedRetryable
@@ -438,7 +462,21 @@ func (s *Store) handleAttemptFailure(ctx context.Context, attempt *settlementAtt
 // (ARCHITECTURE.md §8: bucket 4 immediately, or buckets 1/2 once the
 // 3-attempt cap is exhausted). Releases the deposit reservation and pages
 // ops right away, independent of sla_breached_at.
+//
+// With the Telegram fallback configured, it first tries handing the payout
+// to ops to pay by hand (manual.go) — settlement_failed is then only the
+// outcome when that alert can't be delivered.
 func (s *Store) failSettlement(ctx context.Context, st *Settlement, reason string) error {
+	if s.telegram != nil {
+		handled, err := s.handToManualPayout(ctx, st, reason)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	transitioned, err := s.transitionSettlementAndPublish(ctx, st, StatusSettling, StatusSettlementFailed, "settlement.failed", func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE settlements SET ops_paged_at = now() WHERE id = $1`, st.ID)
 		return err

@@ -42,8 +42,12 @@ const (
 	StatusSettling         Status = "settling"
 	StatusSettled          Status = "settled"
 	StatusSettlementFailed Status = "settlement_failed"
-	StatusReversed         Status = "reversed"
-	StatusReversalResolved Status = "reversal_resolved"
+	// StatusAwaitingManualPayout is settlements-row-local too: automatic
+	// payout gave up and the Telegram fallback handed it to ops to pay by
+	// hand (manual.go). The session stays settling meanwhile.
+	StatusAwaitingManualPayout Status = "awaiting_manual_payout"
+	StatusReversed             Status = "reversed"
+	StatusReversalResolved     Status = "reversal_resolved"
 )
 
 // Retry policy constants (ARCHITECTURE.md §8's "Settlement retry policy") —
@@ -97,6 +101,11 @@ type Config struct {
 	Paystack    SettlementProviderConfig
 	Monnify     SettlementProviderConfig
 	HydrogenPay SettlementProviderConfig
+	Hyparrow    HyparrowConfig
+
+	// Telegram is the manual-payout fallback (manual.go). Disabled, a
+	// payout that can't go out automatically ends in settlement_failed.
+	Telegram TelegramConfig
 
 	// SandboxMode registers the fake sandbox settlement provider (see
 	// sandbox_provider.go) — set from config.Config.SandboxMode by
@@ -114,6 +123,10 @@ type Store struct {
 	feeResolver   FeeResolver
 
 	providers map[string]SettlementProvider
+
+	// telegram is the manual-payout fallback and ops alert channel. Nil
+	// when not configured — every use is nil-checked.
+	telegram *telegramNotifier
 
 	// bus publishes settlement.dispatched/completed/failed/reversed. Nil-safe
 	// — a Store built without one just skips publishing, same convention
@@ -134,12 +147,14 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 	paystack := newPaystackProvider(cfg.Paystack)
 	monnify := newMonnifyProvider(cfg.Monnify)
 	hydrogenpay := newHydrogenPayProvider(cfg.HydrogenPay)
+	hyparrow := newHyparrowProvider(cfg.Hyparrow)
 	providers := map[string]SettlementProvider{
 		cngn.Name():        cngn,
 		flutterwave.Name(): flutterwave,
 		paystack.Name():    paystack,
 		monnify.Name():     monnify,
 		hydrogenpay.Name(): hydrogenpay,
+		hyparrow.Name():    hyparrow,
 	}
 	if cfg.SandboxMode {
 		sandbox := sandboxSettlementProvider{}
@@ -154,6 +169,7 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 		rateStore:     rateStore,
 		feeResolver:   feeResolver,
 		providers:     providers,
+		telegram:      newTelegramNotifier(cfg.Telegram),
 	}
 }
 

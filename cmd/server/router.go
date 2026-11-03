@@ -139,6 +139,10 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// limits.
 	r.With(webhookLimit).Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
 
+	// Telegram manual-payout buttons — same unauthenticated tier, verified
+	// against the setWebhook secret_token plus the configured ops chat ID.
+	r.With(webhookLimit).Post("/webhooks/telegram", sth.handleTelegramWebhook)
+
 	// Same unauthenticated, self-verified tier as the settlement webhook
 	// above — self-custody deposit detection already runs via watcher
 	// polling (treasury/watcher.go), so this is only Busha's partner-

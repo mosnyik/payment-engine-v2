@@ -146,6 +146,8 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),
 		Monnify:     settlement.SettlementProviderConfig(cfg.Settlement.Monnify),
 		HydrogenPay: settlement.SettlementProviderConfig(cfg.Settlement.HydrogenPay),
+		Hyparrow:    settlement.HyparrowConfig(cfg.Settlement.Hyparrow),
+		Telegram:    settlement.TelegramConfig(cfg.Settlement.Telegram),
 		SandboxMode: cfg.SandboxMode,
 	})
 	settlementStore.SetEventBus(bus)

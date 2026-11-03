@@ -212,20 +212,49 @@ type SettlementProviderConfig struct {
 	WebhookSecret string
 }
 
+// HyparrowConfig configures the Hyparrow NGN payout adapter
+// (internal/settlement/hyparrow.go). Env names match v1's so the same
+// credentials carry over. Disabled unless HYPARROW_ENABLED is set and every
+// credential and sender field is present.
+type HyparrowConfig struct {
+	Enabled          bool
+	BaseURL          string
+	APIKey           string
+	APISecret        string
+	WebhookSecret    string
+	SenderPhone      string
+	SenderEmail      string
+	SenderLastname   string
+	SenderOthernames string
+	Timeout          time.Duration
+}
+
+// TelegramConfig configures the ops Telegram group settlement falls back to
+// for manual payout (internal/settlement/manual.go). Env names match v1's.
+type TelegramConfig struct {
+	Enabled       bool
+	BotToken      string
+	ChatID        string
+	WebhookSecret string
+	APIURL        string
+}
+
 // SettlementConfig is settlement's operational tuning — see
-// internal/settlement and ARCHITECTURE.md §8. No settlement partner is
-// integrated yet; CNGN/Flutterwave/Paystack/Monnify/HydrogenPay are the
-// named candidates the business is evaluating, each a disabled-by-default
-// TODO-stub adapter until a real one is chosen. The retry policy's numbers
-// (3-attempt cap, 10-minute confirmation timeout, ~60s backoff) are fixed
-// design constants in internal/settlement, not configured here — only how
-// often the two background jobs poll is an ops knob.
+// internal/settlement and ARCHITECTURE.md §8. Hyparrow is the live NGN
+// payout partner, with the Telegram group as the manual fallback;
+// CNGN/Flutterwave/Paystack/Monnify/HydrogenPay remain disabled-by-default
+// TODO-stub adapters. The retry policy's numbers (3-attempt cap, 10-minute
+// confirmation timeout, ~60s backoff) are fixed design constants in
+// internal/settlement, not configured here — only how often the two
+// background jobs poll is an ops knob.
 type SettlementConfig struct {
 	CNGN        SettlementProviderConfig
 	Flutterwave SettlementProviderConfig
 	Paystack    SettlementProviderConfig
 	Monnify     SettlementProviderConfig
 	HydrogenPay SettlementProviderConfig
+	Hyparrow    HyparrowConfig
+	Telegram    TelegramConfig
 
 	DispatchPollInterval     time.Duration // default 3s — settlement must be near-real-time
 	TimeoutCheckPollInterval time.Duration // default 60s
@@ -418,7 +447,26 @@ func Load(source Source) (*Config, error) {
 		Paystack:                 loadSettlementProviderConfig(source, "PAYSTACK_SETTLEMENT"),
 		Monnify:                  loadSettlementProviderConfig(source, "MONNIFY_SETTLEMENT"),
 		HydrogenPay:              loadSettlementProviderConfig(source, "HYDROGENPAY_SETTLEMENT"),
-		DispatchPollInterval:     durationOrDefault(source, "SETTLEMENT_DISPATCH_POLL_INTERVAL", 3*time.Second, &errs),
+		Hyparrow: HyparrowConfig{
+			Enabled:          boolOrDefault(source, "HYPARROW_ENABLED", false),
+			BaseURL:          stringOrDefault(source, "HYPARROW_BASE_URL", "https://sandbox.hyparrow.cloud/api/v1"),
+			APIKey:           stringOrDefault(source, "HYPARROW_API_KEY", ""),
+			APISecret:        stringOrDefault(source, "HYPARROW_API_SECRET", ""),
+			WebhookSecret:    stringOrDefault(source, "HYPARROW_WEBHOOK_SECRET", ""),
+			SenderPhone:      stringOrDefault(source, "HYPARROW_SENDER_PHONE", ""),
+			SenderEmail:      stringOrDefault(source, "HYPARROW_SENDER_EMAIL", ""),
+			SenderLastname:   stringOrDefault(source, "HYPARROW_SENDER_LASTNAME", ""),
+			SenderOthernames: stringOrDefault(source, "HYPARROW_SENDER_OTHERNAMES", ""),
+			Timeout:          durationOrDefault(source, "HYPARROW_TIMEOUT", 30*time.Second, &errs),
+		},
+		Telegram: TelegramConfig{
+			Enabled:       boolOrDefault(source, "TELEGRAM_ALERTS_ENABLED", false),
+			BotToken:      stringOrDefault(source, "TELEGRAM_BOT_TOKEN", ""),
+			ChatID:        stringOrDefault(source, "TELEGRAM_CHAT_ID", ""),
+			WebhookSecret: stringOrDefault(source, "TELEGRAM_WEBHOOK_SECRET", ""),
+			APIURL:        stringOrDefault(source, "TELEGRAM_API_URL", "https://api.telegram.org"),
+		},
+		DispatchPollInterval:    durationOrDefault(source, "SETTLEMENT_DISPATCH_POLL_INTERVAL", 3*time.Second, &errs),
 		TimeoutCheckPollInterval: durationOrDefault(source, "SETTLEMENT_TIMEOUT_CHECK_POLL_INTERVAL", 60*time.Second, &errs),
 	}
 

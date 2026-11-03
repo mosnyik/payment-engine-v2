@@ -29,7 +29,7 @@ CREATE TABLE corridors (
 -- (ARCHITECTURE.md's settlement retry policy fails over to the next
 -- provider in this order before retrying the one that just failed).
 -- provider_name is a key into the in-code adapter registry (e.g. 'busha',
--- 'self_custody_hd', 'mongoro') — the row wires an existing adapter into
+-- 'self_custody_hd', 'hyparrow') — the row wires an existing adapter into
 -- this corridor; it doesn't define new adapter behavior.
 CREATE TABLE corridor_providers (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),

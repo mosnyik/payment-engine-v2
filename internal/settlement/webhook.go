@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -33,6 +34,42 @@ const (
 	WebhookPayoutFailed    WebhookEventType = "payout.failed"
 	WebhookPayoutReturned  WebhookEventType = "payout.returned"
 )
+
+// genericWebhookSignatureHeader is where the TODO-stub adapters' callbacks
+// carry their HMAC signature. Real adapters (hyparrow.go) read their own
+// headers in their own parseWebhook.
+const genericWebhookSignatureHeader = "X-Webhook-Signature"
+
+// webhookEventKind is what a provider callback means for the attempt it
+// references, independent of how that provider names or shapes it.
+type webhookEventKind int
+
+const (
+	// webhookIgnored: an event that doesn't affect settlement (e.g. a
+	// wallet-funded or test event). Acknowledged, nothing else.
+	webhookIgnored webhookEventKind = iota
+	// webhookSucceeded: the payout landed.
+	webhookSucceeded
+	// webhookFailed: bucket 2 — definitively failed, nothing in flight.
+	webhookFailed
+	// webhookReturned: a return after an initial success.
+	webhookReturned
+	// webhookReversed: the provider says the funds came back. Treated as
+	// webhookFailed while the attempt is still dispatched, and as
+	// webhookReturned if the attempt had already succeeded.
+	webhookReversed
+	// webhookDeclined: declined, but the funds haven't come back yet and
+	// the decline can still resolve either way — still in flight, so a
+	// human is paged but nothing is retried or paid manually.
+	webhookDeclined
+)
+
+// webhookEvent is a verified, provider-neutral payout callback.
+type webhookEvent struct {
+	Kind              webhookEventKind
+	ProviderReference string
+	Reason            string
+}
 
 // webhookPayload is a TODO-shaped inbound webhook body — replace with each
 // provider's real payload once known, same swap providers.go's outbound
@@ -64,45 +101,115 @@ func VerifyWebhookSignature(secret string, body []byte, signatureHeader string) 
 	return nil
 }
 
-// HandleSettlementWebhook processes one payout-provider callback: verifies
-// the signature using that provider's configured secret, resolves it to a
-// settlement_attempts row, then applies the same WHERE status = <expected>
-// compare-and-set discipline every transition in this codebase uses.
-// Idempotent on redelivery — a webhook resolving an already-resolved
-// attempt is a safe no-op, not an error.
-func (s *Store) HandleSettlementWebhook(ctx context.Context, providerName string, body []byte, signatureHeader string) error {
-	provider, ok := s.providers[providerName]
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrUnknownProvider, providerName)
-	}
-	secret := provider.webhookSecret()
+// parseGenericWebhook is the TODO-stub adapters' shared callback scheme:
+// hex HMAC-SHA256 of the raw body in genericWebhookSignatureHeader, body
+// shaped like webhookPayload.
+func parseGenericWebhook(providerName, secret string, header http.Header, body []byte) (webhookEvent, error) {
 	if secret == "" {
-		return fmt.Errorf("%w: %s has no webhook secret configured", ErrUnknownProvider, providerName)
+		return webhookEvent{}, fmt.Errorf("%w: %s has no webhook secret configured", ErrUnknownProvider, providerName)
 	}
-	if err := VerifyWebhookSignature(secret, body, signatureHeader); err != nil {
-		return err
+	if err := VerifyWebhookSignature(secret, body, header.Get(genericWebhookSignatureHeader)); err != nil {
+		return webhookEvent{}, err
 	}
 
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return fmt.Errorf("settlement: parse webhook payload: %w", err)
+		return webhookEvent{}, fmt.Errorf("settlement: parse webhook payload: %w", err)
 	}
 
-	attempt, err := s.findAttemptByProviderReference(ctx, providerName, payload.ProviderReference)
+	ev := webhookEvent{ProviderReference: payload.ProviderReference, Reason: payload.FailureReason}
+	switch payload.EventType {
+	case WebhookPayoutSucceeded:
+		ev.Kind = webhookSucceeded
+	case WebhookPayoutFailed:
+		ev.Kind = webhookFailed
+	case WebhookPayoutReturned:
+		ev.Kind = webhookReturned
+	default:
+		return webhookEvent{}, fmt.Errorf("settlement: unknown webhook event type %q", payload.EventType)
+	}
+	return ev, nil
+}
+
+// HandleSettlementWebhook processes one payout-provider callback: has the
+// provider verify and parse it, resolves it to a settlement_attempts row,
+// then applies the same WHERE status = <expected> compare-and-set
+// discipline every transition in this codebase uses. Idempotent on
+// redelivery — a webhook resolving an already-resolved attempt is a safe
+// no-op, not an error.
+func (s *Store) HandleSettlementWebhook(ctx context.Context, providerName string, body []byte, header http.Header) error {
+	provider, ok := s.providers[providerName]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownProvider, providerName)
+	}
+	ev, err := provider.parseWebhook(header, body)
+	if err != nil {
+		return err
+	}
+	if ev.Kind == webhookIgnored {
+		return nil
+	}
+
+	attempt, err := s.findAttemptByProviderReference(ctx, providerName, ev.ProviderReference)
 	if err != nil {
 		return err
 	}
 
-	switch payload.EventType {
-	case WebhookPayoutSucceeded:
+	// A failure can trigger an inline re-dispatch that first sleeps
+	// RetryBackoff (handleAttemptFailure). If the provider gives up on the
+	// request meanwhile, a cancelled ctx would abort that re-dispatch after
+	// the compensating reversal but before the next attempt — leaving the
+	// settlement settling with nothing in flight. Finish regardless.
+	ctx = context.WithoutCancel(ctx)
+
+	switch ev.Kind {
+	case webhookSucceeded:
 		return s.handlePayoutSucceeded(ctx, attempt)
-	case WebhookPayoutFailed:
-		return s.handleAttemptFailure(ctx, attempt, "failed_bucket2", payload.FailureReason, false)
-	case WebhookPayoutReturned:
-		return s.handlePayoutReturned(ctx, attempt, payload.FailureReason)
+	case webhookFailed:
+		return s.handleAttemptFailure(ctx, attempt, "failed_bucket2", ev.Reason, false)
+	case webhookReturned:
+		return s.handlePayoutReturned(ctx, attempt, ev.Reason)
+	case webhookReversed:
+		if attempt.Status == "succeeded" {
+			return s.handlePayoutReturned(ctx, attempt, ev.Reason)
+		}
+		return s.handleAttemptFailure(ctx, attempt, "failed_bucket2", ev.Reason, false)
+	case webhookDeclined:
+		return s.flagDeclinedAttempt(ctx, attempt, ev.ProviderReference, ev.Reason)
 	default:
-		return fmt.Errorf("settlement: unknown webhook event type %q", payload.EventType)
+		return fmt.Errorf("settlement: unhandled webhook event kind %d", ev.Kind)
 	}
+}
+
+// flagDeclinedAttempt records a provider decline that hasn't been reversed
+// yet. The transfer can still land, so nothing is reversed, retried or
+// handed to manual payout — ops are paged and told not to pay by hand.
+// Deduped per attempt via failure_reason, so a redelivery doesn't re-alert.
+func (s *Store) flagDeclinedAttempt(ctx context.Context, attempt *settlementAttempt, providerReference, reason string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE settlement_attempts SET failure_reason = $2
+		 WHERE id = $1 AND status = 'dispatched' AND failure_reason IS NULL`,
+		attempt.ID, reason,
+	)
+	if err != nil {
+		return fmt.Errorf("settlement: flag declined attempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE settlements SET ops_paged_at = COALESCE(ops_paged_at, now()) WHERE id = $1`,
+		attempt.SettlementID,
+	); err != nil {
+		return fmt.Errorf("settlement: page ops for declined attempt: %w", err)
+	}
+
+	st, err := s.GetSettlement(ctx, attempt.SettlementID)
+	if err != nil {
+		return err
+	}
+	s.alertReview(ctx, st, providerReference, reason+". Awaiting reversal from the provider.")
+	return nil
 }
 
 type settlementAttempt struct {
@@ -157,7 +264,13 @@ func (s *Store) handlePayoutSucceeded(ctx context.Context, attempt *settlementAt
 	if !transitioned {
 		return nil
 	}
+	return s.completeSessionSettlement(ctx, st)
+}
 
+// completeSessionSettlement is the session-side tail of any settled
+// transition (provider success or manual payout): settling -> settled on the
+// session, and release the deposit reservation (ARCHITECTURE.md §8 rule 5).
+func (s *Store) completeSessionSettlement(ctx context.Context, st *Settlement) error {
 	if _, err := s.sessionStore.TransitionToSettled(ctx, st.SessionID); err != nil {
 		return fmt.Errorf("settlement: transition session to settled: %w", err)
 	}
@@ -200,6 +313,7 @@ func (s *Store) handlePayoutReturned(ctx context.Context, attempt *settlementAtt
 	if _, err := s.sessionStore.TransitionToReversed(ctx, st.SessionID); err != nil {
 		return fmt.Errorf("settlement: transition session to reversed: %w", err)
 	}
+	s.alertReversal(ctx, st, reason)
 
 	accounts, err := s.resolveAccounts(ctx, st.TenantID, st.CryptoAsset, st.FiatCurrency)
 	if err != nil {

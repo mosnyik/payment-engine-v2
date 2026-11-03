@@ -3,6 +3,7 @@ package settlement
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/google/uuid"
 )
@@ -27,9 +28,12 @@ func (sandboxSettlementProvider) Dispatch(_ context.Context, _ PayoutRequest) (P
 	return PayoutResult{Outcome: OutcomeAccepted, ProviderReference: "sandbox-" + uuid.New().String()}, nil
 }
 
-// webhookSecret is never used: HandleSettlementWebhook only fires for real
-// provider callbacks, which the sandbox provider never receives.
-func (sandboxSettlementProvider) webhookSecret() string { return "" }
+// parseWebhook always refuses: the sandbox provider never calls back
+// (confirmSandboxDispatches below closes the loop instead), so any callback
+// claiming to be from it is not genuine.
+func (sandboxSettlementProvider) parseWebhook(http.Header, []byte) (webhookEvent, error) {
+	return webhookEvent{}, fmt.Errorf("%w: %s receives no webhooks", ErrUnknownProvider, SandboxProviderName)
+}
 
 // confirmSandboxDispatches finalizes every settlement_attempts row
 // dispatched to the sandbox provider and still waiting on a "confirmation"

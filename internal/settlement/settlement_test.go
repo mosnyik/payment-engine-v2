@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -80,6 +81,12 @@ type fakeSettlementProvider struct {
 	reason  string
 	secret  string
 	calls   int
+
+	lastRequest PayoutRequest
+	// event, if set, is what parseWebhook returns for any correctly-signed
+	// callback — lets a test drive the declined/reversed kinds only real
+	// adapters (hyparrow) emit.
+	event *webhookEvent
 }
 
 func (f *fakeSettlementProvider) Name() string    { return f.name }
@@ -90,8 +97,25 @@ func (f *fakeSettlementProvider) webhookSecret() string {
 	}
 	return f.secret
 }
-func (f *fakeSettlementProvider) Dispatch(_ context.Context, _ PayoutRequest) (PayoutResult, error) {
+func (f *fakeSettlementProvider) parseWebhook(header http.Header, body []byte) (webhookEvent, error) {
+	if f.event != nil {
+		if err := VerifyWebhookSignature(f.webhookSecret(), body, header.Get(genericWebhookSignatureHeader)); err != nil {
+			return webhookEvent{}, err
+		}
+		return *f.event, nil
+	}
+	return parseGenericWebhook(f.name, f.webhookSecret(), header, body)
+}
+
+// sigHeader wraps a generic-scheme signature in the header it travels in.
+func sigHeader(sig string) http.Header {
+	h := http.Header{}
+	h.Set(genericWebhookSignatureHeader, sig)
+	return h
+}
+func (f *fakeSettlementProvider) Dispatch(_ context.Context, req PayoutRequest) (PayoutResult, error) {
 	f.calls++
+	f.lastRequest = req
 	return PayoutResult{Outcome: f.outcome, ProviderReference: f.ref, FailureReason: f.reason}, nil
 }
 
@@ -237,9 +261,16 @@ func uniqueEVMAddress(t *testing.T) string {
 // own subscriber to create the settlements row.
 func (e *testEnv) createDepositConfirmedSession(t *testing.T, fiatAmount, cryptoAmount decimal.Decimal) *session.Session {
 	t.Helper()
+	return e.createDepositConfirmedSessionTo(t, fiatAmount, cryptoAmount, nil)
+}
+
+// createDepositConfirmedSessionTo is createDepositConfirmedSession with a
+// payout_destination supplied at CreateSession.
+func (e *testEnv) createDepositConfirmedSessionTo(t *testing.T, fiatAmount, cryptoAmount decimal.Decimal, destination json.RawMessage) *session.Session {
+	t.Helper()
 	ctx := context.Background()
 
-	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount, nil)
+	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount, destination)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -407,7 +438,7 @@ func TestDispatch_HappyPath_SettlesAndPostsLedgerEntries(t *testing.T) {
 
 	// Deliver the success webhook.
 	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`),
-		ComputeWebhookSignature(provider.webhookSecret(), []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`))); err != nil {
+		sigHeader(ComputeWebhookSignature(provider.webhookSecret(), []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`)))); err != nil {
 		t.Fatalf("handle webhook: %v", err)
 	}
 	env.waitForSettlementStatus(t, st.ID, StatusSettled)
@@ -516,7 +547,7 @@ func TestWebhook_InvalidSignatureRejected(t *testing.T) {
 	env := setupTestEnv(t, provider)
 	defer env.Cleanup()
 
-	err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{}`), "not-the-right-signature")
+	err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{}`), sigHeader("not-the-right-signature"))
 	if err != ErrInvalidWebhookSignature {
 		t.Fatalf("expected ErrInvalidWebhookSignature, got %v", err)
 	}
@@ -535,7 +566,7 @@ func TestWebhook_SucceededReplayIsNoOp(t *testing.T) {
 	body := []byte(`{"event_type":"payout.succeeded","reference_id":"` + provider.ref + `"}`)
 	sig := ComputeWebhookSignature(provider.webhookSecret(), body)
 
-	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sig); err != nil {
+	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sigHeader(sig)); err != nil {
 		t.Fatalf("first webhook delivery: %v", err)
 	}
 	env.waitForSettlementStatus(t, st.ID, StatusSettled)
@@ -544,7 +575,7 @@ func TestWebhook_SucceededReplayIsNoOp(t *testing.T) {
 	// second ledger post (ledger.Post's idempotency key would reject it
 	// anyway, but the CAS on settlement_attempts should short-circuit
 	// before ever trying).
-	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sig); err != nil {
+	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sigHeader(sig)); err != nil {
 		t.Fatalf("replayed webhook should be a no-op, got error: %v", err)
 	}
 }
