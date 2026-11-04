@@ -41,14 +41,28 @@ func (s *Store) RetryPayout(ctx context.Context, settlementID, adminID uuid.UUID
 		return nil, err
 	}
 
-	var from Status
+	// sessionFrom is where the session sits: the same name as the
+	// settlement's status, except awaiting_manual_payout, which is
+	// settlement-local (the session stays settling throughout).
+	var from, sessionFrom Status
 	switch {
 	case st.Status == StatusSettlementFailed:
-		from = StatusSettlementFailed
+		from, sessionFrom = StatusSettlementFailed, StatusSettlementFailed
+	case st.Status == StatusAwaitingManualPayout:
+		// Nothing is in flight (that's what put it here), so an automatic
+		// retry instead of paying by hand is safe. The Telegram alert's
+		// button is then refused by ManualSettle's CAS.
+		from, sessionFrom = StatusAwaitingManualPayout, StatusSettling
 	case st.Status == StatusSettling && st.OpsPagedAt != nil && confirmedFailed:
-		from = StatusSettling
+		from, sessionFrom = StatusSettling, StatusSettling
 	default:
 		return nil, ErrNotRetryable
+	}
+
+	if from == StatusSettling {
+		if err := s.resolveConfirmedFailedAttempts(ctx, st, adminID); err != nil {
+			return nil, err
+		}
 	}
 
 	tag, err := s.pool.Exec(ctx,
@@ -68,11 +82,66 @@ func (s *Store) RetryPayout(ctx context.Context, settlementID, adminID uuid.UUID
 	// the same underlying type (string) and the same vocabulary for these
 	// in-flight/terminal names (ARCHITECTURE.md §8) — a direct conversion,
 	// not a lookup.
-	if _, err := s.sessionStore.RetryToSettling(ctx, st.SessionID, session.Status(from)); err != nil {
+	if _, err := s.sessionStore.RetryToSettling(ctx, st.SessionID, session.Status(sessionFrom)); err != nil {
 		return nil, fmt.Errorf("settlement: retry payout: transition session: %w", err)
 	}
 
 	return s.GetSettlement(ctx, settlementID)
+}
+
+// resolveConfirmedFailedAttempts closes out the still-dispatched attempt(s)
+// a human has just confirmed genuinely failed (bucket 3, or an uncertain
+// dispatch): marks each failed_bucket3 so a late webhook for it is a no-op,
+// and posts its compensating reversal so the next attempt's
+// settlement_payout claim doesn't debit tenant_payable a second time.
+func (s *Store) resolveConfirmedFailedAttempts(ctx context.Context, st *Settlement, adminID uuid.UUID) error {
+	rows, err := s.pool.Query(ctx,
+		`UPDATE settlement_attempts SET status = 'failed_bucket3', resolved_at = now(),
+		   failure_reason = COALESCE(failure_reason || '; ', '') || $2
+		 WHERE settlement_id = $1 AND status = 'dispatched'
+		 RETURNING attempt_number`,
+		st.ID, "confirmed failed by admin "+adminID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("settlement: resolve confirmed-failed attempts: %w", err)
+	}
+	var attemptNumbers []int
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return fmt.Errorf("settlement: resolve confirmed-failed attempts: scan: %w", err)
+		}
+		attemptNumbers = append(attemptNumbers, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("settlement: resolve confirmed-failed attempts: %w", err)
+	}
+	if len(attemptNumbers) == 0 {
+		return nil
+	}
+
+	accounts, err := s.resolveAccounts(ctx, st.TenantID, st.CryptoAsset, st.FiatCurrency)
+	if err != nil {
+		return err
+	}
+	for _, n := range attemptNumbers {
+		if _, err := s.ledger.Post(ctx, ledger.Transaction{
+			IdempotencyKey: fmt.Sprintf("settlement_reversal:session_%s:attempt_%d", st.SessionID, n),
+			TxnType:        "reversal",
+			ReferenceType:  "session",
+			ReferenceID:    st.SessionID,
+			CreatedBy:      "settlement",
+			Entries: []ledger.Entry{
+				{AccountID: accounts.TreasuryFiatOperating, Direction: ledger.Debit, Amount: st.TenantPayableAmount, AssetCode: st.FiatCurrency},
+				{AccountID: accounts.TenantPayable, Direction: ledger.Credit, Amount: st.TenantPayableAmount, AssetCode: st.FiatCurrency},
+			},
+		}); err != nil && !errors.Is(err, ledger.ErrAlreadyPosted) {
+			return fmt.Errorf("settlement: post confirmed-failed reversal: %w", err)
+		}
+	}
+	return nil
 }
 
 // AccountRef identifies a ledger account for ResolveReversal's manual

@@ -121,6 +121,13 @@ type Store struct {
 	bus *eventbus.Bus
 }
 
+// HasProvider reports whether name is a registered screening provider —
+// the admin corridor-create endpoint's binding check.
+func (s *Store) HasProvider(name string) bool {
+	_, ok := s.registry.Get(name)
+	return ok
+}
+
 func New(pool *db.Pool, registry *Registry) *Store {
 	return &Store{pool: pool, registry: registry}
 }

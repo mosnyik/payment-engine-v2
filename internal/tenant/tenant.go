@@ -1,5 +1,5 @@
 // Package tenant is the bank/fintech account that integrates with the
-// rail: profile, fee schedule, corridor entitlements, and credential
+// rail: profile, corridor entitlements, and credential
 // storage. Implements gateway.CredentialLookup so the tenant-facing API
 // gateway can authenticate requests without depending on this package
 // directly — only on the interface it satisfies.
@@ -93,18 +93,28 @@ var (
 	ErrInvalidMagicLink         = errors.New("tenant: invalid or expired magic link")
 	ErrPortalSessionInvalid     = errors.New("tenant: invalid or expired session")
 	ErrEmailDeliveryUnavailable = errors.New("tenant: email delivery not configured")
+	// ErrInvalidPortalURL is returned by ValidatePortalURL/RequestMagicLink
+	// when the client-supplied portal_url is missing, malformed or not on
+	// the PORTAL_ALLOWED_ORIGINS allowlist.
+	ErrInvalidPortalURL = errors.New("tenant: invalid portal_url")
 	// ErrJurisdictionNotApproved is returned by GrantCorridorEntitlement
 	// (Phase 10) when the tenant has no approved KYB case covering the
 	// corridor's fiat currency — the corridor's jurisdiction was never
 	// cleared, so the entitlement can't activate.
 	ErrJurisdictionNotApproved = errors.New("tenant: jurisdiction not approved by KYB")
+	// ErrEntitlementDisabledByAdmin is returned by EnableCorridorSelfService
+	// when an admin switched this entitlement off — only an admin can turn
+	// it back on.
+	ErrEntitlementDisabledByAdmin = errors.New("tenant: corridor disabled by an admin")
+	// ErrTenantNotActive is returned by EnableCorridorSelfService for a
+	// tenant that hasn't cleared KYB yet (or was suspended).
+	ErrTenantNotActive = errors.New("tenant: tenant is not active")
 )
 
 type Tenant struct {
 	ID         uuid.UUID
 	Name       string
 	Status     Status
-	FeeBps     int
 	WebhookURL *string
 	CreatedAt  time.Time
 }
@@ -113,11 +123,15 @@ type Store struct {
 	pool          *db.Pool
 	crypto        *pcrypto.AESGCM
 	emailSender   EmailSender
-	portalBaseURL string
+
+	// allowedPortalOrigins is the set of frontend origins
+	// ("scheme://host[:port]", lowercased) a client-supplied portal_url may
+	// point at — see SetAllowedPortalOrigins/ValidatePortalURL.
+	allowedPortalOrigins map[string]struct{}
 
 	// fiatLookup/jurisdictionChecker back GrantCorridorEntitlement's
 	// compliance gate (Phase 10) — optional-dependency setter convention
-	// (SetJurisdictionGate), same as SetEmailSender/SetPortalBaseURL, so
+	// (SetJurisdictionGate), same as SetEmailSender/SetAllowedPortalOrigins, so
 	// tenant.New's signature and every existing call site stay untouched.
 	// Unlike those two, an unset gate is not silently skipped:
 	// GrantCorridorEntitlement fails closed (see its doc comment) — a
@@ -155,13 +169,53 @@ func (s *Store) SetJurisdictionGate(fiatLookup FiatCurrencyLookup, checker Juris
 	s.jurisdictionChecker = checker
 }
 
-// SetPortalBaseURL wires the tenant portal frontend's origin (e.g.
-// https://portal.2settle.io) — same optional-dependency setter convention
-// as SetEmailSender. When unset, RequestMagicLink emails the bare token
-// instead of a clickable link, so this stays safe to leave unconfigured
-// (config.PortalBaseURL defaults to "").
-func (s *Store) SetPortalBaseURL(baseURL string) {
-	s.portalBaseURL = baseURL
+// SetAllowedPortalOrigins wires the allowlist a client-supplied portal_url
+// is checked against (config.PortalAllowedOrigins, PORTAL_ALLOWED_ORIGINS).
+// Each entry is an origin — "scheme://host[:port]" — and any path under an
+// allowed origin is accepted, so the frontend can move its routes without
+// a config change. Unset/empty means every portal_url is rejected: fail
+// closed, since emailing a magic link to an arbitrary client-chosen host
+// would hand the login token to whoever made the request.
+func (s *Store) SetAllowedPortalOrigins(origins []string) {
+	s.allowedPortalOrigins = make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		s.allowedPortalOrigins[strings.ToLower(strings.TrimRight(o, "/"))] = struct{}{}
+	}
+}
+
+// ValidatePortalURL checks a client-supplied portal_url — the frontend
+// prefix the magic link is built on, "{portal_url}/verify?token=..." — and
+// returns ErrInvalidPortalURL unless it is an absolute http(s) URL with no
+// credentials, query or fragment whose origin is on the
+// SetAllowedPortalOrigins allowlist.
+//
+// Why the allowlist matters: /portal/login and /portal/register are
+// unauthenticated, so without it anyone could request a link for a
+// victim's email pointed at their own host, and the victim clicking a
+// genuine 2Settle email would deliver the token to the attacker.
+//
+// It never touches the database, so callers can (and the HTTP handlers
+// do) run it before any email lookup — a rejection then reveals nothing
+// about whether an email is registered.
+func (s *Store) ValidatePortalURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("%w: portal_url is required", ErrInvalidPortalURL)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPortalURL, err)
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Opaque != "" {
+		return nil, fmt.Errorf("%w: must be an absolute http(s) URL", ErrInvalidPortalURL)
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("%w: must not contain credentials, a query or a fragment", ErrInvalidPortalURL)
+	}
+	origin := strings.ToLower(u.Scheme + "://" + u.Host)
+	if _, ok := s.allowedPortalOrigins[origin]; !ok {
+		return nil, fmt.Errorf("%w: origin %s is not allowed", ErrInvalidPortalURL, origin)
+	}
+	return u, nil
 }
 
 func (s *Store) CreateTenant(ctx context.Context, name string) (uuid.UUID, error) {
@@ -180,9 +234,9 @@ func (s *Store) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
 	var t Tenant
 	var status string
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, name, status, fee_bps, webhook_url, created_at FROM tenants WHERE id = $1`,
+		`SELECT id, name, status, webhook_url, created_at FROM tenants WHERE id = $1`,
 		id,
-	).Scan(&t.ID, &t.Name, &status, &t.FeeBps, &t.WebhookURL, &t.CreatedAt)
+	).Scan(&t.ID, &t.Name, &status, &t.WebhookURL, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -212,7 +266,7 @@ func (s *Store) ListTenants(ctx context.Context, status *Status, limit, offset i
 		return nil, 0, fmt.Errorf("tenant: list tenants: count: %w", err)
 	}
 
-	query := `SELECT id, name, status, fee_bps, webhook_url, created_at FROM tenants
+	query := `SELECT id, name, status, webhook_url, created_at FROM tenants
 		WHERE ($1::text IS NULL OR status = $1) ORDER BY created_at DESC`
 	args := []any{statusFilter}
 	if limit > 0 {
@@ -230,7 +284,7 @@ func (s *Store) ListTenants(ctx context.Context, status *Status, limit, offset i
 	for rows.Next() {
 		var t Tenant
 		var st string
-		if err := rows.Scan(&t.ID, &t.Name, &st, &t.FeeBps, &t.WebhookURL, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &st, &t.WebhookURL, &t.CreatedAt); err != nil {
 			return nil, 0, fmt.Errorf("tenant: list tenants: scan: %w", err)
 		}
 		t.Status = Status(st)
@@ -263,15 +317,22 @@ func (s *Store) RegisterTenant(ctx context.Context, name, email string) (uuid.UU
 
 // RequestMagicLink issues a single-use, time-limited login token for the
 // tenant registered under email and, if an EmailSender is configured,
-// delivers it. Returns ErrNotFound if no tenant has this email — the HTTP
+// delivers it as a "{portalURL}/verify?token=..." link. portalURL is
+// checked with ValidatePortalURL before anything else (ErrInvalidPortalURL),
+// so a bad URL never reaches the email lookup. Returns ErrNotFound if no tenant has this email — the HTTP
 // handler is responsible for hiding that distinction behind a uniform
 // response so this can't be used to enumerate registered emails (same
 // split of responsibility sessionHandlers.getSession already uses: the
 // Store tells the truth, the handler decides what to reveal).
-func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
+func (s *Store) RequestMagicLink(ctx context.Context, email, portalURL string) error {
+	base, err := s.ValidatePortalURL(portalURL)
+	if err != nil {
+		return err
+	}
+
 	var tenantID uuid.UUID
 	var status string
-	err := s.pool.QueryRow(ctx, `SELECT id, status FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID, &status)
+	err = s.pool.QueryRow(ctx, `SELECT id, status FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -303,26 +364,23 @@ func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
 		return ErrEmailDeliveryUnavailable
 	}
 	subject := "Your 2Settle dashboard login link"
-	body := magicLinkEmailBody(token, s.portalBaseURL)
+	body := magicLinkEmailBody(token, base)
 	if err := s.emailSender.Send(ctx, email, subject, body); err != nil {
 		return fmt.Errorf("tenant: send magic link email: %w", err)
 	}
 	return nil
 }
 
-// magicLinkEmailBody renders a real "{portalBaseURL}/verify?token=..." link
-// when portalBaseURL is configured (see SetPortalBaseURL), so the email
-// contains something clickable instead of a bare token the recipient would
-// have to copy into a request body by hand. Falls back to the bare token
-// when no frontend origin is configured, so a deployment that hasn't set
-// PORTAL_BASE_URL yet still sends something usable, just not clickable.
-func magicLinkEmailBody(token, portalBaseURL string) string {
-	link := token
-	if portalBaseURL != "" {
-		link = fmt.Sprintf("%s/v2/portal/verify?token=%s", strings.TrimRight(portalBaseURL, "/"), url.QueryEscape(token))
-	}
+// magicLinkEmailBody renders the clickable "{base}/verify?token=..." link.
+// base is an already-validated portal_url (ValidatePortalURL); only
+// "/verify" and the token query are appended to whatever path it carries.
+func magicLinkEmailBody(token string, base *url.URL) string {
+	link := *base
+	link.Path = strings.TrimRight(link.Path, "/") + "/verify"
+	link.RawPath = ""
+	link.RawQuery = url.Values{"token": {token}}.Encode()
 	expiryMinutes := int(PortalMagicLinkTTL.Minutes())
-	return fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", link, expiryMinutes)
+	return fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", link.String(), expiryMinutes)
 }
 
 // VerifyMagicLink redeems a single-use magic-link token and issues a real
@@ -704,16 +762,18 @@ func (s *Store) LookupHMACSecret(ctx context.Context, apiKey string) (string, uu
 	return secret, tenantID, keyID, rateLimitTier, allowedCIDRs, permissions, true, nil
 }
 
-// SetCorridorEntitlement grants or revokes a tenant's access to a corridor,
-// with an optional per-corridor fee override.
-func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, active bool, feeBpsOverride *int) error {
+// SetCorridorEntitlement grants or revokes a tenant's access to a corridor.
+// This is the admin path: a
+// revoke here marks the row disabled_by_admin, which blocks the tenant from
+// re-enabling it via EnableCorridorSelfService; a grant clears it.
+func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, active bool) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, fee_bps_override)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active, disabled_by_admin)
+		 VALUES ($1, $2, $3, NOT $3)
 		 ON CONFLICT (tenant_id, corridor_id) DO UPDATE SET
 			active = EXCLUDED.active,
-			fee_bps_override = EXCLUDED.fee_bps_override`,
-		tenantID, corridorID, active, feeBpsOverride,
+			disabled_by_admin = EXCLUDED.disabled_by_admin`,
+		tenantID, corridorID, active,
 	)
 	if err != nil {
 		return fmt.Errorf("tenant: set corridor entitlement: %w", err)
@@ -727,27 +787,121 @@ func (s *Store) SetCorridorEntitlement(ctx context.Context, tenantID, corridorID
 // currency's jurisdiction, so an admin can't ride a tenant's original
 // (e.g. NGN) approval into a corridor under a different regulator (e.g.
 // KES) it never covered. Revocation doesn't go through this — callers
-// should call SetCorridorEntitlement(ctx, tenantID, corridorID, false, ...)
+// should call SetCorridorEntitlement(ctx, tenantID, corridorID, false)
 // directly, since a compliance check has no bearing on turning access off.
-func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID, feeBpsOverride *int) error {
+func (s *Store) GrantCorridorEntitlement(ctx context.Context, tenantID, corridorID uuid.UUID) error {
+	if err := s.checkCorridorJurisdiction(ctx, tenantID, corridorID); err != nil {
+		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+	}
+	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true)
+}
+
+// checkCorridorJurisdiction is the Phase 10 compliance gate shared by the
+// admin grant and the tenant self-service enable: the tenant must hold an
+// approved KYB case covering the corridor's fiat currency.
+func (s *Store) checkCorridorJurisdiction(ctx context.Context, tenantID, corridorID uuid.UUID) error {
 	if s.fiatLookup == nil || s.jurisdictionChecker == nil {
 		return errors.New("tenant: jurisdiction gate not configured — call SetJurisdictionGate at startup")
 	}
 
 	fiatCurrency, err := s.fiatLookup.FiatCurrencyForCorridor(ctx, corridorID)
 	if err != nil {
-		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+		return err
 	}
 
 	approved, err := s.jurisdictionChecker.IsJurisdictionApproved(ctx, tenantID, fiatCurrency)
 	if err != nil {
-		return fmt.Errorf("tenant: grant corridor entitlement: %w", err)
+		return err
 	}
 	if !approved {
 		return fmt.Errorf("%w: no approved KYB case covers %s", ErrJurisdictionNotApproved, fiatCurrency)
 	}
+	return nil
+}
 
-	return s.SetCorridorEntitlement(ctx, tenantID, corridorID, true, feeBpsOverride)
+// EnableCorridorSelfService is the tenant portal's counterpart to
+// GrantCorridorEntitlement: same tenant-status and jurisdiction gates, but
+// it refuses a row
+// an admin disabled — the conditional upsert makes that check and the write
+// one atomic statement.
+func (s *Store) EnableCorridorSelfService(ctx context.Context, tenantID, corridorID uuid.UUID) error {
+	t, err := s.GetTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	if t.Status != StatusActive {
+		return fmt.Errorf("%w: status %q", ErrTenantNotActive, t.Status)
+	}
+	if err := s.checkCorridorJurisdiction(ctx, tenantID, corridorID); err != nil {
+		return fmt.Errorf("tenant: enable corridor: %w", err)
+	}
+
+	var id uuid.UUID
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active)
+		 VALUES ($1, $2, true)
+		 ON CONFLICT (tenant_id, corridor_id) DO UPDATE SET active = true
+		 WHERE NOT tenant_corridor_entitlements.disabled_by_admin
+		 RETURNING id`,
+		tenantID, corridorID,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrEntitlementDisabledByAdmin
+	}
+	if err != nil {
+		return fmt.Errorf("tenant: enable corridor: %w", err)
+	}
+	return nil
+}
+
+// DisableCorridorSelfService switches off the tenant's own entitlement.
+// Always allowed, never marks the row disabled_by_admin (the tenant can
+// re-enable it later), and a no-op when no entitlement exists.
+func (s *Store) DisableCorridorSelfService(ctx context.Context, tenantID, corridorID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE tenant_corridor_entitlements SET active = false
+		 WHERE tenant_id = $1 AND corridor_id = $2`,
+		tenantID, corridorID,
+	)
+	if err != nil {
+		return fmt.Errorf("tenant: disable corridor: %w", err)
+	}
+	return nil
+}
+
+// CorridorEntitlement is one tenant_corridor_entitlements row, as the
+// tenant portal reports it.
+type CorridorEntitlement struct {
+	CorridorID      uuid.UUID
+	Active          bool
+	DisabledByAdmin bool
+}
+
+// ListCorridorEntitlements returns every entitlement row the tenant has,
+// keyed by corridor ID — a corridor with no row was never enabled.
+func (s *Store) ListCorridorEntitlements(ctx context.Context, tenantID uuid.UUID) (map[uuid.UUID]CorridorEntitlement, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT corridor_id, active, disabled_by_admin
+		 FROM tenant_corridor_entitlements WHERE tenant_id = $1`,
+		tenantID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("tenant: list corridor entitlements: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[uuid.UUID]CorridorEntitlement)
+	for rows.Next() {
+		var e CorridorEntitlement
+		if err := rows.Scan(&e.CorridorID, &e.Active, &e.DisabledByAdmin); err != nil {
+			return nil, fmt.Errorf("tenant: list corridor entitlements: scan: %w", err)
+		}
+		out[e.CorridorID] = e
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("tenant: list corridor entitlements: %w", err)
+	}
+	return out, nil
 }
 
 // CheckEntitlement reports whether a tenant may use a corridor. No row at
@@ -766,31 +920,6 @@ func (s *Store) CheckEntitlement(ctx context.Context, tenantID, corridorID uuid.
 		return false, fmt.Errorf("tenant: check entitlement: %w", err)
 	}
 	return active, nil
-}
-
-// EffectiveFeeBps resolves the fee (in basis points) settlement should apply
-// for a tenant on a corridor: the corridor entitlement's fee_bps_override if
-// set, else the tenant's flat FeeBps. Requires an entitlement row to exist
-// (i.e. CheckEntitlement must already have passed) — a tenant with no
-// entitlement on this corridor has nothing to fall back to but its own
-// FeeBps, so this deliberately doesn't try to guess a default from a
-// missing row the way CheckEntitlement's "no row = false" does.
-func (s *Store) EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error) {
-	var feeBps int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COALESCE(e.fee_bps_override, t.fee_bps)
-		 FROM tenants t
-		 JOIN tenant_corridor_entitlements e ON e.tenant_id = t.id AND e.corridor_id = $2
-		 WHERE t.id = $1`,
-		tenantID, corridorID,
-	).Scan(&feeBps)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("tenant: effective fee bps: %w", ErrNotFound)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("tenant: effective fee bps: %w", err)
-	}
-	return feeBps, nil
 }
 
 // SetWebhookURL validates and stores a tenant's outbound webhook endpoint.

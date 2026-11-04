@@ -86,7 +86,7 @@ func TestSettlementDispatchAndOpsSurfaceOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert corridor: %v", err)
 	}
-	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corridorID, true, nil); err != nil {
+	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corridorID, true); err != nil {
 		t.Fatalf("set corridor entitlement: %v", err)
 	}
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
@@ -297,6 +297,20 @@ func TestSettlementDispatchAndOpsSurfaceOverHTTP(t *testing.T) {
 	}
 	if !strings.Contains(errResp.Error, "unknown or unconfigured settlement provider") {
 		t.Fatalf("expected settlement.ErrUnknownProvider's message, got %q", errResp.Error)
+	}
+
+	// Hyparrow is registered (but disabled with no secret in testConfig):
+	// reaching its parseWebhook proves it's wired into the provider set.
+	hyparrowResp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/webhooks/settlement/hyparrow", "", nil, &errResp)
+	if hyparrowResp.StatusCode != http.StatusNotFound || !strings.Contains(errResp.Error, "hyparrow has no webhook secret configured") {
+		t.Fatalf("hyparrow webhook without a secret: expected 404 no-secret, got %d %q", hyparrowResp.StatusCode, errResp.Error)
+	}
+
+	// The Telegram button route is mounted; with no Telegram fallback
+	// configured it refuses rather than acting.
+	telegramResp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/webhooks/telegram", "", nil, &errResp)
+	if telegramResp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(errResp.Error, "telegram fallback not configured") {
+		t.Fatalf("telegram webhook unconfigured: expected 503, got %d %q", telegramResp.StatusCode, errResp.Error)
 	}
 
 	// treasury's webhook route (this phase's other carried-forward gap):

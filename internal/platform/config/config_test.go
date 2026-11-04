@@ -200,3 +200,36 @@ func TestLoad_CollectsMultipleErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_PortalAllowedOriginsParsed(t *testing.T) {
+	cfg, err := config.Load(mapSource{
+		"DATABASE_URL":                 "postgres://real:real@realhost:5432/real",
+		"TENANT_SECRET_ENCRYPTION_KEY": validTestKey,
+		"PORTAL_ALLOWED_ORIGINS":       " https://App.2settle.io/ , http://localhost:3000,",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want := []string{"https://app.2settle.io", "http://localhost:3000"}
+	if len(cfg.PortalAllowedOrigins) != len(want) {
+		t.Fatalf("expected %v, got %v", want, cfg.PortalAllowedOrigins)
+	}
+	for i := range want {
+		if cfg.PortalAllowedOrigins[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, cfg.PortalAllowedOrigins)
+		}
+	}
+}
+
+func TestLoad_PortalAllowedOriginsRejectsNonOrigin(t *testing.T) {
+	for _, bad := range []string{"app.2settle.io", "https://app.2settle.io/dashboard", "ftp://app.2settle.io", "https://app.2settle.io?x=1"} {
+		_, err := config.Load(mapSource{
+			"DATABASE_URL":                 "postgres://real:real@realhost:5432/real",
+			"TENANT_SECRET_ENCRYPTION_KEY": validTestKey,
+			"PORTAL_ALLOWED_ORIGINS":       bad,
+		})
+		if err == nil || !strings.Contains(err.Error(), "PORTAL_ALLOWED_ORIGINS") {
+			t.Fatalf("expected a PORTAL_ALLOWED_ORIGINS error for %q, got %v", bad, err)
+		}
+	}
+}

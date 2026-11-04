@@ -167,6 +167,13 @@ func (s *Store) SetEventBus(bus *eventbus.Bus) {
 	s.bus = bus
 }
 
+// HasProvider reports whether name is a registered collection adapter
+// (enabled or not) — the admin corridor-create endpoint's binding check.
+func (s *Store) HasProvider(name string) bool {
+	_, ok := s.providers[name]
+	return ok
+}
+
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 	busha := newBushaProvider(cfg.Busha)
 	maxRetries := cfg.TenantWebhookMaxRetries

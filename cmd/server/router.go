@@ -72,10 +72,12 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	th := &treasuryHandlers{treasury: stores.treasury}
 	nh := &notificationHandlers{notification: stores.notification}
 	lh := &ledgerHandlers{ledger: stores.ledger}
-	rh := &rateHandlers{rate: stores.rate}
+	rh := &rateHandlers{rate: stores.rate, corridor: stores.corridor}
+	ch := &corridorAdminHandlers{corridor: stores.corridor, settlement: stores.settlement, treasury: stores.treasury, compliance: stores.compliance, admin: stores.admin}
 	ph := &portalHandlers{
 		tenant:       stores.tenant,
 		compliance:   stores.compliance,
+		corridor:     stores.corridor,
 		session:      stores.session,
 		settlement:   stores.settlement,
 		notification: stores.notification,
@@ -120,6 +122,8 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Get("/api-keys", ph.listAPIKeys)
 		portal.Post("/api-keys/{keyID}/revoke", ph.revokeAPIKey)
 		portal.Put("/webhook", ph.setWebhookURL)
+		portal.Get("/corridors", ph.listCorridors)
+		portal.Post("/corridors/{corridorID}", ph.setCorridorEntitlement)
 	})
 
 	// Public, unauthenticated — same tier as /admin/login, deliberately not
@@ -134,6 +138,10 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	// doc comment on why this one is set higher than the other public
 	// limits.
 	r.With(webhookLimit).Post("/webhooks/settlement/{providerName}", sth.handleWebhook)
+
+	// Telegram manual-payout buttons — same unauthenticated tier, verified
+	// against the setWebhook secret_token plus the configured ops chat ID.
+	r.With(webhookLimit).Post("/webhooks/telegram", sth.handleTelegramWebhook)
 
 	// Same unauthenticated, self-verified tier as the settlement webhook
 	// above — self-custody deposit detection already runs via watcher
@@ -151,6 +159,9 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
+		admin.Post("/corridors", ch.createCorridor)
+		admin.Patch("/corridors/{corridorID}", ch.updateCorridor)
+		admin.Put("/corridors/{corridorID}/providers", ch.replaceProviders)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)
 		admin.Get("/settlements", sth.listSettlements)

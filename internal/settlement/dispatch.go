@@ -10,20 +10,19 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
+	"github.com/sirfi/payment-engine-v2/internal/session"
 )
 
-// settlementAccounts is the six ledger accounts one settlement's postings
+// settlementAccounts is the five ledger accounts one settlement's postings
 // touch (ARCHITECTURE.md §6's account taxonomy / worked example).
 type settlementAccounts struct {
 	TreasuryInTransit     uuid.UUID
 	CryptoFXClearing      uuid.UUID
 	FiatFXClearing        uuid.UUID
 	TreasuryFiatOperating uuid.UUID
-	FeeRevenue            uuid.UUID
 	TenantPayable         uuid.UUID
 }
 
@@ -40,9 +39,6 @@ func (s *Store) resolveAccounts(ctx context.Context, tenantID uuid.UUID, cryptoA
 		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
 	}
 	if a.TreasuryFiatOperating, err = s.ledger.GetOrCreateAccount(ctx, nil, "treasury_fiat_operating", fiatCurrency, "fiat", "Treasury fiat operating: "+fiatCurrency); err != nil {
-		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
-	}
-	if a.FeeRevenue, err = s.ledger.GetOrCreateAccount(ctx, nil, "fee_revenue", fiatCurrency, "fiat", "Fee revenue: "+fiatCurrency); err != nil {
 		return nil, fmt.Errorf("settlement: resolve accounts: %w", err)
 	}
 	tid := tenantID
@@ -125,7 +121,7 @@ func (s *Store) claimNextPendingDispatch(ctx context.Context) (*Settlement, erro
 }
 
 // processSettlement is steps 1-8 of the plan: load the session's confirmed
-// deposit and rate lock, compute the fee split, post the previously-deferred
+// deposit and rate lock, post the previously-deferred
 // deposit_confirmed/fx_conversion ledger transactions (ARCHITECTURE.md §6's
 // worked example rows 1-2), transition both settlement and session to
 // settling, then dispatch the first payout attempt.
@@ -149,16 +145,10 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 	}
 	fiatValue := lock.CryptoToFiat(cryptoAmount)
 
-	feeBps, err := s.feeResolver.EffectiveFeeBps(ctx, sess.TenantID, sess.CorridorID)
-	if err != nil {
-		return fmt.Errorf("settlement: get effective fee bps: %w", err)
-	}
-	// tenantPayable is derived by subtraction, never independently rounded
-	// — ledger.Post rejects any transaction whose entries don't net to
-	// exactly zero per asset, so feeAmount + tenantPayable must equal
-	// fiatValue exactly.
-	feeAmount := fiatValue.Mul(decimal.NewFromInt(int64(feeBps))).Div(decimal.NewFromInt(10000)).Round(2)
-	tenantPayable := fiatValue.Sub(feeAmount)
+	// No fee is charged: the tenant is owed the full locked fiat value.
+	// 2Settle's margin is the spread already built into the locked rate
+	// (internal/rate LockRate), not a deduction here.
+	tenantPayable := fiatValue
 
 	accounts, err := s.resolveAccounts(ctx, sess.TenantID, sess.CryptoAsset, sess.FiatCurrency)
 	if err != nil {
@@ -188,7 +178,6 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 		Entries: []ledger.Entry{
 			{AccountID: accounts.FiatFXClearing, Direction: ledger.Debit, Amount: fiatValue, AssetCode: sess.FiatCurrency},
 			{AccountID: accounts.TenantPayable, Direction: ledger.Credit, Amount: tenantPayable, AssetCode: sess.FiatCurrency},
-			{AccountID: accounts.FeeRevenue, Direction: ledger.Credit, Amount: feeAmount, AssetCode: sess.FiatCurrency},
 		},
 	}); err != nil && !errors.Is(err, ledger.ErrAlreadyPosted) {
 		return fmt.Errorf("settlement: post fx_conversion: %w", err)
@@ -196,20 +185,24 @@ func (s *Store) processSettlement(ctx context.Context, st *Settlement) error {
 
 	if _, err := s.pool.Exec(ctx,
 		`UPDATE settlements SET status = 'settling', crypto_asset = $2, crypto_amount = $3,
-		   fiat_currency = $4, fiat_value = $5, fee_amount = $6, tenant_payable_amount = $7, updated_at = now()
+		   fiat_currency = $4, fiat_value = $5, tenant_payable_amount = $6, updated_at = now()
 		 WHERE id = $1 AND status = 'dispatching'`,
-		st.ID, sess.CryptoAsset, cryptoAmount, sess.FiatCurrency, fiatValue, feeAmount, tenantPayable,
+		st.ID, sess.CryptoAsset, cryptoAmount, sess.FiatCurrency, fiatValue, tenantPayable,
 	); err != nil {
 		return fmt.Errorf("settlement: update to settling: %w", err)
 	}
-	if _, err := s.sessionStore.TransitionToSettling(ctx, sess.ID); err != nil {
-		return fmt.Errorf("settlement: transition session to settling: %w", err)
+	// An ops retry (RetryPayout) has already moved the session back to
+	// settling itself; only a first dispatch comes from deposit_confirmed.
+	if sess.Status != session.StatusSettling {
+		if _, err := s.sessionStore.TransitionToSettling(ctx, sess.ID); err != nil {
+			return fmt.Errorf("settlement: transition session to settling: %w", err)
+		}
 	}
 
 	st.TenantID, st.CorridorID = sess.TenantID, sess.CorridorID
 	st.CryptoAsset, st.CryptoAmount = sess.CryptoAsset, cryptoAmount
 	st.FiatCurrency, st.FiatValue = sess.FiatCurrency, fiatValue
-	st.FeeAmount, st.TenantPayableAmount = feeAmount, tenantPayable
+	st.TenantPayableAmount = tenantPayable
 	st.Status = StatusSettling
 
 	return s.dispatchAttempt(ctx, st)
@@ -309,8 +302,12 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 		return fmt.Errorf("settlement: claim settlement_payout: %w", err)
 	}
 
-	attemptPayload := st.PendingDestination
-	if attemptPayload == nil {
+	destination, err := s.resolveDestination(ctx, st)
+	if err != nil {
+		return err
+	}
+	attemptPayload := destination
+	if len(attemptPayload) == 0 {
 		attemptPayload = json.RawMessage("{}")
 	}
 	var attemptID uuid.UUID
@@ -331,13 +328,11 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 
 	result, err := provider.Dispatch(ctx, PayoutRequest{
 		SessionID:             st.SessionID,
+		AttemptNumber:         attemptNumber,
 		AttemptIdempotencyKey: idempotencyKey,
 		FiatCurrency:          st.FiatCurrency,
 		Amount:                st.TenantPayableAmount,
-		// Destination: whatever ops supplied via RetryPayout's
-		// corrected-details path, if this is a retry — nil on a first
-		// attempt (no tenant-level payout-destination schema exists yet).
-		Destination: st.PendingDestination,
+		Destination:           destination,
 	})
 	if err != nil {
 		return fmt.Errorf("settlement: dispatch to %q: %w", provider.Name(), err)
@@ -362,6 +357,23 @@ func (s *Store) dispatchAttempt(ctx context.Context, st *Settlement) error {
 			return err
 		})
 		return err
+	case OutcomeUncertain:
+		// May be in flight: no reversal, no retry, no manual payout. Keep the
+		// reference so the provider's webhook can still resolve it, and page
+		// ops now rather than waiting out ConfirmationTimeout.
+		deadline := time.Now().Add(ConfirmationTimeout)
+		if _, err := s.transitionSettlementAndPublish(ctx, st, StatusSettling, StatusSettling, "settlement.dispatched", func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `UPDATE settlement_attempts SET provider_reference = $2, failure_reason = $3 WHERE id = $1`, attemptID, result.ProviderReference, result.FailureReason); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE settlements SET confirmation_deadline_at = $2, ops_paged_at = now() WHERE id = $1`, st.ID, deadline)
+			return err
+		}); err != nil {
+			return err
+		}
+		log.Printf("settlement: %s attempt %d outcome uncertain on %s, ops paged: %s", st.ID, attemptNumber, provider.Name(), result.FailureReason)
+		s.alertReview(ctx, st, result.ProviderReference, provider.Name()+": "+result.FailureReason)
+		return nil
 	case OutcomeRejectedTerminal:
 		return s.handleAttemptFailure(ctx, attempt, "failed_bucket4", result.FailureReason, true)
 	default: // OutcomeRejectedRetryable
@@ -438,7 +450,21 @@ func (s *Store) handleAttemptFailure(ctx context.Context, attempt *settlementAtt
 // (ARCHITECTURE.md §8: bucket 4 immediately, or buckets 1/2 once the
 // 3-attempt cap is exhausted). Releases the deposit reservation and pages
 // ops right away, independent of sla_breached_at.
+//
+// With the Telegram fallback configured, it first tries handing the payout
+// to ops to pay by hand (manual.go) — settlement_failed is then only the
+// outcome when that alert can't be delivered.
 func (s *Store) failSettlement(ctx context.Context, st *Settlement, reason string) error {
+	if s.telegram != nil {
+		handled, err := s.handToManualPayout(ctx, st, reason)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+	}
+
 	transitioned, err := s.transitionSettlementAndPublish(ctx, st, StatusSettling, StatusSettlementFailed, "settlement.failed", func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `UPDATE settlements SET ops_paged_at = now() WHERE id = $1`, st.ID)
 		return err

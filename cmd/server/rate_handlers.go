@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/shopspring/decimal"
 
+	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 )
 
@@ -18,9 +19,13 @@ import (
 // rate (internal/rate/currentrate.go's CurrentRateJob — system_rates
 // ceiling vs. every enabled provider's quote, recomputed periodically) —
 // the same value LockRate locks transactions against, not a live
-// recomputation per request.
+// recomputation per request. Only currencies with an active corridor are
+// published: CurrentRateJob stops refreshing a currency once its last
+// corridor is deactivated, and its last persisted row would otherwise be
+// served indefinitely.
 type rateHandlers struct {
-	rate *rate.Store
+	rate     *rate.Store
+	corridor *corridor.Store
 }
 
 type rateResponse struct {
@@ -35,9 +40,20 @@ func (h *rateHandlers) getRate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	notAvailable := fmt.Errorf("rate: no rate available for %s", currency)
+	active, err := h.corridor.HasActiveCorridorForFiat(r.Context(), currency)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !active {
+		writeErr(w, http.StatusNotFound, notAvailable)
+		return
+	}
+
 	current, err := h.rate.GetCurrentRate(r.Context(), currency)
 	if errors.Is(err, rate.ErrCurrentRateNotComputed) {
-		writeErr(w, http.StatusNotFound, fmt.Errorf("rate: no rate available for %s", currency))
+		writeErr(w, http.StatusNotFound, notAvailable)
 		return
 	}
 	if err != nil {

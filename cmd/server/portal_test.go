@@ -45,11 +45,90 @@ func extractPortalMagicLinkToken(t *testing.T, body string) string {
 	if !ok {
 		t.Fatalf("email body missing expected prefix: %q", body)
 	}
-	token, _, _ := strings.Cut(rest, "\n")
+	raw, _, _ := strings.Cut(rest, "\n")
+	link, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse emailed link %q: %v", raw, err)
+	}
+	if !strings.HasPrefix(raw, testPortalURL+"/verify?") {
+		t.Fatalf("expected emailed link to start with %q, got %q", testPortalURL+"/verify?", raw)
+	}
+	token := link.Query().Get("token")
 	if token == "" {
 		t.Fatalf("extracted empty token from body: %q", body)
 	}
 	return token
+}
+
+// TestPortalLoginRegister_PortalURLValidation drives the HTTP layer: a
+// missing or non-allowlisted portal_url is a 400 on both entry points and
+// no email goes out — for login, regardless of whether the email exists.
+func TestPortalLoginRegister_PortalURLValidation(t *testing.T) {
+	cfg := testConfig(t)
+	ctx := context.Background()
+
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	stores, err := buildStores(ctx, cfg, pool)
+	if err != nil {
+		t.Fatalf("build stores: %v", err)
+	}
+	sender := &fakePortalEmailSender{}
+	stores.tenant.SetEmailSender(sender)
+	router, err := buildRouter(cfg, stores)
+	if err != nil {
+		t.Fatalf("build router: %v", err)
+	}
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	client := srv.Client()
+
+	email := "owner+" + uuid.NewString() + "@example.com"
+	if _, err := stores.tenant.RegisterTenant(ctx, "Existing Fintech "+uuid.NewString(), email); err != nil {
+		t.Fatalf("register tenant: %v", err)
+	}
+	unknown := "nobody+" + uuid.NewString() + "@example.com"
+
+	for _, portalURL := range []string{"", "https://evil.example/dashboard", "not a url"} {
+		for _, addr := range []string{email, unknown} {
+			body := map[string]string{"email": addr}
+			if portalURL != "" {
+				body["portal_url"] = portalURL
+			}
+			resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/login", "", body, nil)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("login with portal_url %q, email %q: expected 400, got %d", portalURL, addr, resp.StatusCode)
+			}
+		}
+
+		body := map[string]string{"name": "New Fintech " + uuid.NewString(), "email": "new+" + uuid.NewString() + "@example.com"}
+		if portalURL != "" {
+			body["portal_url"] = portalURL
+		}
+		resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/register", "", body, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("register with portal_url %q: expected 400, got %d", portalURL, resp.StatusCode)
+		}
+	}
+	if sender.lastTo != "" {
+		t.Fatalf("expected no email sent for a rejected portal_url, one went to %q", sender.lastTo)
+	}
+
+	// The same login with an allowlisted portal_url goes through.
+	resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/login", "", map[string]string{
+		"email": email, "portal_url": testPortalURL,
+	}, nil)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("login with allowed portal_url: expected 202, got %d", resp.StatusCode)
+	}
+	if sender.lastTo != email {
+		t.Fatalf("expected magic link sent to %q, sent to %q", email, sender.lastTo)
+	}
+	extractPortalMagicLinkToken(t, sender.lastBody)
 }
 
 func TestPortalWorkflowEndToEnd(t *testing.T) {
@@ -102,7 +181,7 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 	// --- Register ---
 	tenantEmail := "owner+" + uuid.NewString() + "@example.com"
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/register", "", map[string]string{
-		"name": "Test Fintech " + uuid.NewString(), "email": tenantEmail,
+		"name": "Test Fintech " + uuid.NewString(), "email": tenantEmail, "portal_url": testPortalURL,
 	}, nil)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("register: expected 202, got %d", resp.StatusCode)
@@ -329,7 +408,7 @@ func TestPortalWorkflowEndToEnd(t *testing.T) {
 	// never see the first tenant's data. ---
 	otherEmail := "owner+" + uuid.NewString() + "@example.com"
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/register", "", map[string]string{
-		"name": "Other Fintech " + uuid.NewString(), "email": otherEmail,
+		"name": "Other Fintech " + uuid.NewString(), "email": otherEmail, "portal_url": testPortalURL,
 	}, nil)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("register other tenant: expected 202, got %d", resp.StatusCode)

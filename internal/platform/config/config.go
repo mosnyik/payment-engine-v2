@@ -80,13 +80,14 @@ type Config struct {
 
 	HTTPAddr string // default :3700
 
-	// PortalBaseURL is the tenant self-service frontend's origin (e.g.
-	// https://portal.2settle.io) — internal/tenant.RequestMagicLink uses it
-	// to build a real clickable "{PortalBaseURL}/verify?token=..." link
-	// instead of emailing the bare token. Empty by default: no frontend
-	// exists to point at yet, and RequestMagicLink falls back to the bare
-	// token in that case rather than emitting a broken link.
-	PortalBaseURL string
+	// PortalAllowedOrigins (PORTAL_ALLOWED_ORIGINS, comma-separated) is the
+	// allowlist of tenant-portal frontend origins ("scheme://host[:port]")
+	// a client may pass as portal_url to /v2/portal/login and
+	// /v2/portal/register — internal/tenant.ValidatePortalURL. The magic
+	// link is built as "{portal_url}/verify?token=...", so any path under
+	// an allowed origin works without a config change. Empty by default,
+	// which rejects every portal_url (fail closed).
+	PortalAllowedOrigins []string
 
 	RateEngine   RateEngineConfig
 	Treasury     TreasuryConfig
@@ -212,20 +213,49 @@ type SettlementProviderConfig struct {
 	WebhookSecret string
 }
 
+// HyparrowConfig configures the Hyparrow NGN payout adapter
+// (internal/settlement/hyparrow.go). Env names match v1's so the same
+// credentials carry over. Disabled unless HYPARROW_ENABLED is set and every
+// credential and sender field is present.
+type HyparrowConfig struct {
+	Enabled          bool
+	BaseURL          string
+	APIKey           string
+	APISecret        string
+	WebhookSecret    string
+	SenderPhone      string
+	SenderEmail      string
+	SenderLastname   string
+	SenderOthernames string
+	Timeout          time.Duration
+}
+
+// TelegramConfig configures the ops Telegram group settlement falls back to
+// for manual payout (internal/settlement/manual.go). Env names match v1's.
+type TelegramConfig struct {
+	Enabled       bool
+	BotToken      string
+	ChatID        string
+	WebhookSecret string
+	APIURL        string
+}
+
 // SettlementConfig is settlement's operational tuning — see
-// internal/settlement and ARCHITECTURE.md §8. No settlement partner is
-// integrated yet; CNGN/Flutterwave/Paystack/Monnify/HydrogenPay are the
-// named candidates the business is evaluating, each a disabled-by-default
-// TODO-stub adapter until a real one is chosen. The retry policy's numbers
-// (3-attempt cap, 10-minute confirmation timeout, ~60s backoff) are fixed
-// design constants in internal/settlement, not configured here — only how
-// often the two background jobs poll is an ops knob.
+// internal/settlement and ARCHITECTURE.md §8. Hyparrow is the live NGN
+// payout partner, with the Telegram group as the manual fallback;
+// CNGN/Flutterwave/Paystack/Monnify/HydrogenPay remain disabled-by-default
+// TODO-stub adapters. The retry policy's numbers (3-attempt cap, 10-minute
+// confirmation timeout, ~60s backoff) are fixed design constants in
+// internal/settlement, not configured here — only how often the two
+// background jobs poll is an ops knob.
 type SettlementConfig struct {
 	CNGN        SettlementProviderConfig
 	Flutterwave SettlementProviderConfig
 	Paystack    SettlementProviderConfig
 	Monnify     SettlementProviderConfig
 	HydrogenPay SettlementProviderConfig
+	Hyparrow    HyparrowConfig
+	Telegram    TelegramConfig
 
 	DispatchPollInterval     time.Duration // default 3s — settlement must be near-real-time
 	TimeoutCheckPollInterval time.Duration // default 60s
@@ -360,7 +390,7 @@ func Load(source Source) (*Config, error) {
 	auditLogRetention := durationOrDefault(source, "AUDIT_LOG_RETENTION", 8760*time.Hour, &errs)
 	auditLogRetentionCheckInterval := durationOrDefault(source, "AUDIT_LOG_RETENTION_CHECK_INTERVAL", 24*time.Hour, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
-	portalBaseURL := stringOrDefault(source, "PORTAL_BASE_URL", "")
+	portalAllowedOrigins := originListOrEmpty(source, "PORTAL_ALLOWED_ORIGINS", &errs)
 
 	session := SessionConfig{
 		TTLCheckInterval: durationOrDefault(source, "SESSION_TTL_CHECK_INTERVAL", 30*time.Second, &errs),
@@ -418,7 +448,26 @@ func Load(source Source) (*Config, error) {
 		Paystack:                 loadSettlementProviderConfig(source, "PAYSTACK_SETTLEMENT"),
 		Monnify:                  loadSettlementProviderConfig(source, "MONNIFY_SETTLEMENT"),
 		HydrogenPay:              loadSettlementProviderConfig(source, "HYDROGENPAY_SETTLEMENT"),
-		DispatchPollInterval:     durationOrDefault(source, "SETTLEMENT_DISPATCH_POLL_INTERVAL", 3*time.Second, &errs),
+		Hyparrow: HyparrowConfig{
+			Enabled:          boolOrDefault(source, "HYPARROW_ENABLED", false),
+			BaseURL:          stringOrDefault(source, "HYPARROW_BASE_URL", "https://sandbox.hyparrow.cloud/api/v1"),
+			APIKey:           stringOrDefault(source, "HYPARROW_API_KEY", ""),
+			APISecret:        stringOrDefault(source, "HYPARROW_API_SECRET", ""),
+			WebhookSecret:    stringOrDefault(source, "HYPARROW_WEBHOOK_SECRET", ""),
+			SenderPhone:      stringOrDefault(source, "HYPARROW_SENDER_PHONE", ""),
+			SenderEmail:      stringOrDefault(source, "HYPARROW_SENDER_EMAIL", ""),
+			SenderLastname:   stringOrDefault(source, "HYPARROW_SENDER_LASTNAME", ""),
+			SenderOthernames: stringOrDefault(source, "HYPARROW_SENDER_OTHERNAMES", ""),
+			Timeout:          durationOrDefault(source, "HYPARROW_TIMEOUT", 30*time.Second, &errs),
+		},
+		Telegram: TelegramConfig{
+			Enabled:       boolOrDefault(source, "TELEGRAM_ALERTS_ENABLED", false),
+			BotToken:      stringOrDefault(source, "TELEGRAM_BOT_TOKEN", ""),
+			ChatID:        stringOrDefault(source, "TELEGRAM_CHAT_ID", ""),
+			WebhookSecret: stringOrDefault(source, "TELEGRAM_WEBHOOK_SECRET", ""),
+			APIURL:        stringOrDefault(source, "TELEGRAM_API_URL", "https://api.telegram.org"),
+		},
+		DispatchPollInterval:    durationOrDefault(source, "SETTLEMENT_DISPATCH_POLL_INTERVAL", 3*time.Second, &errs),
 		TimeoutCheckPollInterval: durationOrDefault(source, "SETTLEMENT_TIMEOUT_CHECK_POLL_INTERVAL", 60*time.Second, &errs),
 	}
 
@@ -476,7 +525,7 @@ func Load(source Source) (*Config, error) {
 		AuditLogRetention:              auditLogRetention,
 		AuditLogRetentionCheckInterval: auditLogRetentionCheckInterval,
 		HTTPAddr:                       httpAddr,
-		PortalBaseURL:                  portalBaseURL,
+		PortalAllowedOrigins:           portalAllowedOrigins,
 		RateEngine:                     rateEngine,
 		Treasury:                       treasury,
 		Session:                        session,
@@ -567,6 +616,32 @@ func stringOrDefault(source Source, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// originListOrEmpty parses a comma-separated list of origins
+// ("scheme://host[:port]", http or https, no path/query/fragment/
+// credentials). A malformed entry is a startup error rather than being
+// silently dropped — it's a security allowlist.
+func originListOrEmpty(source Source, key string, errs *[]string) []string {
+	v, ok := source.Get(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	var out []string
+	for _, raw := range strings.Split(v, ",") {
+		raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+			u.Path != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			*errs = append(*errs, fmt.Sprintf("%s: invalid origin %q (want scheme://host[:port])", key, raw))
+			continue
+		}
+		out = append(out, strings.ToLower(u.Scheme+"://"+u.Host))
+	}
+	return out
 }
 
 func requireString(source Source, key string, errs *[]string) string {

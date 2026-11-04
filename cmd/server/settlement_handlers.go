@@ -14,12 +14,9 @@ import (
 	"github.com/sirfi/payment-engine-v2/internal/settlement"
 )
 
-// settlementWebhookSignatureHeader is where a settlement provider's payout
-// callback carries its HMAC signature (settlement.VerifyWebhookSignature).
-// TODO: confirm this matches each real provider's actual header name once
-// known — a placeholder, same status as providers.go's request/response
-// shapes.
-const settlementWebhookSignatureHeader = "X-Webhook-Signature"
+// telegramSecretTokenHeader carries the secret_token registered with
+// Telegram's setWebhook on every update Telegram delivers.
+const telegramSecretTokenHeader = "X-Telegram-Bot-Api-Secret-Token"
 
 // settlementHandlers implements Phase 6's inbound webhook and ops-facing
 // admin surface. handleWebhook is deliberately unauthenticated by the
@@ -38,15 +35,39 @@ func (h *settlementHandlers) handleWebhook(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	signature := r.Header.Get(settlementWebhookSignatureHeader)
-
-	err = h.settlement.HandleSettlementWebhook(r.Context(), providerName, body, signature)
+	// Each provider reads its own signature headers (settlement's
+	// parseWebhook), so the whole header set goes through.
+	err = h.settlement.HandleSettlementWebhook(r.Context(), providerName, body, r.Header)
 	switch {
 	case errors.Is(err, settlement.ErrInvalidWebhookSignature):
 		writeErr(w, http.StatusUnauthorized, err)
 		return
 	case errors.Is(err, settlement.ErrUnknownProvider), errors.Is(err, settlement.ErrUnknownAttempt):
 		writeErr(w, http.StatusNotFound, err)
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /webhooks/telegram — button presses on the manual-payout alerts.
+// Self-verified via the setWebhook secret_token, same unauthenticated tier
+// as the provider webhooks.
+func (h *settlementHandlers) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	err = h.settlement.HandleTelegramUpdate(r.Context(), r.Header.Get(telegramSecretTokenHeader), body)
+	switch {
+	case errors.Is(err, settlement.ErrTelegramDisabled):
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	case errors.Is(err, settlement.ErrInvalidTelegramSecret):
+		writeErr(w, http.StatusUnauthorized, err)
 		return
 	case err != nil:
 		writeErr(w, http.StatusInternalServerError, err)
@@ -67,7 +88,6 @@ type settlementResponse struct {
 	CryptoAmount        string    `json:"crypto_amount"`
 	FiatCurrency        string    `json:"fiat_currency"`
 	FiatValue           string    `json:"fiat_value"`
-	FeeAmount           string    `json:"fee_amount"`
 	TenantPayableAmount string    `json:"tenant_payable_amount"`
 	AttemptCount        int       `json:"attempt_count"`
 	OpsPaged            bool      `json:"ops_paged"`
@@ -84,7 +104,6 @@ func toSettlementResponse(st *settlement.Settlement) settlementResponse {
 		CryptoAmount:        st.CryptoAmount.String(),
 		FiatCurrency:        st.FiatCurrency,
 		FiatValue:           st.FiatValue.String(),
-		FeeAmount:           st.FeeAmount.String(),
 		TenantPayableAmount: st.TenantPayableAmount.String(),
 		AttemptCount:        st.AttemptCount,
 		OpsPaged:            st.OpsPagedAt != nil,
@@ -126,7 +145,7 @@ func (h *settlementHandlers) retrySettlement(w http.ResponseWriter, r *http.Requ
 
 	var req struct {
 		CorrectedDestination json.RawMessage `json:"corrected_destination"`
-		ConfirmedFailed       bool            `json:"confirmed_failed"`
+		ConfirmedFailed      bool            `json:"confirmed_failed"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)

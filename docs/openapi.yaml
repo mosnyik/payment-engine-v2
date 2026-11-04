@@ -18,6 +18,8 @@ tags:
     description: Tenant-authenticated (API key + HMAC signature)
   - name: admin
     description: Admin-authenticated (bearer token from /admin/login)
+  - name: portal
+    description: Tenant self-service, portal session token (from /portal/verify)
   - name: webhooks
     description: Inbound, self-verified by provider signature
 
@@ -40,7 +42,8 @@ paths:
       description: >
         Returns the persisted "current rate" (internal/rate's CurrentRateJob
         output) — the same value LockRate locks transactions against, not a
-        live per-request recomputation.
+        live per-request recomputation. Only published for currencies with
+        at least one active corridor.
       security: []
       parameters:
         - name: fiatCurrency
@@ -57,7 +60,7 @@ paths:
                 properties:
                   rate: { type: string, example: "1,650.00" }
         "404":
-          description: No rate computed yet for this currency
+          description: No active corridor uses this currency, or no rate computed for it yet
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
@@ -328,6 +331,74 @@ paths:
                       items:
                         type: array
                         items: { $ref: "#/components/schemas/Corridor" }
+    post:
+      tags: [admin]
+      summary: "Create a corridor and its provider bindings"
+      description: >
+        Create-only: an existing crypto_asset/crypto_network/fiat_currency
+        combination returns 409 and is never overwritten. The corridor and
+        its provider bindings are written in one transaction. Asset, network
+        and currency are trimmed and uppercased. Provider names must match an
+        adapter registered in this server (collection, settlement or
+        compliance), so a typo is a 400 rather than a corridor whose sessions
+        can't find a provider. Recorded in the admin audit log as
+        corridor.create.
+      security: [{ adminAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [crypto_asset, crypto_network, fiat_currency]
+              properties:
+                crypto_asset: { type: string, example: USDT }
+                crypto_network: { type: string, example: TRC20 }
+                fiat_currency: { type: string, example: NGN }
+                active: { type: boolean, default: true }
+                min_amount_fiat: { type: string, description: "Positive decimal", nullable: true }
+                max_amount_fiat: { type: string, description: "Positive decimal, >= min_amount_fiat", nullable: true }
+                travel_rule_threshold_fiat: { type: string, description: "Positive decimal; omit for no Travel Rule check", nullable: true }
+                travel_rule_window_seconds: { type: integer, default: 86400, minimum: 1 }
+                compliance_hold_timeout_seconds: { type: integer, default: 86400, minimum: 1 }
+                required_destination_fields: { type: array, items: { type: string } }
+                providers:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, name]
+                    properties:
+                      type: { type: string, enum: [collection, settlement, compliance] }
+                      name: { type: string, example: busha }
+                      priority: { type: integer, default: 0, minimum: 0, description: "Lower is tried first" }
+      responses:
+        "201":
+          description: Corridor created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Corridor"
+                  - type: object
+                    properties:
+                      providers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            type: { type: string }
+                            name: { type: string }
+                            priority: { type: integer }
+                            active: { type: boolean }
+        "400":
+          description: Missing or invalid field, unknown provider, or duplicate binding
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "409":
+          description: A corridor with this asset/network/fiat already exists
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
   /admin/corridors/{corridorID}:
     get:
@@ -343,6 +414,113 @@ paths:
             application/json: { schema: { $ref: "#/components/schemas/Corridor" } }
         "404":
           description: Not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+    patch:
+      tags: [admin]
+      summary: "Edit or deactivate a corridor (partial update)"
+      description: >
+        Send only the fields to change; absent fields keep their value and
+        an explicit null clears min_amount_fiat, max_amount_fiat or
+        travel_rule_threshold_fiat. crypto_asset, crypto_network and
+        fiat_currency can't be changed (sessions, entitlements and the KYB
+        jurisdiction gate are tied to them; create a new corridor and
+        deactivate this one instead). Unknown fields are a 400. Validation
+        runs on the merged result (e.g. a new max is checked against the
+        existing min). {"active": false} deactivates: new sessions are
+        rejected and the corridor disappears from the tenant portal, while
+        in-flight sessions finish normally and tenant entitlements are kept,
+        so {"active": true} restores access. Recorded in the admin audit log
+        as corridor.update with before/after values.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/corridorID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              additionalProperties: false
+              properties:
+                active: { type: boolean }
+                min_amount_fiat: { type: string, nullable: true, description: "Positive decimal; null clears" }
+                max_amount_fiat: { type: string, nullable: true, description: "Positive decimal; null clears" }
+                travel_rule_threshold_fiat: { type: string, nullable: true, description: "Positive decimal; null disables the Travel Rule check" }
+                travel_rule_window_seconds: { type: integer, minimum: 1 }
+                compliance_hold_timeout_seconds: { type: integer, minimum: 1 }
+                required_destination_fields: { type: array, nullable: true, items: { type: string } }
+      responses:
+        "200":
+          description: Updated corridor
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Corridor" } }
+        "400":
+          description: Empty body, unknown or immutable field, or invalid value
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "404":
+          description: Not found
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /admin/corridors/{corridorID}/providers:
+    put:
+      tags: [admin]
+      summary: "Replace a corridor's provider bindings"
+      description: >
+        Makes the given list the corridor's complete set of active provider
+        bindings, atomically, with the same validation as corridor create
+        (registered adapter names only, no duplicates, priority >= 0).
+        Bindings left out are deactivated, not deleted, so re-adding one
+        later reactivates it with its existing config. An empty list
+        deactivates every binding. Recorded in the admin audit log as
+        corridor.providers.replace.
+      security: [{ adminAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/corridorID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providers]
+              properties:
+                providers:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, name]
+                    properties:
+                      type: { type: string, enum: [collection, settlement, compliance] }
+                      name: { type: string, example: flutterwave }
+                      priority: { type: integer, default: 0, minimum: 0, description: "Lower is tried first" }
+      responses:
+        "200":
+          description: The corridor's active bindings after the replace
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        type: { type: string }
+                        name: { type: string }
+                        priority: { type: integer }
+                        active: { type: boolean }
+        "400":
+          description: Missing providers key, unknown provider, or duplicate binding
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "404":
+          description: Corridor not found
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
@@ -518,9 +696,6 @@ paths:
               type: object
               properties:
                 active: { type: boolean }
-                fee_bps_override:
-                  type: integer
-                  nullable: true
       responses:
         "200":
           description: Entitlement set
@@ -530,6 +705,76 @@ paths:
                 type: object
                 properties:
                   active: { type: boolean }
+
+  /portal/corridors:
+    get:
+      tags: [portal]
+      summary: "List active platform corridors with this tenant's entitlement state"
+      description: >
+        Corridors are platform config, managed by admins — a tenant can only
+        opt in to existing ones. Inactive corridors are not listed. Travel
+        Rule and compliance-hold settings are deliberately omitted from this
+        tenant-facing shape.
+      security: [{ portalAuth: [] }]
+      responses:
+        "200":
+          description: Corridors
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/PortalCorridor" }
+        "401":
+          description: Missing or invalid portal session
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
+  /portal/corridors/{corridorID}:
+    post:
+      tags: [portal]
+      summary: "Enable or disable a corridor for this tenant (self-service onboarding step 5)"
+      description: >
+        Self-service counterpart to POST /admin/tenants/{tenantID}/corridors/{corridorID}.
+        Enabling requires an active tenant whose approved KYB declared the
+        corridor's fiat currency, and is refused if an admin disabled this
+        entitlement (only an admin can re-grant it). Disabling is always
+        allowed.
+      security: [{ portalAuth: [] }]
+      parameters:
+        - name: corridorID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+      responses:
+        "200":
+          description: Entitlement set
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  active: { type: boolean }
+        "400":
+          description: "Missing active field, invalid corridor ID, tenant not active, or no approved KYB covers the corridor's currency"
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "403":
+          description: Disabled by an admin; only an admin can re-enable it
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "404":
+          description: Corridor not found or not active
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
   /admin/tenants/{tenantID}/webhook:
     post:
@@ -829,6 +1074,10 @@ components:
       type: http
       scheme: bearer
       description: Token obtained from POST /admin/login.
+    portalAuth:
+      type: http
+      scheme: bearer
+      description: Portal session token obtained from GET /portal/verify (magic link).
 
   schemas:
     Error:
@@ -849,7 +1098,6 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         status: { type: string, enum: [pending_kyb, active, suspended, deleted] }
-        fee_bps: { type: integer }
         webhook_url: { type: string, nullable: true }
         created_at: { type: string }
 
@@ -867,6 +1115,19 @@ components:
         travel_rule_window_seconds: { type: integer }
         compliance_hold_timeout_seconds: { type: integer }
         required_destination_fields: { type: array, items: { type: string } }
+
+    PortalCorridor:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        crypto_asset: { type: string }
+        crypto_network: { type: string }
+        fiat_currency: { type: string }
+        min_amount_fiat: { type: string, nullable: true }
+        max_amount_fiat: { type: string, nullable: true }
+        required_destination_fields: { type: array, items: { type: string } }
+        entitled: { type: boolean, description: "Enabled for this tenant" }
+        disabled_by_admin: { type: boolean, description: "An admin switched it off; only an admin can re-enable it" }
 
     AdminSession:
       description: >
@@ -983,7 +1244,6 @@ components:
         crypto_amount: { type: string }
         fiat_currency: { type: string }
         fiat_value: { type: string }
-        fee_amount: { type: string }
         tenant_payable_amount: { type: string }
         attempt_count: { type: integer }
         ops_paged: { type: boolean }

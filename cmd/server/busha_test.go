@@ -77,7 +77,7 @@ func TestBushaSandboxCollectionOverHTTP(t *testing.T) {
 	if err := stores.tenant.ApproveKYB(ctx, tenantID); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corr.ID, true, nil); err != nil {
+	if err := stores.tenant.SetCorridorEntitlement(ctx, tenantID, corr.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	key, secret, err := stores.tenant.IssueAPIKey(ctx, tenantID)

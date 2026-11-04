@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/sirfi/payment-engine-v2/internal/corridor"
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
 	"github.com/sirfi/payment-engine-v2/internal/rate"
 )
@@ -47,6 +48,20 @@ func newRateTestServer(t *testing.T) (*httptest.Server, *appStores, *db.Pool) {
 	return srv, stores, pool
 }
 
+// seedRateCorridor creates a corridor for fiatCurrency — the endpoint only
+// publishes rates for currencies with an active corridor. Returns its ID.
+func seedRateCorridor(t *testing.T, stores *appStores, fiatCurrency string, active bool) uuid.UUID {
+	t.Helper()
+	id, err := stores.corridor.UpsertCorridor(context.Background(), corridor.UpsertCorridorInput{
+		CryptoAsset: "USDT", CryptoNetwork: "TRC20", FiatCurrency: fiatCurrency, Active: active,
+		TravelRuleWindow: 24 * time.Hour, ComplianceHoldTimeout: 24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("seed corridor %s: %v", fiatCurrency, err)
+	}
+	return id
+}
+
 func TestGetRate_PublicEndpointReturnsPersistedCurrentRate(t *testing.T) {
 	srv, stores, pool := newRateTestServer(t)
 	client := srv.Client()
@@ -57,6 +72,7 @@ func TestGetRate_PublicEndpointReturnsPersistedCurrentRate(t *testing.T) {
 	// colliding with data left over from a previous run against the same
 	// live dev database.
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	seedRateCorridor(t, stores, fiatCurrency, true)
 	if err := rate.UpsertProviderRate(ctx, pool, rate.Quote{
 		Provider:  rate.ProviderCoinMarketCap,
 		Rate:      decimal.RequireFromString("1354.735"),
@@ -95,6 +111,7 @@ func TestGetRate_SystemRateWinsWhenNoExternalProviderAvailable(t *testing.T) {
 	ctx := context.Background()
 
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	seedRateCorridor(t, stores, fiatCurrency, true)
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1650), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
@@ -120,6 +137,7 @@ func TestGetRate_CurrencyLowercaseIsNormalized(t *testing.T) {
 	ctx := context.Background()
 
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	seedRateCorridor(t, stores, fiatCurrency, true)
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1650), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
@@ -162,6 +180,7 @@ func TestGetRate_SetButNotYetComputedReturns404(t *testing.T) {
 	ctx := context.Background()
 
 	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	seedRateCorridor(t, stores, fiatCurrency, true)
 	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1000), decimal.Zero, decimal.Zero); err != nil {
 		t.Fatalf("set system rate: %v", err)
 	}
@@ -169,5 +188,46 @@ func TestGetRate_SetButNotYetComputedReturns404(t *testing.T) {
 	resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/rate/"+fiatCurrency, "", nil, &struct{}{})
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 (current rate not computed yet), got %d", resp.StatusCode)
+	}
+}
+
+func TestGetRate_NoActiveCorridorReturns404(t *testing.T) {
+	// A computed current_rates row isn't enough: once a currency's last
+	// corridor is deactivated, CurrentRateJob stops refreshing it, so the
+	// endpoint must stop serving that frozen value — and serve it again
+	// once a corridor is reactivated.
+	srv, stores, _ := newRateTestServer(t)
+	client := srv.Client()
+	ctx := context.Background()
+
+	fiatCurrency := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	if err := stores.rate.SetSystemRate(ctx, fiatCurrency, decimal.NewFromInt(1650), decimal.Zero, decimal.Zero); err != nil {
+		t.Fatalf("set system rate: %v", err)
+	}
+	if _, err := stores.rate.ComputeAndPersistCurrentRate(ctx, fiatCurrency); err != nil {
+		t.Fatalf("compute and persist current rate: %v", err)
+	}
+	url := srv.URL + "/v2/rate/" + fiatCurrency
+
+	// No corridor at all.
+	if resp := doJSON(t, client, http.MethodGet, url, "", nil, &struct{}{}); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("no corridor: expected 404, got %d", resp.StatusCode)
+	}
+
+	// Only an inactive corridor.
+	corridorID := seedRateCorridor(t, stores, fiatCurrency, false)
+	if resp := doJSON(t, client, http.MethodGet, url, "", nil, &struct{}{}); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("inactive corridor: expected 404, got %d", resp.StatusCode)
+	}
+
+	// Reactivated: published again.
+	if _, _, err := stores.corridor.UpdateCorridor(ctx, corridorID, func(c *corridor.Corridor) error {
+		c.Active = true
+		return nil
+	}); err != nil {
+		t.Fatalf("reactivate corridor: %v", err)
+	}
+	if resp := doJSON(t, client, http.MethodGet, url, "", nil, &struct{}{}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("reactivated corridor: expected 200, got %d", resp.StatusCode)
 	}
 }

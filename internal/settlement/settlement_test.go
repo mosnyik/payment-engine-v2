@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -80,6 +81,12 @@ type fakeSettlementProvider struct {
 	reason  string
 	secret  string
 	calls   int
+
+	lastRequest PayoutRequest
+	// event, if set, is what parseWebhook returns for any correctly-signed
+	// callback — lets a test drive the declined/reversed kinds only real
+	// adapters (hyparrow) emit.
+	event *webhookEvent
 }
 
 func (f *fakeSettlementProvider) Name() string    { return f.name }
@@ -90,8 +97,25 @@ func (f *fakeSettlementProvider) webhookSecret() string {
 	}
 	return f.secret
 }
-func (f *fakeSettlementProvider) Dispatch(_ context.Context, _ PayoutRequest) (PayoutResult, error) {
+func (f *fakeSettlementProvider) parseWebhook(header http.Header, body []byte) (webhookEvent, error) {
+	if f.event != nil {
+		if err := VerifyWebhookSignature(f.webhookSecret(), body, header.Get(genericWebhookSignatureHeader)); err != nil {
+			return webhookEvent{}, err
+		}
+		return *f.event, nil
+	}
+	return parseGenericWebhook(f.name, f.webhookSecret(), header, body)
+}
+
+// sigHeader wraps a generic-scheme signature in the header it travels in.
+func sigHeader(sig string) http.Header {
+	h := http.Header{}
+	h.Set(genericWebhookSignatureHeader, sig)
+	return h
+}
+func (f *fakeSettlementProvider) Dispatch(_ context.Context, req PayoutRequest) (PayoutResult, error) {
 	f.calls++
+	f.lastRequest = req
 	return PayoutResult{Outcome: f.outcome, ProviderReference: f.ref, FailureReason: f.reason}, nil
 }
 
@@ -104,8 +128,7 @@ func (fakeComplianceProvider) Screen(_ context.Context, _ compliance.Case) (comp
 	return compliance.Decision{Approved: true, Reason: "ok"}, nil
 }
 
-// testEnv is one fully-wired stack: a real tenant (1% fee via corridor
-// entitlement override) entitled to a real corridor with a system rate,
+// testEnv is one fully-wired stack: a real tenant entitled to a real corridor with a system rate,
 // tenant-provided-wallet collection binding, and always-approve compliance
 // — plus session and settlement Stores sharing one live bus, mirroring
 // production wiring (cmd/server/stores.go) closely enough that
@@ -148,8 +171,7 @@ func setupTestEnv(t *testing.T, providers ...*fakeSettlementProvider) *testEnv {
 	if err != nil {
 		t.Fatalf("upsert corridor: %v", err)
 	}
-	feeBps := 100 // 1%, matches ARCHITECTURE.md §6's worked example fee rate
-	if err := tenantStore.SetCorridorEntitlement(ctx, tenantID, corridorID, true, &feeBps); err != nil {
+	if err := tenantStore.SetCorridorEntitlement(ctx, tenantID, corridorID, true); err != nil {
 		t.Fatalf("set corridor entitlement: %v", err)
 	}
 
@@ -204,7 +226,6 @@ func setupTestEnv(t *testing.T, providers ...*fakeSettlementProvider) *testEnv {
 		sessionStore:  sessionStore,
 		treasuryStore: treasuryStore,
 		rateStore:     rateStore,
-		feeResolver:   tenantStore,
 		providers:     providerMap,
 	}
 	settlementStore.SetEventBus(bus)
@@ -237,9 +258,16 @@ func uniqueEVMAddress(t *testing.T) string {
 // own subscriber to create the settlements row.
 func (e *testEnv) createDepositConfirmedSession(t *testing.T, fiatAmount, cryptoAmount decimal.Decimal) *session.Session {
 	t.Helper()
+	return e.createDepositConfirmedSessionTo(t, fiatAmount, cryptoAmount, nil)
+}
+
+// createDepositConfirmedSessionTo is createDepositConfirmedSession with a
+// payout_destination supplied at CreateSession.
+func (e *testEnv) createDepositConfirmedSessionTo(t *testing.T, fiatAmount, cryptoAmount decimal.Decimal, destination json.RawMessage) *session.Session {
+	t.Helper()
 	ctx := context.Background()
 
-	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount, nil)
+	sess, err := e.session.CreateSession(ctx, e.tenantID, "USDT", string(wallet.Ethereum), e.fiat, fiatAmount, destination)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -387,11 +415,8 @@ func TestDispatch_HappyPath_SettlesAndPostsLedgerEntries(t *testing.T) {
 	if !st.FiatValue.Equal(decimal.NewFromInt(99000)) {
 		t.Fatalf("expected fiat_value 99000, got %s", st.FiatValue)
 	}
-	if !st.FeeAmount.Equal(decimal.NewFromInt(990)) {
-		t.Fatalf("expected fee_amount 990, got %s", st.FeeAmount)
-	}
-	if !st.TenantPayableAmount.Equal(decimal.NewFromInt(98010)) {
-		t.Fatalf("expected tenant_payable_amount 98010, got %s", st.TenantPayableAmount)
+	if !st.TenantPayableAmount.Equal(decimal.NewFromInt(99000)) {
+		t.Fatalf("expected tenant_payable_amount 99000, got %s", st.TenantPayableAmount)
 	}
 	if provider.calls != 1 {
 		t.Fatalf("expected exactly 1 dispatch call, got %d", provider.calls)
@@ -407,7 +432,7 @@ func TestDispatch_HappyPath_SettlesAndPostsLedgerEntries(t *testing.T) {
 
 	// Deliver the success webhook.
 	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`),
-		ComputeWebhookSignature(provider.webhookSecret(), []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`))); err != nil {
+		sigHeader(ComputeWebhookSignature(provider.webhookSecret(), []byte(`{"event_type":"payout.succeeded","reference_id":"`+provider.ref+`"}`)))); err != nil {
 		t.Fatalf("handle webhook: %v", err)
 	}
 	env.waitForSettlementStatus(t, st.ID, StatusSettled)
@@ -415,7 +440,7 @@ func TestDispatch_HappyPath_SettlesAndPostsLedgerEntries(t *testing.T) {
 
 	// The full ledger trail (ARCHITECTURE.md §6): deposit_confirmed,
 	// fx_conversion, settlement_payout — asset accounts net to zero, fiat
-	// accounts land exactly on the fee split.
+	// accounts land on the full fiat value (no fee is charged).
 	if bal := env.balance(t, l, nil, "treasury_in_transit", "USDT", "crypto"); !bal.Sub(inTransitBefore).Equal(decimal.NewFromInt(100)) {
 		t.Fatalf("treasury_in_transit: expected +100 delta, got %s (before=%s after=%s)", bal.Sub(inTransitBefore), inTransitBefore, bal)
 	}
@@ -425,15 +450,15 @@ func TestDispatch_HappyPath_SettlesAndPostsLedgerEntries(t *testing.T) {
 	if bal := env.balance(t, l, nil, "fiat_fx_clearing", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(99000)) {
 		t.Fatalf("fiat_fx_clearing: expected 99000, got %s", bal)
 	}
-	if bal := env.balance(t, l, nil, "fee_revenue", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-990)) {
-		t.Fatalf("fee_revenue: expected -990, got %s", bal)
+	if bal := env.balance(t, l, nil, "fee_revenue", env.fiat, "fiat"); !bal.IsZero() {
+		t.Fatalf("fee_revenue: expected 0 (no fee is charged), got %s", bal)
 	}
-	if bal := env.balance(t, l, nil, "treasury_fiat_operating", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-98010)) {
-		t.Fatalf("treasury_fiat_operating: expected -98010, got %s", bal)
+	if bal := env.balance(t, l, nil, "treasury_fiat_operating", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-99000)) {
+		t.Fatalf("treasury_fiat_operating: expected -99000, got %s", bal)
 	}
 	tid := env.tenantID
 	if bal := env.balance(t, l, &tid, "tenant_payable", env.fiat, "fiat"); !bal.IsZero() {
-		t.Fatalf("tenant_payable: expected 0 (98010 credited by fx_conversion, 98010 debited by settlement_payout), got %s", bal)
+		t.Fatalf("tenant_payable: expected 0 (99000 credited by fx_conversion, 99000 debited by settlement_payout), got %s", bal)
 	}
 
 	// The reservation is released only at this terminal state (§8 rule 5).
@@ -497,17 +522,17 @@ func TestDispatch_Bucket4Terminal_SettlementFailedImmediately(t *testing.T) {
 	}
 	env.waitForSessionStatus(t, sess.ID, session.StatusSettlementFailed)
 
-	// fx_conversion credited tenant_payable 98010 (liability recognized,
-	// balance -98010 under this ledger's debits-minus-credits convention).
+	// fx_conversion credited tenant_payable 99000 (liability recognized,
+	// balance -99000 under this ledger's debits-minus-credits convention).
 	// settlement_payout then optimistically debited it back to 0 before
 	// calling the provider; the compensating reversal must put the
-	// liability BACK to -98010 — the payout never actually went out, so the
+	// liability BACK to -99000 — the payout never actually went out, so the
 	// tenant is still owed the money pending a future retry, not settled to
 	// zero (ARCHITECTURE.md §6's claim-then-reverse pattern).
 	l := ledger.New(env.pool)
 	tid := env.tenantID
-	if bal := env.balance(t, l, &tid, "tenant_payable", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-98010)) {
-		t.Fatalf("tenant_payable: expected -98010 (liability restored) after compensating reversal, got %s", bal)
+	if bal := env.balance(t, l, &tid, "tenant_payable", env.fiat, "fiat"); !bal.Equal(decimal.NewFromInt(-99000)) {
+		t.Fatalf("tenant_payable: expected -99000 (liability restored) after compensating reversal, got %s", bal)
 	}
 }
 
@@ -516,7 +541,7 @@ func TestWebhook_InvalidSignatureRejected(t *testing.T) {
 	env := setupTestEnv(t, provider)
 	defer env.Cleanup()
 
-	err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{}`), "not-the-right-signature")
+	err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, []byte(`{}`), sigHeader("not-the-right-signature"))
 	if err != ErrInvalidWebhookSignature {
 		t.Fatalf("expected ErrInvalidWebhookSignature, got %v", err)
 	}
@@ -535,7 +560,7 @@ func TestWebhook_SucceededReplayIsNoOp(t *testing.T) {
 	body := []byte(`{"event_type":"payout.succeeded","reference_id":"` + provider.ref + `"}`)
 	sig := ComputeWebhookSignature(provider.webhookSecret(), body)
 
-	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sig); err != nil {
+	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sigHeader(sig)); err != nil {
 		t.Fatalf("first webhook delivery: %v", err)
 	}
 	env.waitForSettlementStatus(t, st.ID, StatusSettled)
@@ -544,7 +569,7 @@ func TestWebhook_SucceededReplayIsNoOp(t *testing.T) {
 	// second ledger post (ledger.Post's idempotency key would reject it
 	// anyway, but the CAS on settlement_attempts should short-circuit
 	// before ever trying).
-	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sig); err != nil {
+	if err := env.settlement.HandleSettlementWebhook(context.Background(), provider.name, body, sigHeader(sig)); err != nil {
 		t.Fatalf("replayed webhook should be a no-op, got error: %v", err)
 	}
 }

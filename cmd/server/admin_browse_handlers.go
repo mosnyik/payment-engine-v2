@@ -86,7 +86,6 @@ type tenantResponse struct {
 	ID         uuid.UUID `json:"id"`
 	Name       string    `json:"name"`
 	Status     string    `json:"status"`
-	FeeBps     int       `json:"fee_bps"`
 	WebhookURL *string   `json:"webhook_url,omitempty"`
 	CreatedAt  string    `json:"created_at"`
 }
@@ -96,7 +95,6 @@ func toTenantResponse(t *tenant.Tenant) tenantResponse {
 		ID:         t.ID,
 		Name:       t.Name,
 		Status:     string(t.Status),
-		FeeBps:     t.FeeBps,
 		WebhookURL: t.WebhookURL,
 		CreatedAt:  t.CreatedAt.Format(http.TimeFormat),
 	}

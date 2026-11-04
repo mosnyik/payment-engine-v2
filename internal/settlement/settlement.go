@@ -42,8 +42,12 @@ const (
 	StatusSettling         Status = "settling"
 	StatusSettled          Status = "settled"
 	StatusSettlementFailed Status = "settlement_failed"
-	StatusReversed         Status = "reversed"
-	StatusReversalResolved Status = "reversal_resolved"
+	// StatusAwaitingManualPayout is settlements-row-local too: automatic
+	// payout gave up and the Telegram fallback handed it to ops to pay by
+	// hand (manual.go). The session stays settling meanwhile.
+	StatusAwaitingManualPayout Status = "awaiting_manual_payout"
+	StatusReversed             Status = "reversed"
+	StatusReversalResolved     Status = "reversal_resolved"
 )
 
 // Retry policy constants (ARCHITECTURE.md §8's "Settlement retry policy") —
@@ -68,7 +72,6 @@ type Settlement struct {
 	CryptoAmount           decimal.Decimal
 	FiatCurrency           string
 	FiatValue              decimal.Decimal
-	FeeAmount              decimal.Decimal
 	TenantPayableAmount    decimal.Decimal
 	AttemptCount           int
 	ConfirmationDeadlineAt *time.Time
@@ -81,14 +84,6 @@ type Settlement struct {
 	UpdatedAt          time.Time
 }
 
-// FeeResolver is the one tenant-module capability settlement needs — a
-// narrow interface, not internal/tenant.Store directly, same convention
-// session.EntitlementChecker/treasury.TenantWebhookLookup already establish
-// for keeping the tenant module boundary hard everywhere else touches it.
-type FeeResolver interface {
-	EffectiveFeeBps(ctx context.Context, tenantID, corridorID uuid.UUID) (int, error)
-}
-
 // Config is what main.go builds from *config.Config to construct a Store —
 // same convention treasury.Config/rate.Config follow.
 type Config struct {
@@ -97,6 +92,11 @@ type Config struct {
 	Paystack    SettlementProviderConfig
 	Monnify     SettlementProviderConfig
 	HydrogenPay SettlementProviderConfig
+	Hyparrow    HyparrowConfig
+
+	// Telegram is the manual-payout fallback (manual.go). Disabled, a
+	// payout that can't go out automatically ends in settlement_failed.
+	Telegram TelegramConfig
 
 	// SandboxMode registers the fake sandbox settlement provider (see
 	// sandbox_provider.go) — set from config.Config.SandboxMode by
@@ -111,9 +111,12 @@ type Store struct {
 	sessionStore  *session.Store
 	treasuryStore *treasury.Store
 	rateStore     *rate.Store
-	feeResolver   FeeResolver
 
 	providers map[string]SettlementProvider
+
+	// telegram is the manual-payout fallback and ops alert channel. Nil
+	// when not configured — every use is nil-checked.
+	telegram *telegramNotifier
 
 	// bus publishes settlement.dispatched/completed/failed/reversed. Nil-safe
 	// — a Store built without one just skips publishing, same convention
@@ -121,18 +124,27 @@ type Store struct {
 	bus *eventbus.Bus
 }
 
-func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, feeResolver FeeResolver, cfg Config) *Store {
+// HasProvider reports whether name is a registered settlement adapter
+// (enabled or not) — the admin corridor-create endpoint's binding check.
+func (s *Store) HasProvider(name string) bool {
+	_, ok := s.providers[name]
+	return ok
+}
+
+func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, cfg Config) *Store {
 	cngn := newCNGNProvider(cfg.CNGN)
 	flutterwave := newFlutterwaveProvider(cfg.Flutterwave)
 	paystack := newPaystackProvider(cfg.Paystack)
 	monnify := newMonnifyProvider(cfg.Monnify)
 	hydrogenpay := newHydrogenPayProvider(cfg.HydrogenPay)
+	hyparrow := newHyparrowProvider(cfg.Hyparrow)
 	providers := map[string]SettlementProvider{
 		cngn.Name():        cngn,
 		flutterwave.Name(): flutterwave,
 		paystack.Name():    paystack,
 		monnify.Name():     monnify,
 		hydrogenpay.Name(): hydrogenpay,
+		hyparrow.Name():    hyparrow,
 	}
 	if cfg.SandboxMode {
 		sandbox := sandboxSettlementProvider{}
@@ -145,8 +157,8 @@ func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Stor
 		sessionStore:  sessionStore,
 		treasuryStore: treasuryStore,
 		rateStore:     rateStore,
-		feeResolver:   feeResolver,
 		providers:     providers,
+		telegram:      newTelegramNotifier(cfg.Telegram),
 	}
 }
 
@@ -157,7 +169,7 @@ func (s *Store) SetEventBus(bus *eventbus.Bus) {
 }
 
 const settlementColumns = `id, session_id, tenant_id, corridor_id, status, crypto_asset, crypto_amount,
-	fiat_currency, fiat_value, fee_amount, tenant_payable_amount, attempt_count,
+	fiat_currency, fiat_value, tenant_payable_amount, attempt_count,
 	confirmation_deadline_at, ops_paged_at, pending_destination, created_at, updated_at`
 
 func scanSettlement(row pgx.Row) (*Settlement, error) {
@@ -165,7 +177,7 @@ func scanSettlement(row pgx.Row) (*Settlement, error) {
 	var status string
 	err := row.Scan(
 		&st.ID, &st.SessionID, &st.TenantID, &st.CorridorID, &status, &st.CryptoAsset, &st.CryptoAmount,
-		&st.FiatCurrency, &st.FiatValue, &st.FeeAmount, &st.TenantPayableAmount, &st.AttemptCount,
+		&st.FiatCurrency, &st.FiatValue, &st.TenantPayableAmount, &st.AttemptCount,
 		&st.ConfirmationDeadlineAt, &st.OpsPagedAt, &st.PendingDestination, &st.CreatedAt, &st.UpdatedAt,
 	)
 	if err != nil {

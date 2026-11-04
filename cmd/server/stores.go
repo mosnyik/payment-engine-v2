@@ -64,7 +64,7 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	// by default like every other provider in this codebase until
 	// NOTIFICATION_EMAIL_* is actually configured.
 	tenantStore.SetEmailSender(notification.NewEmailProvider(notification.EmailProviderConfig(cfg.Notification.Email)))
-	tenantStore.SetPortalBaseURL(cfg.PortalBaseURL)
+	tenantStore.SetAllowedPortalOrigins(cfg.PortalAllowedOrigins)
 
 	complianceRegistry := compliance.NewRegistry()
 	if cfg.SandboxMode {
@@ -140,12 +140,14 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 
 	ledgerStore := ledger.New(pool)
 	ledgerStore.SetEventBus(bus)
-	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, tenantStore, settlement.Config{
+	settlementStore := settlement.New(pool, ledgerStore, corridorStore, sessionStore, treasuryStore, rateStore, settlement.Config{
 		CNGN:        settlement.SettlementProviderConfig(cfg.Settlement.CNGN),
 		Flutterwave: settlement.SettlementProviderConfig(cfg.Settlement.Flutterwave),
 		Paystack:    settlement.SettlementProviderConfig(cfg.Settlement.Paystack),
 		Monnify:     settlement.SettlementProviderConfig(cfg.Settlement.Monnify),
 		HydrogenPay: settlement.SettlementProviderConfig(cfg.Settlement.HydrogenPay),
+		Hyparrow:    settlement.HyparrowConfig(cfg.Settlement.Hyparrow),
+		Telegram:    settlement.TelegramConfig(cfg.Settlement.Telegram),
 		SandboxMode: cfg.SandboxMode,
 	})
 	settlementStore.SetEventBus(bus)

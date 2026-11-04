@@ -30,18 +30,27 @@ const (
 	// OutcomeRejectedTerminal is bucket 4: the provider says this will
 	// never succeed (e.g. invalid account details).
 	OutcomeRejectedTerminal DispatchOutcome = "rejected_terminal"
+	// OutcomeUncertain means the provider may or may not have taken the
+	// transfer (lost response, timeout, unexplained 5xx) and a status
+	// lookup couldn't settle it. Never reversed and never auto-retried:
+	// the next attempt would carry a new idempotency key, so retrying a
+	// transfer that did go through would pay twice. The attempt stays
+	// dispatched, ops are paged, and the provider's webhook (or a human
+	// via RetryPayout's confirmed_failed path) resolves it.
+	OutcomeUncertain DispatchOutcome = "uncertain"
 )
 
 // PayoutRequest is what DispatchWorker hands to a SettlementProvider.
 type PayoutRequest struct {
 	SessionID             uuid.UUID
+	AttemptNumber         int
 	AttemptIdempotencyKey string
 	FiatCurrency          string
-	Amount                decimal.Decimal // the tenant-payable amount, post-fee
-	// Destination is an opaque bank-details payload (account number,
-	// routing details, etc.) — no tenant-level payout-destination schema
-	// exists yet, so this is supplied per dispatch/retry rather than looked
-	// up from tenant config.
+	Amount                decimal.Decimal // the tenant-payable amount (the full locked fiat value; no fee)
+	// Destination is the bank-details payload this attempt pays to: an
+	// ops-corrected one from RetryPayout, else the previous attempt's, else
+	// the session's own payout_destination (dispatch.go resolveDestination).
+	// See bankDestination for the NGN bank-transfer fields.
 	Destination json.RawMessage
 }
 
@@ -60,11 +69,14 @@ type SettlementProvider interface {
 	Name() string
 	IsEnabled() bool
 	Dispatch(ctx context.Context, req PayoutRequest) (PayoutResult, error)
-	// webhookSecret returns the secret this provider's inbound webhook
-	// signature is verified against (webhook.go). Unexported: only
-	// meaningful within this package, same discipline other
-	// implementation-detail interface methods here follow.
-	webhookSecret() string
+	// parseWebhook verifies an inbound payout callback's signature and maps
+	// it to a webhookEvent (webhook.go). Each provider signs and shapes its
+	// callbacks differently, so both live with the adapter. Returns
+	// ErrInvalidWebhookSignature on a bad signature and ErrUnknownProvider
+	// when no webhook secret is configured. Unexported: only meaningful
+	// within this package, same discipline other implementation-detail
+	// interface methods here follow.
+	parseWebhook(header http.Header, body []byte) (webhookEvent, error)
 }
 
 // SettlementProviderConfig configures one external settlement adapter.
@@ -102,9 +114,14 @@ type httpSettlementProvider struct {
 	parseResponse func(body []byte) (PayoutResult, error)
 }
 
-func (p *httpSettlementProvider) Name() string          { return p.name }
-func (p *httpSettlementProvider) IsEnabled() bool       { return p.cfg.Enabled }
-func (p *httpSettlementProvider) webhookSecret() string { return p.cfg.WebhookSecret }
+func (p *httpSettlementProvider) Name() string    { return p.name }
+func (p *httpSettlementProvider) IsEnabled() bool { return p.cfg.Enabled }
+
+// parseWebhook is the placeholder scheme every TODO-stub adapter shares —
+// see parseGenericWebhook.
+func (p *httpSettlementProvider) parseWebhook(header http.Header, body []byte) (webhookEvent, error) {
+	return parseGenericWebhook(p.name, p.cfg.WebhookSecret, header, body)
+}
 
 func (p *httpSettlementProvider) Dispatch(ctx context.Context, req PayoutRequest) (PayoutResult, error) {
 	httpReq, err := p.buildRequest(p.cfg, req)
