@@ -1,6 +1,6 @@
 # Both services use the Linux VPS network to reach host PostgreSQL.
 services:
-  server:
+  payment-engine-v2:
     build:
       context: .
       dockerfile: cmd/server/Dockerfile

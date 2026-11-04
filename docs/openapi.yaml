@@ -9,7 +9,7 @@ info:
   version: "2.0"
 servers:
   - url: http://localhost:3700/v2
-    description: Local dev (go run ./cmd/server, or docker compose up server)
+    description: Local dev (go run ./cmd/server, or docker compose up payment-engine-v2)
 
 tags:
   - name: public
