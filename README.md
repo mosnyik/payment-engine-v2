@@ -44,7 +44,7 @@ docker compose up
 - Postgres is reachable from the host at `localhost:5433` (not 5432, to avoid clashing with a native install).
 - To run just the server (Postgres comes up automatically since it's a dependency):
   ```
-  docker compose up server
+  docker compose up payment-engine-v2
   ```
 - The rate fetcher (`ratefetcher`) is fully independent — it never needs the server running, only Postgres.
 
