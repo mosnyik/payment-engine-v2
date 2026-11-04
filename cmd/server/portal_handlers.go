@@ -35,6 +35,31 @@ type portalHandlers struct {
 	notification *notification.Store
 	ledger       *ledger.Ledger
 	sandboxMode  bool
+	// kybProvider is the screening provider self-service KYB runs through
+	// (portalKYBProvider): sandbox, youverify, or "" for the manual queue.
+	kybProvider string
+}
+
+// portalKYBProvider picks the self-service KYB provider. Sandbox mode
+// always wins: it is a test deployment and must never bill a real vendor.
+func portalKYBProvider(sandboxMode, youverifyEnabled bool) string {
+	switch {
+	case sandboxMode:
+		return compliance.SandboxProviderName
+	case youverifyEnabled:
+		return compliance.YouverifyProviderName
+	default:
+		return ""
+	}
+}
+
+// portalKYBResponse is all a tenant sees of its KYB case. The decision
+// reason holds vendor findings and admin notes, and submitted_data holds
+// the identity numbers; neither goes back to the portal, so the form can't
+// be used to learn what a BVN or TIN lookup returned.
+type portalKYBResponse struct {
+	ID     uuid.UUID `json:"id"`
+	Status string    `json:"status"`
 }
 
 func portalTenantID(r *http.Request) (uuid.UUID, bool) {
@@ -244,13 +269,21 @@ func (h *portalHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	providerName := ""
-	if h.sandboxMode {
-		providerName = compliance.SandboxProviderName
+	switch err := h.compliance.CheckKYBSubmissionAllowed(r.Context(), tenantID); {
+	case errors.Is(err, compliance.ErrKYBUnderReview):
+		writeErr(w, http.StatusConflict, err)
+		return
+	case errors.Is(err, compliance.ErrKYBTooManyAttempts):
+		writeErr(w, http.StatusTooManyRequests, err)
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
 	}
 
-	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.DeclaredCurrencies, providerName)
+	c, err := h.compliance.ScreenTenant(r.Context(), tenantID, req.SubmittedData, req.DeclaredCurrencies, h.kybProvider)
 	if err != nil {
+		log.Printf("portal: kyb: tenant %s: %v", tenantID, err)
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -263,7 +296,27 @@ func (h *portalHandlers) submitKYB(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusCreated, c)
+	writeJSON(w, http.StatusCreated, portalKYBResponse{ID: c.ID, Status: string(c.Status)})
+}
+
+// GET /v2/portal/kyb — where the tenant's latest KYB case stands, so the
+// portal can show "under review" after a reload. 404 before any submission.
+func (h *portalHandlers) getKYB(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := portalTenantID(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, errors.New("missing tenant identity"))
+		return
+	}
+	c, err := h.compliance.GetLatestCase(r.Context(), "tenant", tenantID, compliance.CaseTypeKYB)
+	if errors.Is(err, compliance.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, portalKYBResponse{ID: c.ID, Status: string(c.Status)})
 }
 
 // GET /v2/portal/sessions

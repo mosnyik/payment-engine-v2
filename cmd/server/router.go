@@ -83,6 +83,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		notification: stores.notification,
 		ledger:       stores.ledger,
 		sandboxMode:  cfg.SandboxMode,
+		kybProvider:  portalKYBProvider(cfg.SandboxMode, cfg.Youverify.Enabled),
 	}
 
 	r.With(publicLimit).Post("/admin/login", h.login)
@@ -113,6 +114,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Post("/logout-all", ph.logoutAll)
 		portal.Post("/delete-account", ph.deleteAccount)
 		portal.Post("/kyb", ph.submitKYB)
+		portal.Get("/kyb", ph.getKYB)
 		portal.Get("/sessions", ph.listSessions)
 		portal.Get("/sessions/{sessionID}", ph.getSession)
 		portal.Get("/settlements", ph.listSettlements)

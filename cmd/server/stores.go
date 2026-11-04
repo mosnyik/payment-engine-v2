@@ -70,6 +70,9 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 	if cfg.SandboxMode {
 		complianceRegistry.Register(compliance.SandboxProvider{})
 	}
+	if cfg.Youverify.Enabled {
+		complianceRegistry.Register(compliance.NewYouverifyProvider(cfg.Youverify.APIURL, cfg.Youverify.APIKey))
+	}
 	complianceStore := compliance.New(pool, complianceRegistry)
 	adminStore := adminauth.New(pool, cfg.AdminSessionTTL)
 	corridorStore := corridor.New(pool)
