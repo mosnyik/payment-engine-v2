@@ -51,6 +51,7 @@ func newStore(t *testing.T, pool *db.Pool) *tenant.Store {
 	if err != nil {
 		t.Fatalf("new tenant store: %v", err)
 	}
+	s.SetAllowedPortalOrigins([]string{testPortalOrigin})
 	return s
 }
 

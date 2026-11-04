@@ -96,7 +96,7 @@ func TestPortalCorridorSelfService(t *testing.T) {
 
 	// --- Register + verify a tenant ---
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/register", "", map[string]string{
-		"name": "Corridor Fintech " + uuid.NewString(), "email": "owner+" + uuid.NewString() + "@example.com",
+		"name": "Corridor Fintech " + uuid.NewString(), "email": "owner+" + uuid.NewString() + "@example.com", "portal_url": testPortalURL,
 	}, nil)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("register: expected 202, got %d", resp.StatusCode)

@@ -41,20 +41,27 @@ func portalTenantID(r *http.Request) (uuid.UUID, bool) {
 	return tenant.PortalTenantIDFromContext(r.Context())
 }
 
-// POST /v2/portal/register {"name": "...", "email": "..."} — creates the
-// pending_kyb tenant and sends a magic link. No session token is returned
+// POST /v2/portal/register {"name": "...", "email": "...", "portal_url": "..."}
+// — creates the pending_kyb tenant and sends a magic link to
+// "{portal_url}/verify?token=...". portal_url is validated against
+// PORTAL_ALLOWED_ORIGINS before the tenant is created. No session token is returned
 // here: registering doesn't prove email ownership, verifying the link does.
 func (h *portalHandlers) register(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name  string `json:"name"`
-		Email string `json:"email"`
+		Name      string `json:"name"`
+		Email     string `json:"email"`
+		PortalURL string `json:"portal_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Name == "" || req.Email == "" {
-		writeErr(w, http.StatusBadRequest, errors.New("name and email are required"))
+	if req.Name == "" || req.Email == "" || req.PortalURL == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("name, email and portal_url are required"))
+		return
+	}
+	if _, err := h.tenant.ValidatePortalURL(req.PortalURL); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -72,25 +79,36 @@ func (h *portalHandlers) register(w http.ResponseWriter, r *http.Request) {
 	// the email actually sends — a delivery failure here (e.g. no email
 	// provider configured) shouldn't fail a registration that already
 	// succeeded. The tenant can always retry via login.
-	if err := h.tenant.RequestMagicLink(r.Context(), req.Email); err != nil {
+	if err := h.tenant.RequestMagicLink(r.Context(), req.Email, req.PortalURL); err != nil {
 		log.Printf("portal: register: send magic link: %v", err)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"message": "check your email for a login link"})
 }
 
-// POST /v2/portal/login {"email": "..."} — always responds identically
-// regardless of whether the email is registered (RequestMagicLink's
-// ErrNotFound is deliberately swallowed here), so this endpoint can't be
-// used to enumerate registered emails.
+// POST /v2/portal/login {"email": "...", "portal_url": "..."} — always
+// responds identically regardless of whether the email is registered
+// (RequestMagicLink's ErrNotFound is deliberately swallowed here), so this
+// endpoint can't be used to enumerate registered emails. A bad portal_url
+// is a 400, but it's checked before any email lookup, so that response
+// says nothing about the email either.
 func (h *portalHandlers) login(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Email string `json:"email"`
+		Email     string `json:"email"`
+		PortalURL string `json:"portal_url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := h.tenant.RequestMagicLink(r.Context(), req.Email); err != nil && !errors.Is(err, tenant.ErrNotFound) {
+	if req.Email == "" || req.PortalURL == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("email and portal_url are required"))
+		return
+	}
+	if _, err := h.tenant.ValidatePortalURL(req.PortalURL); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.tenant.RequestMagicLink(r.Context(), req.Email, req.PortalURL); err != nil && !errors.Is(err, tenant.ErrNotFound) {
 		log.Printf("portal: login: send magic link: %v", err)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"message": "if that email is registered, a login link has been sent"})

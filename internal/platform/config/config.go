@@ -80,13 +80,14 @@ type Config struct {
 
 	HTTPAddr string // default :3700
 
-	// PortalBaseURL is the tenant self-service frontend's origin (e.g.
-	// https://portal.2settle.io) — internal/tenant.RequestMagicLink uses it
-	// to build a real clickable "{PortalBaseURL}/verify?token=..." link
-	// instead of emailing the bare token. Empty by default: no frontend
-	// exists to point at yet, and RequestMagicLink falls back to the bare
-	// token in that case rather than emitting a broken link.
-	PortalBaseURL string
+	// PortalAllowedOrigins (PORTAL_ALLOWED_ORIGINS, comma-separated) is the
+	// allowlist of tenant-portal frontend origins ("scheme://host[:port]")
+	// a client may pass as portal_url to /v2/portal/login and
+	// /v2/portal/register — internal/tenant.ValidatePortalURL. The magic
+	// link is built as "{portal_url}/verify?token=...", so any path under
+	// an allowed origin works without a config change. Empty by default,
+	// which rejects every portal_url (fail closed).
+	PortalAllowedOrigins []string
 
 	RateEngine   RateEngineConfig
 	Treasury     TreasuryConfig
@@ -389,7 +390,7 @@ func Load(source Source) (*Config, error) {
 	auditLogRetention := durationOrDefault(source, "AUDIT_LOG_RETENTION", 8760*time.Hour, &errs)
 	auditLogRetentionCheckInterval := durationOrDefault(source, "AUDIT_LOG_RETENTION_CHECK_INTERVAL", 24*time.Hour, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
-	portalBaseURL := stringOrDefault(source, "PORTAL_BASE_URL", "")
+	portalAllowedOrigins := originListOrEmpty(source, "PORTAL_ALLOWED_ORIGINS", &errs)
 
 	session := SessionConfig{
 		TTLCheckInterval: durationOrDefault(source, "SESSION_TTL_CHECK_INTERVAL", 30*time.Second, &errs),
@@ -524,7 +525,7 @@ func Load(source Source) (*Config, error) {
 		AuditLogRetention:              auditLogRetention,
 		AuditLogRetentionCheckInterval: auditLogRetentionCheckInterval,
 		HTTPAddr:                       httpAddr,
-		PortalBaseURL:                  portalBaseURL,
+		PortalAllowedOrigins:           portalAllowedOrigins,
 		RateEngine:                     rateEngine,
 		Treasury:                       treasury,
 		Session:                        session,
@@ -615,6 +616,32 @@ func stringOrDefault(source Source, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// originListOrEmpty parses a comma-separated list of origins
+// ("scheme://host[:port]", http or https, no path/query/fragment/
+// credentials). A malformed entry is a startup error rather than being
+// silently dropped — it's a security allowlist.
+func originListOrEmpty(source Source, key string, errs *[]string) []string {
+	v, ok := source.Get(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return nil
+	}
+	var out []string
+	for _, raw := range strings.Split(v, ",") {
+		raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+			u.Path != "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			*errs = append(*errs, fmt.Sprintf("%s: invalid origin %q (want scheme://host[:port])", key, raw))
+			continue
+		}
+		out = append(out, strings.ToLower(u.Scheme+"://"+u.Host))
+	}
+	return out
 }
 
 func requireString(source Source, key string, errs *[]string) string {

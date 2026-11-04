@@ -93,6 +93,10 @@ var (
 	ErrInvalidMagicLink         = errors.New("tenant: invalid or expired magic link")
 	ErrPortalSessionInvalid     = errors.New("tenant: invalid or expired session")
 	ErrEmailDeliveryUnavailable = errors.New("tenant: email delivery not configured")
+	// ErrInvalidPortalURL is returned by ValidatePortalURL/RequestMagicLink
+	// when the client-supplied portal_url is missing, malformed or not on
+	// the PORTAL_ALLOWED_ORIGINS allowlist.
+	ErrInvalidPortalURL = errors.New("tenant: invalid portal_url")
 	// ErrJurisdictionNotApproved is returned by GrantCorridorEntitlement
 	// (Phase 10) when the tenant has no approved KYB case covering the
 	// corridor's fiat currency — the corridor's jurisdiction was never
@@ -119,11 +123,15 @@ type Store struct {
 	pool          *db.Pool
 	crypto        *pcrypto.AESGCM
 	emailSender   EmailSender
-	portalBaseURL string
+
+	// allowedPortalOrigins is the set of frontend origins
+	// ("scheme://host[:port]", lowercased) a client-supplied portal_url may
+	// point at — see SetAllowedPortalOrigins/ValidatePortalURL.
+	allowedPortalOrigins map[string]struct{}
 
 	// fiatLookup/jurisdictionChecker back GrantCorridorEntitlement's
 	// compliance gate (Phase 10) — optional-dependency setter convention
-	// (SetJurisdictionGate), same as SetEmailSender/SetPortalBaseURL, so
+	// (SetJurisdictionGate), same as SetEmailSender/SetAllowedPortalOrigins, so
 	// tenant.New's signature and every existing call site stay untouched.
 	// Unlike those two, an unset gate is not silently skipped:
 	// GrantCorridorEntitlement fails closed (see its doc comment) — a
@@ -161,13 +169,53 @@ func (s *Store) SetJurisdictionGate(fiatLookup FiatCurrencyLookup, checker Juris
 	s.jurisdictionChecker = checker
 }
 
-// SetPortalBaseURL wires the tenant portal frontend's origin (e.g.
-// https://portal.2settle.io) — same optional-dependency setter convention
-// as SetEmailSender. When unset, RequestMagicLink emails the bare token
-// instead of a clickable link, so this stays safe to leave unconfigured
-// (config.PortalBaseURL defaults to "").
-func (s *Store) SetPortalBaseURL(baseURL string) {
-	s.portalBaseURL = baseURL
+// SetAllowedPortalOrigins wires the allowlist a client-supplied portal_url
+// is checked against (config.PortalAllowedOrigins, PORTAL_ALLOWED_ORIGINS).
+// Each entry is an origin — "scheme://host[:port]" — and any path under an
+// allowed origin is accepted, so the frontend can move its routes without
+// a config change. Unset/empty means every portal_url is rejected: fail
+// closed, since emailing a magic link to an arbitrary client-chosen host
+// would hand the login token to whoever made the request.
+func (s *Store) SetAllowedPortalOrigins(origins []string) {
+	s.allowedPortalOrigins = make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		s.allowedPortalOrigins[strings.ToLower(strings.TrimRight(o, "/"))] = struct{}{}
+	}
+}
+
+// ValidatePortalURL checks a client-supplied portal_url — the frontend
+// prefix the magic link is built on, "{portal_url}/verify?token=..." — and
+// returns ErrInvalidPortalURL unless it is an absolute http(s) URL with no
+// credentials, query or fragment whose origin is on the
+// SetAllowedPortalOrigins allowlist.
+//
+// Why the allowlist matters: /portal/login and /portal/register are
+// unauthenticated, so without it anyone could request a link for a
+// victim's email pointed at their own host, and the victim clicking a
+// genuine 2Settle email would deliver the token to the attacker.
+//
+// It never touches the database, so callers can (and the HTTP handlers
+// do) run it before any email lookup — a rejection then reveals nothing
+// about whether an email is registered.
+func (s *Store) ValidatePortalURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("%w: portal_url is required", ErrInvalidPortalURL)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPortalURL, err)
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Opaque != "" {
+		return nil, fmt.Errorf("%w: must be an absolute http(s) URL", ErrInvalidPortalURL)
+	}
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("%w: must not contain credentials, a query or a fragment", ErrInvalidPortalURL)
+	}
+	origin := strings.ToLower(u.Scheme + "://" + u.Host)
+	if _, ok := s.allowedPortalOrigins[origin]; !ok {
+		return nil, fmt.Errorf("%w: origin %s is not allowed", ErrInvalidPortalURL, origin)
+	}
+	return u, nil
 }
 
 func (s *Store) CreateTenant(ctx context.Context, name string) (uuid.UUID, error) {
@@ -269,15 +317,22 @@ func (s *Store) RegisterTenant(ctx context.Context, name, email string) (uuid.UU
 
 // RequestMagicLink issues a single-use, time-limited login token for the
 // tenant registered under email and, if an EmailSender is configured,
-// delivers it. Returns ErrNotFound if no tenant has this email — the HTTP
+// delivers it as a "{portalURL}/verify?token=..." link. portalURL is
+// checked with ValidatePortalURL before anything else (ErrInvalidPortalURL),
+// so a bad URL never reaches the email lookup. Returns ErrNotFound if no tenant has this email — the HTTP
 // handler is responsible for hiding that distinction behind a uniform
 // response so this can't be used to enumerate registered emails (same
 // split of responsibility sessionHandlers.getSession already uses: the
 // Store tells the truth, the handler decides what to reveal).
-func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
+func (s *Store) RequestMagicLink(ctx context.Context, email, portalURL string) error {
+	base, err := s.ValidatePortalURL(portalURL)
+	if err != nil {
+		return err
+	}
+
 	var tenantID uuid.UUID
 	var status string
-	err := s.pool.QueryRow(ctx, `SELECT id, status FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID, &status)
+	err = s.pool.QueryRow(ctx, `SELECT id, status FROM tenants WHERE contact_email = $1`, email).Scan(&tenantID, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -309,26 +364,23 @@ func (s *Store) RequestMagicLink(ctx context.Context, email string) error {
 		return ErrEmailDeliveryUnavailable
 	}
 	subject := "Your 2Settle dashboard login link"
-	body := magicLinkEmailBody(token, s.portalBaseURL)
+	body := magicLinkEmailBody(token, base)
 	if err := s.emailSender.Send(ctx, email, subject, body); err != nil {
 		return fmt.Errorf("tenant: send magic link email: %w", err)
 	}
 	return nil
 }
 
-// magicLinkEmailBody renders a real "{portalBaseURL}/verify?token=..." link
-// when portalBaseURL is configured (see SetPortalBaseURL), so the email
-// contains something clickable instead of a bare token the recipient would
-// have to copy into a request body by hand. Falls back to the bare token
-// when no frontend origin is configured, so a deployment that hasn't set
-// PORTAL_BASE_URL yet still sends something usable, just not clickable.
-func magicLinkEmailBody(token, portalBaseURL string) string {
-	link := token
-	if portalBaseURL != "" {
-		link = fmt.Sprintf("%s/v2/portal/verify?token=%s", strings.TrimRight(portalBaseURL, "/"), url.QueryEscape(token))
-	}
+// magicLinkEmailBody renders the clickable "{base}/verify?token=..." link.
+// base is an already-validated portal_url (ValidatePortalURL); only
+// "/verify" and the token query are appended to whatever path it carries.
+func magicLinkEmailBody(token string, base *url.URL) string {
+	link := *base
+	link.Path = strings.TrimRight(link.Path, "/") + "/verify"
+	link.RawPath = ""
+	link.RawQuery = url.Values{"token": {token}}.Encode()
 	expiryMinutes := int(PortalMagicLinkTTL.Minutes())
-	return fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", link, expiryMinutes)
+	return fmt.Sprintf("Use this link to sign in: %s\n\nThis link expires in %d minutes and can only be used once.", link.String(), expiryMinutes)
 }
 
 // VerifyMagicLink redeems a single-use magic-link token and issues a real

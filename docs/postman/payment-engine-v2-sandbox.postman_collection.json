@@ -11,6 +11,7 @@
     { "key": "admin_token", "value": "" },
     { "key": "tenant_name", "value": "Test Tenant" },
     { "key": "tenant_email", "value": "test-tenant@example.com" },
+    { "key": "portal_url", "value": "http://localhost:3000" },
     { "key": "tenant_id", "value": "" },
     { "key": "magic_link_token", "value": "" },
     { "key": "portal_token", "value": "" },
@@ -341,7 +342,7 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\",\n  \"portal_url\": \"{{portal_url}}\"\n}" },
             "url": { "raw": "{{base_url}}/portal/register", "host": ["{{base_url}}"], "path": ["portal", "register"] },
             "description": "Public. Creates a tenant in 'pending_kyb' status. Returns 202 with no tenant_id — best-effort sends a magic-link email. Use Admin > [Alt] Create Tenant instead if you need tenant_id returned directly."
           }
@@ -351,7 +352,7 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\",\n  \"portal_url\": \"{{portal_url}}\"\n}" },
             "url": { "raw": "{{base_url}}/portal/login", "host": ["{{base_url}}"], "path": ["portal", "login"] },
             "description": "Public, always returns 202 regardless of whether the email is registered (anti-enumeration). Sends a magic-link email IF Resend is configured (NOTIFICATION_EMAIL_PROVIDER=resend).\n\nMANUAL STEP: retrieve the raw token from the email, or read it from Postgres (only the sha256 hash is stored server-side, so the raw token must come from wherever it was actually sent/logged: SELECT * FROM tenant_magic_links ORDER BY created_at DESC LIMIT 1;). Paste it into the `magic_link_token` collection variable before running Verify Magic Link."
           }
@@ -442,7 +443,7 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{tenant_name}}\",\n  \"email\": \"{{tenant_email}}\",\n  \"portal_url\": \"{{portal_url}}\"\n}" },
             "url": { "raw": "{{base_url}}/portal/register", "host": ["{{base_url}}"], "path": ["portal", "register"] }
           }
         },
@@ -451,7 +452,7 @@
           "request": {
             "method": "POST",
             "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\"\n}" },
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{tenant_email}}\",\n  \"portal_url\": \"{{portal_url}}\"\n}" },
             "url": { "raw": "{{base_url}}/portal/login", "host": ["{{base_url}}"], "path": ["portal", "login"] },
             "description": "MANUAL STEP after this request: set the `magic_link_token` collection variable from the email/DB before continuing to step 04."
           }

@@ -51,8 +51,16 @@ func testConfig(t *testing.T) *config.Config {
 		AdminSessionTTL:           12 * time.Hour,
 		EventbusBatchSize:         50,
 		HTTPAddr:                  ":0",
+		PortalAllowedOrigins:      []string{testPortalOrigin},
 	}
 }
+
+// testPortalOrigin is the frontend origin testConfig allowlists;
+// testPortalURL is the portal_url the tests send to login/register.
+const (
+	testPortalOrigin = "https://portal.example.test"
+	testPortalURL    = testPortalOrigin + "/dashboard"
+)
 
 // doJSON performs an HTTP request against srv with a JSON body (or nil) and
 // decodes the JSON response into out (if non-nil). Fails the test on
@@ -196,7 +204,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	// RegisterTenant (not the old email-less CreateTenant) is what
 	// POST /admin/tenants now calls.
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/login", "", map[string]string{
-		"email": tenantEmail,
+		"email": tenantEmail, "portal_url": testPortalURL,
 	}, nil)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("portal login: expected 202, got %d", resp.StatusCode)

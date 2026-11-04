@@ -3,6 +3,7 @@ package tenant_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -29,14 +30,33 @@ func (f *fakeEmailSender) Send(ctx context.Context, to, subject, body string) er
 	return f.sendErr
 }
 
-func extractMagicLinkToken(t *testing.T, body string) string {
+// testPortalOrigin is the origin newStore allowlists; testPortalURL is a
+// portal_url under it, with a path, as a real frontend would send.
+const (
+	testPortalOrigin = "https://portal.example.test"
+	testPortalURL    = testPortalOrigin + "/dashboard"
+)
+
+// extractMagicLink pulls the emailed "{portal_url}/verify?token=..." link
+// out of a magic-link email body.
+func extractMagicLink(t *testing.T, body string) *url.URL {
 	t.Helper()
 	const prefix = "Use this link to sign in: "
 	_, rest, ok := strings.Cut(body, prefix)
 	if !ok {
 		t.Fatalf("email body missing expected prefix: %q", body)
 	}
-	token, _, _ := strings.Cut(rest, "\n")
+	raw, _, _ := strings.Cut(rest, "\n")
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse emailed link %q: %v", raw, err)
+	}
+	return u
+}
+
+func extractMagicLinkToken(t *testing.T, body string) string {
+	t.Helper()
+	token := extractMagicLink(t, body).Query().Get("token")
 	if token == "" {
 		t.Fatalf("extracted empty token from body: %q", body)
 	}
@@ -84,7 +104,7 @@ func TestRequestMagicLink_UnknownEmail(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, pool)
 
-	err := s.RequestMagicLink(ctx, "nobody+"+uuid.NewString()+"@example.com")
+	err := s.RequestMagicLink(ctx, "nobody+"+uuid.NewString()+"@example.com", testPortalURL)
 	if !errors.Is(err, tenant.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for an unregistered email, got %v", err)
 	}
@@ -103,7 +123,7 @@ func TestRequestMagicLink_NoEmailSenderConfigured(t *testing.T) {
 	// No SetEmailSender call at all — same "fails safe, never silently
 	// pretends it worked" reasoning notification's disabled-provider path
 	// already establishes.
-	err := s.RequestMagicLink(ctx, email)
+	err := s.RequestMagicLink(ctx, email, testPortalURL)
 	if !errors.Is(err, tenant.ErrEmailDeliveryUnavailable) {
 		t.Fatalf("expected ErrEmailDeliveryUnavailable with no sender configured, got %v", err)
 	}
@@ -122,7 +142,7 @@ func TestMagicLinkFlow_RequestVerifyThenAuthenticate(t *testing.T) {
 		t.Fatalf("register tenant: %v", err)
 	}
 
-	if err := s.RequestMagicLink(ctx, email); err != nil {
+	if err := s.RequestMagicLink(ctx, email, testPortalURL); err != nil {
 		t.Fatalf("request magic link: %v", err)
 	}
 	if sender.lastTo != email {
@@ -161,7 +181,7 @@ func TestVerifyMagicLink_CannotBeReused(t *testing.T) {
 	if _, err := s.RegisterTenant(ctx, "Test Bank", email); err != nil {
 		t.Fatalf("register tenant: %v", err)
 	}
-	if err := s.RequestMagicLink(ctx, email); err != nil {
+	if err := s.RequestMagicLink(ctx, email, testPortalURL); err != nil {
 		t.Fatalf("request magic link: %v", err)
 	}
 	token := extractMagicLinkToken(t, sender.lastBody)
@@ -262,5 +282,93 @@ func TestListAPIKeys_And_RevokeAPIKey(t *testing.T) {
 	}
 	if err := s.RevokeAPIKey(ctx, otherTenantID, keys[0].ID); !errors.Is(err, tenant.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound revoking another tenant's key, got %v", err)
+	}
+}
+
+func TestValidatePortalURL(t *testing.T) {
+	s, err := tenant.New(nil, make([]byte, 32))
+	if err != nil {
+		t.Fatalf("new tenant store: %v", err)
+	}
+	s.SetAllowedPortalOrigins([]string{"https://portal.example.test", "http://localhost:3000/"})
+
+	cases := []struct {
+		name string
+		raw  string
+		ok   bool
+	}{
+		{"origin only", "https://portal.example.test", true},
+		{"with path", "https://portal.example.test/dashboard/auth", true},
+		{"trailing slash", "https://portal.example.test/", true},
+		{"origin match is case-insensitive", "https://PORTAL.example.test/x", true},
+		{"allowed localhost with port", "http://localhost:3000/app", true},
+		{"empty", "", false},
+		{"relative", "/dashboard", false},
+		{"not allowlisted", "https://evil.example/dashboard", false},
+		{"lookalike subdomain", "https://portal.example.test.evil.example", false},
+		{"wrong scheme for allowed host", "http://portal.example.test", false},
+		{"wrong port", "http://localhost:4000", false},
+		{"userinfo trick", "https://portal.example.test@evil.example", false},
+		{"credentials", "https://user:pass@portal.example.test", false},
+		{"query", "https://portal.example.test/x?next=1", false},
+		{"fragment", "https://portal.example.test/x#y", false},
+		{"javascript scheme", "javascript:alert(1)", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.ValidatePortalURL(tc.raw)
+			if tc.ok && err != nil {
+				t.Fatalf("expected %q to be accepted, got %v", tc.raw, err)
+			}
+			if !tc.ok && !errors.Is(err, tenant.ErrInvalidPortalURL) {
+				t.Fatalf("expected ErrInvalidPortalURL for %q, got %v", tc.raw, err)
+			}
+		})
+	}
+}
+
+func TestValidatePortalURL_NoAllowlistRejectsEverything(t *testing.T) {
+	s, err := tenant.New(nil, make([]byte, 32))
+	if err != nil {
+		t.Fatalf("new tenant store: %v", err)
+	}
+	if _, err := s.ValidatePortalURL("https://portal.example.test"); !errors.Is(err, tenant.ErrInvalidPortalURL) {
+		t.Fatalf("expected ErrInvalidPortalURL with no allowlist configured, got %v", err)
+	}
+}
+
+func TestRequestMagicLink_InvalidPortalURLCheckedBeforeLookup(t *testing.T) {
+	pool := openTestPool(t)
+	s := newStore(t, pool)
+
+	// An unregistered email with a bad portal_url must fail on the URL,
+	// not ErrNotFound — the URL check can't leak whether an email exists.
+	err := s.RequestMagicLink(context.Background(), "nobody+"+uuid.NewString()+"@example.com", "https://evil.example")
+	if !errors.Is(err, tenant.ErrInvalidPortalURL) {
+		t.Fatalf("expected ErrInvalidPortalURL, got %v", err)
+	}
+}
+
+func TestRequestMagicLink_LinkBuiltFromPortalURL(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+	s := newStore(t, pool)
+	sender := &fakeEmailSender{enabled: true}
+	s.SetEmailSender(sender)
+
+	email := "owner+" + uuid.NewString() + "@example.com"
+	if _, err := s.RegisterTenant(ctx, "Test Bank", email); err != nil {
+		t.Fatalf("register tenant: %v", err)
+	}
+	if err := s.RequestMagicLink(ctx, email, testPortalURL+"/"); err != nil {
+		t.Fatalf("request magic link: %v", err)
+	}
+
+	link := extractMagicLink(t, sender.lastBody)
+	if got, want := link.Scheme+"://"+link.Host+link.Path, testPortalURL+"/verify"; got != want {
+		t.Fatalf("expected link to start with %q, got %q", want, got)
+	}
+	if link.Query().Get("token") == "" {
+		t.Fatalf("expected a token query parameter in %q", link)
 	}
 }
