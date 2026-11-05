@@ -66,6 +66,11 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.With(gateway.RequirePermission(gateway.PermissionSessionsWrite)).Post("/sessions", sh.createSession)
 	protected.With(gateway.RequirePermission(gateway.PermissionSessionsRead)).Get("/sessions/{sessionID}", sh.getSession)
 
+	// KYC as a service. Explicit permission only: an unscoped key doesn't
+	// get it, since every call is billed by the provider.
+	kh := &kycHandlers{kyc: stores.kyc}
+	protected.With(gateway.RequireExplicitPermission(gateway.PermissionKYCVerify)).Post("/kyc/verify", kh.verify)
+
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
 	bh := &adminBrowseHandlers{tenant: stores.tenant, corridor: stores.corridor, session: stores.session, admin: stores.admin, requestAudit: stores.audit}
 	sth := &settlementHandlers{settlement: stores.settlement}

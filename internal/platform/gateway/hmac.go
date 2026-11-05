@@ -63,6 +63,11 @@ func limitForTier(tier string) int {
 const (
 	PermissionSessionsWrite = "sessions:write"
 	PermissionSessionsRead  = "sessions:read"
+
+	// PermissionKYCVerify gates POST /v2/kyc/verify. Unlike the others it
+	// must be granted explicitly (RequireExplicitPermission): every call
+	// is billed by the KYC provider, so an unscoped key doesn't get it.
+	PermissionKYCVerify = "kyc:verify"
 )
 
 // CredentialLookup resolves an API key to the tenant's HMAC secret, the
@@ -220,6 +225,24 @@ func RequirePermission(perm string) func(http.Handler) http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": ErrPermissionDenied.Error()})
+		})
+	}
+}
+
+// RequireExplicitPermission is RequirePermission without the "empty list
+// means unrestricted" rule: the key must list perm itself. Used for
+// actions that cost money per call (PermissionKYCVerify), so a key issued
+// before the action existed, or issued unscoped, never gains it silently.
+func RequireExplicitPermission(perm string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if slices.Contains(permissionsFromContext(r.Context()), perm) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": ErrPermissionDenied.Error() + ": requires " + perm})
 		})
 	}
 }

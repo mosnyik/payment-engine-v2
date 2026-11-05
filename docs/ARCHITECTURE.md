@@ -13,7 +13,7 @@ A crypto-to-fiat payment rail, built as a modular monolith in Go + PostgreSQL, d
   - **Self-custody**: own HD-derived wallets hold crypto between deposit and settlement.
   - **Partner-custodied**: e.g. Busha holds funds; the rail only orchestrates via their API.
   - A corridor picks a collection provider; that provider's type determines which custody model applies. Both must be pluggable.
-- Tenant = the integrating bank/fintech, each with a KYB record. End-user KYC is vouched for by the tenant, not performed by this system.
+- Tenant = the integrating bank/fintech, each with a KYB record. End-user KYC for *transactions* is still vouched for by the tenant, not performed by this system. Separately, 2Settle sells identity checks to builders as a product (`POST /v2/kyc/verify`, the `kyc` module, Phase 16): a tenant can use it to KYC its own users, but sessions don't require it.
 - Settlement is via partnerships with licensed PSPs/aggregators and local clearing through banks/fintechs; multiple settlement partners per corridor, for redundancy/failover.
 
 ## 3. Decision log
@@ -65,6 +65,7 @@ Nine business bounded contexts + one shared platform layer. Each module owns its
 | **settlement** | Settlement provider adapters, payout dispatch records, provider failover state | (internally triggered) | `settlement.dispatched`, `settlement.completed`, `settlement.failed` | `session.deposit_confirmed` |
 | **ledger** | Accounts, entries, transactions (append-only), balance cache | `Post()` — the *only* write path | `ledger.posted` | Nearly everything |
 | **notification** | Webhook subscriber config, delivery log, dead-letter queue | — | — (terminal consumer) | `session.*`, `settlement.*`, `compliance.hold_created` |
+| **kyc** | Identity-check usage records (`kyc_checks`: tenant, key, ID type, keyed hash of the ID number, outcome, provider fee; no personal data), KYC provider adapters (Nuban, sandbox) | `Verify()` (sync), behind `POST /v2/kyc/verify` with the explicit-only `kyc:verify` key permission | — | — |
 | **platform** (shared kernel) | Tenant gateway (HMAC/mTLS auth), **admin/internal auth** (separate credential space for staff; password + optional OIDC SSO), outbox/eventbus, inbound-request idempotency store, db/migrations | used by all modules | — | — |
 
 **Key flow decision**: `settlement` subscribes to `session.deposit_confirmed`, not `treasury.swept`. Sweep can be batched (stablecoin policy); settlement must be real-time. They are independent consumers of the same event, not a pipeline.
@@ -86,6 +87,14 @@ None of the three credential spaces are interchangeable, and none of their sessi
 6. Webhook config (`tenant`) — **either path**: admin sets it (`POST /admin/tenants/{id}/webhook`), or the tenant sets its own (`PUT /portal/webhook`, Phase 9a); both validated against SSRF (private/loopback ranges rejected) per the v1 audit finding on this exact gap.
 
 Steps 3 and 5 are the only genuinely admin-only steps — both are judgment calls (a compliance decision, a business/limits decision), not paperwork a tenant could self-serve. Only after step 4 can a tenant call the API at all; only after step 5 can they create a session on a given corridor.
+
+**KYC as a service (Phase 16)** is a product sold to builders, not a step in onboarding or sessions:
+
+- `POST /v2/kyc/verify` (tenant HMAC auth) takes an ID (`bvn`, `nin`, `phone`, `drivers_license`), the first/last name the builder was given, an optional date of birth and `consent: true`, and returns `match` / `partial_match` / `no_match` / `not_found` with a per-field outcome.
+- **Match-only, never the record.** The provider's response (name, DOB, phone, address, photo) is compared in memory and dropped; it is never returned, stored or logged. Returning it would make 2Settle a reseller of identity data, with the NDPA exposure that brings.
+- **Explicit permission.** The key must list `kyc:verify` (`gateway.RequireExplicitPermission`). Unlike every other permission, an unscoped key does not get it, because every call is billed by the provider. Only an admin can issue such a key today (`POST /admin/tenants/{id}/api-keys`).
+- **Usage record without personal data.** Each call writes a `kyc_checks` row: tenant, API key, ID type, an HMAC-SHA256 of the ID number keyed by a server secret (an 11-digit BVN is brute-forceable from a plain hash), the outcome and the provider's fee. That is the basis for billing tenants later; charging is not built yet.
+- Provider: Nuban's KYC data API (`NUBAN_KYC_*`), a separate product from the account-name lookup v1 uses. `SANDBOX_MODE` uses a free simulated provider instead.
 
 ## 6. System & flow diagrams
 

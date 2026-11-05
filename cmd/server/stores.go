@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirfi/payment-engine-v2/internal/compliance"
 	"github.com/sirfi/payment-engine-v2/internal/corridor"
+	"github.com/sirfi/payment-engine-v2/internal/kyc"
 	"github.com/sirfi/payment-engine-v2/internal/ledger"
 	"github.com/sirfi/payment-engine-v2/internal/notification"
 	"github.com/sirfi/payment-engine-v2/internal/platform/adminauth"
@@ -45,6 +46,7 @@ type appStores struct {
 	bus          *eventbus.Bus
 	audit        *audit.Logger
 	ratelimit    *ratelimit.Limiter
+	kyc          *kyc.Service
 
 	// adminOIDC is nil unless ADMIN_OIDC_ISSUER_URL is configured — see
 	// buildRouter, which only registers the two admin OIDC routes when
@@ -177,7 +179,21 @@ func buildStores(ctx context.Context, cfg *config.Config, pool *db.Pool) (*appSt
 		}
 	}
 
+	// KYC as a service: sandbox mode always answers with simulated results
+	// (never billed); otherwise Nuban when configured, else none and
+	// POST /v2/kyc/verify answers 503. The ID-number hash key is derived
+	// from the tenant-secret encryption key (kyc.New domain-separates it).
+	var kycProvider kyc.Provider
+	switch {
+	case cfg.SandboxMode:
+		kycProvider = kyc.SandboxProvider{}
+	case cfg.NubanKYC.Enabled:
+		kycProvider = kyc.NewNubanProvider(cfg.NubanKYC.APIURL, cfg.NubanKYC.APIKey)
+	}
+	kycService := kyc.New(pool, kycProvider, cfg.TenantSecretEncryptionKey)
+
 	return &appStores{
+		kyc:          kycService,
 		tenant:       tenantStore,
 		compliance:   complianceStore,
 		admin:        adminStore,

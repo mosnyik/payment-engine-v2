@@ -233,3 +233,38 @@ func TestLoad_PortalAllowedOriginsRejectsNonOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_NubanKYC(t *testing.T) {
+	base := func() mapSource {
+		return mapSource{
+			"DATABASE_URL":                 "postgres://real:real@realhost:5432/real",
+			"TENANT_SECRET_ENCRYPTION_KEY": validTestKey,
+		}
+	}
+
+	cfg, err := config.Load(base())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.NubanKYC.Enabled || cfg.NubanKYC.APIURL != "https://api-kycdata.nuban.com.ng" {
+		t.Fatalf("unexpected defaults: %+v", cfg.NubanKYC)
+	}
+
+	src := base()
+	src["NUBAN_KYC_ENABLED"] = "true"
+	if _, err := config.Load(src); err == nil || !strings.Contains(err.Error(), "NUBAN_KYC_API_KEY") {
+		t.Fatalf("expected a missing-key error, got %v", err)
+	}
+
+	src["NUBAN_KYC_API_KEY"] = "k"
+	src["NUBAN_KYC_API_URL"] = "http://api-kycdata.nuban.com.ng"
+	if _, err := config.Load(src); err == nil || !strings.Contains(err.Error(), "NUBAN_KYC_API_URL") {
+		t.Fatalf("expected an HTTPS error, got %v", err)
+	}
+
+	delete(src, "NUBAN_KYC_API_URL")
+	cfg, err = config.Load(src)
+	if err != nil || !cfg.NubanKYC.Enabled || cfg.NubanKYC.APIKey != "k" {
+		t.Fatalf("expected enabled config, got %+v, %v", cfg.NubanKYC, err)
+	}
+}
