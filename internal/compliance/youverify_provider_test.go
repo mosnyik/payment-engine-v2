@@ -168,7 +168,7 @@ func TestScreenTenant_ProviderErrorFallsBackToManual(t *testing.T) {
 	reg.Register(fakeProvider{name: "test-provider-error", err: errors.New("boom")})
 	s := compliance.New(pool, reg)
 
-	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "test-provider-error")
+	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"XTS"}, "test-provider-error")
 	if err != nil {
 		t.Fatalf("a provider error must not fail the submission: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestScreenTenant_ProviderHoldMasksAndKeepsFindings(t *testing.T) {
 	s := compliance.New(pool, reg)
 
 	tenantID := uuid.New()
-	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"director_bvn":"22233344455"}`), []string{"NGN"}, "test-provider-hold")
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"director_bvn":"22233344455"}`), []string{"XTS"}, "test-provider-hold")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestCheckKYBSubmissionAllowed_CapsPerDay(t *testing.T) {
 		if err := s.CheckKYBSubmissionAllowed(ctx, tenantID); err != nil {
 			t.Fatalf("submission %d should be allowed: %v", i+1, err)
 		}
-		if _, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "test-provider-reject-cap"); err != nil {
+		if _, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"XTS"}, "test-provider-reject-cap"); err != nil {
 			t.Fatalf("screen %d: %v", i+1, err)
 		}
 	}

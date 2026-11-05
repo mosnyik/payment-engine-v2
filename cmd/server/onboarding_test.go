@@ -145,7 +145,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	corridorID, err := corridorStore.UpsertCorridor(ctx, corridor.UpsertCorridorInput{
 		CryptoAsset:   "USDT",
 		CryptoNetwork: "TESTNET_ONBOARDING_" + uuid.NewString(),
-		FiatCurrency:  "NGN",
+		FiatCurrency:  "XTS", // ISO 4217 test code: no KYB requirements, unlike NGN
 		Active:        true,
 	})
 	if err != nil {
@@ -235,7 +235,7 @@ func TestOnboardingWorkflowEndToEnd(t *testing.T) {
 	}
 	resp = doJSON(t, client, http.MethodPost, srv.URL+"/v2/portal/kyb", portalSessionToken, map[string]any{
 		"submitted_data":      map[string]string{"company": "Test Fintech Ltd"},
-		"declared_currencies": []string{"NGN"},
+		"declared_currencies": []string{"XTS"},
 	}, &kybCase)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("submit kyb: expected 201, got %d", resp.StatusCode)

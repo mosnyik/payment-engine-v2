@@ -147,7 +147,7 @@ func (w *Watcher) pollOnce(ctx context.Context) {
 
 	tipCache := make(map[wallet.Chain]int64)
 	for _, r := range reservations {
-		chain := wallet.Chain(r.CryptoNetwork)
+		chain, _ := wallet.ChainForNetwork(r.CryptoNetwork)
 		client, ok := w.clients[chain]
 		if !ok {
 			continue

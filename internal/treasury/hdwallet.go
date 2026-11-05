@@ -241,7 +241,7 @@ func (p *selfCustodyProvider) CustodyType() CustodyType { return CustodyTypeSelf
 // Derives from tenantID's own segregated HD account (see
 // getOrAllocateTenantAccount) — never the platform-level account.
 func (p *selfCustodyProvider) ReserveAddress(ctx context.Context, tenantID uuid.UUID, _, cryptoNetwork string) (ProviderAddress, error) {
-	chain := wallet.Chain(cryptoNetwork)
+	chain, _ := wallet.ChainForNetwork(cryptoNetwork)
 	switch chain {
 	case wallet.Bitcoin, wallet.Ethereum, wallet.BSC, wallet.Tron:
 	default:

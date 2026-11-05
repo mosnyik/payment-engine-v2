@@ -216,7 +216,7 @@ func TestScreenTenant_NoProviderFallsIntoHold(t *testing.T) {
 	s := compliance.New(pool, compliance.NewRegistry())
 
 	tenantID := uuid.New()
-	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"company":"Test Bank"}`), []string{"NGN"}, "")
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{"company":"Test Bank"}`), []string{"XTS"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestScreenTenant_RegisteredProviderApproves(t *testing.T) {
 	s := compliance.New(pool, reg)
 
 	tenantID := uuid.New()
-	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "test-provider")
+	c, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"XTS"}, "test-provider")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestScreenTenant_RegisteredProviderRejects(t *testing.T) {
 	reg.Register(fakeProvider{name: "test-provider-reject", decision: compliance.Decision{Approved: false, Reason: "sanctions hit"}})
 	s := compliance.New(pool, reg)
 
-	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "test-provider-reject")
+	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"XTS"}, "test-provider-reject")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestScreenTenant_UnknownProviderNameErrors(t *testing.T) {
 	ctx := context.Background()
 	s := compliance.New(pool, compliance.NewRegistry())
 
-	_, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "does-not-exist")
+	_, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"XTS"}, "does-not-exist")
 	if !errors.Is(err, compliance.ErrProviderNotFound) {
 		t.Fatalf("expected ErrProviderNotFound, got %v", err)
 	}
@@ -295,7 +295,7 @@ func TestGetLatestCase(t *testing.T) {
 		t.Fatalf("expected ErrNotFound before any case exists, got %v", err)
 	}
 
-	created, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "")
+	created, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"XTS"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestListHolds_AndResolveHold(t *testing.T) {
 	adminID := mustCreateAdmin(t, pool)
 
 	tenantID := uuid.New()
-	held, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"NGN"}, "")
+	held, err := s.ScreenTenant(ctx, tenantID, json.RawMessage(`{}`), []string{"XTS"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestResolveHold_ConcurrentResolutionOnlyOneWins(t *testing.T) {
 	admin1 := mustCreateAdmin(t, pool)
 	admin2 := mustCreateAdmin(t, pool)
 
-	held, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "")
+	held, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"XTS"}, "")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestScreenTenant_ApprovedDoesNotPublishHoldEvent(t *testing.T) {
 	bus := eventbus.New(pool, 50)
 	s.SetEventBus(bus)
 
-	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"NGN"}, "always-approve-3")
+	c, err := s.ScreenTenant(ctx, uuid.New(), json.RawMessage(`{}`), []string{"XTS"}, "always-approve-3")
 	if err != nil {
 		t.Fatalf("screen tenant: %v", err)
 	}

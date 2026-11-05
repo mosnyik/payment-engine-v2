@@ -131,6 +131,16 @@ func (s *Store) HasProvider(name string) bool {
 	return ok
 }
 
+// ProviderNames lists every registered settlement adapter by name, with
+// whether it is enabled (configured) — the admin corridor form's choices.
+func (s *Store) ProviderNames() map[string]bool {
+	out := make(map[string]bool, len(s.providers))
+	for name, p := range s.providers {
+		out[name] = p.IsEnabled()
+	}
+	return out
+}
+
 func New(pool *db.Pool, ledgerStore *ledger.Ledger, corridorStore *corridor.Store, sessionStore *session.Store, treasuryStore *treasury.Store, rateStore *rate.Store, cfg Config) *Store {
 	cngn := newCNGNProvider(cfg.CNGN)
 	flutterwave := newFlutterwaveProvider(cfg.Flutterwave)

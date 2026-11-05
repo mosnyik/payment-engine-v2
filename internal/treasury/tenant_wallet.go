@@ -74,7 +74,7 @@ func (p *tenantProvidedWalletProvider) IsEnabled() bool { return true }
 func (p *tenantProvidedWalletProvider) CustodyType() CustodyType { return CustodyTypeTenantProvided }
 
 func (p *tenantProvidedWalletProvider) ReserveAddress(ctx context.Context, tenantID uuid.UUID, _, cryptoNetwork string) (ProviderAddress, error) {
-	chain := wallet.Chain(cryptoNetwork)
+	chain, _ := wallet.ChainForNetwork(cryptoNetwork)
 	address, addressTag, err := p.store.getTenantCustomWallet(ctx, tenantID, chain)
 	if err != nil {
 		return ProviderAddress{}, err

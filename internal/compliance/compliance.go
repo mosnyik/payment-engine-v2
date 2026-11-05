@@ -132,6 +132,18 @@ func (s *Store) HasProvider(name string) bool {
 	return ok
 }
 
+// ProviderNames lists every registered screening provider by name. They
+// are only registered once configured, so each one is enabled.
+func (s *Store) ProviderNames() map[string]bool {
+	s.registry.mu.RLock()
+	defer s.registry.mu.RUnlock()
+	out := make(map[string]bool, len(s.registry.providers))
+	for name := range s.registry.providers {
+		out[name] = true
+	}
+	return out
+}
+
 func New(pool *db.Pool, registry *Registry) *Store {
 	return &Store{pool: pool, registry: registry}
 }

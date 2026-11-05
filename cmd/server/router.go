@@ -166,8 +166,26 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
+		admin.Get("/providers", ch.listProviders)
+		admin.Get("/payout-currencies", ch.listPayoutCurrencies)
+
+		// Supported crypto catalog (networks, assets) — what corridors may use.
+		cc := &cryptoCatalogHandlers{corridor: stores.corridor, admin: stores.admin}
+		admin.Get("/crypto", cc.catalog)
+		admin.Get("/crypto/networks", cc.listNetworks)
+		admin.Post("/crypto/networks", cc.createNetwork)
+		admin.Get("/crypto/networks/{code}", cc.getNetwork)
+		admin.Patch("/crypto/networks/{code}", cc.updateNetwork)
+		admin.Delete("/crypto/networks/{code}", cc.deleteNetwork)
+		admin.Get("/crypto/assets", cc.listAssets)
+		admin.Post("/crypto/assets", cc.createAsset)
+		admin.Get("/crypto/assets/{code}", cc.getAsset)
+		admin.Patch("/crypto/assets/{code}", cc.updateAsset)
+		admin.Delete("/crypto/assets/{code}", cc.deleteAsset)
+
 		admin.Post("/corridors", ch.createCorridor)
 		admin.Patch("/corridors/{corridorID}", ch.updateCorridor)
+		admin.Delete("/corridors/{corridorID}", ch.deleteCorridor)
 		admin.Put("/corridors/{corridorID}/providers", ch.replaceProviders)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)

@@ -174,6 +174,16 @@ func (s *Store) HasProvider(name string) bool {
 	return ok
 }
 
+// ProviderNames lists every registered collection adapter by name, with
+// whether it is enabled (configured) — the admin corridor form's choices.
+func (s *Store) ProviderNames() map[string]bool {
+	out := make(map[string]bool, len(s.providers))
+	for name, p := range s.providers {
+		out[name] = p.IsEnabled()
+	}
+	return out
+}
+
 func New(pool *db.Pool, corridorStore *corridor.Store, cfg Config) *Store {
 	busha := newBushaProvider(cfg.Busha)
 	maxRetries := cfg.TenantWebhookMaxRetries

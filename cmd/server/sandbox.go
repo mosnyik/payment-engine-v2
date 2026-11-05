@@ -74,6 +74,11 @@ func seedSandboxCorridors(ctx context.Context, corridorStore *corridor.Store, co
 		if _, err := complianceStore.UpsertJurisdictionRequirement(ctx, s.fiatCurrency, "sandbox", []string{}); err != nil {
 			return fmt.Errorf("sandbox: upsert jurisdiction requirement for %s: %w", s.fiatCurrency, err)
 		}
+		// Keep the supported-crypto catalog in step with configured
+		// sandbox corridors, so they show (and validate) like any other.
+		if err := corridorStore.EnsureCrypto(ctx, s.cryptoAsset, s.cryptoNetwork); err != nil {
+			return fmt.Errorf("sandbox: catalog %s/%s: %w", s.cryptoAsset, s.cryptoNetwork, err)
+		}
 		corridorID, err := corridorStore.UpsertCorridor(ctx, corridor.UpsertCorridorInput{
 			CryptoAsset:   s.cryptoAsset,
 			CryptoNetwork: s.cryptoNetwork,

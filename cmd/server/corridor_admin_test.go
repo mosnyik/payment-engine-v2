@@ -26,6 +26,7 @@ type corridorAdminTestEnv struct {
 	adminStore *adminauth.Store
 	adminID    uuid.UUID
 	token      string
+	pool       *db.Pool
 }
 
 func newCorridorAdminTestEnv(t *testing.T) *corridorAdminTestEnv {
@@ -66,7 +67,18 @@ func newCorridorAdminTestEnv(t *testing.T) *corridorAdminTestEnv {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin login: expected 200, got %d", resp.StatusCode)
 	}
-	return &corridorAdminTestEnv{srv: srv, client: client, stores: stores, adminStore: adminStore, adminID: adminID, token: login.Token}
+	return &corridorAdminTestEnv{srv: srv, client: client, stores: stores, adminStore: adminStore, adminID: adminID, token: login.Token, pool: pool}
+}
+
+// payoutCurrency returns a fresh test currency registered as a supported
+// payout currency (it has a KYB requirement), as POST /admin/corridors needs.
+func (e *corridorAdminTestEnv) payoutCurrency(t *testing.T) string {
+	t.Helper()
+	fiat := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	if _, err := e.stores.compliance.UpsertJurisdictionRequirement(context.Background(), fiat, "test", []string{"test_field"}); err != nil {
+		t.Fatalf("register payout currency %s: %v", fiat, err)
+	}
+	return fiat
 }
 
 // hasAuditEntry reports whether the env's admin has an audit-log entry with
@@ -94,7 +106,7 @@ func TestAdminCreateCorridor(t *testing.T) {
 	create := func(body map[string]any, out any) *http.Response {
 		return doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/corridors", token, body, out)
 	}
-	fiat := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	fiat := env.payoutCurrency(t)
 
 	// --- An unknown provider name is rejected, and nothing is left behind ---
 	resp := create(map[string]any{
@@ -186,7 +198,7 @@ func TestAdminCreateCorridor(t *testing.T) {
 	}
 
 	// --- Validation ---
-	other := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	other := env.payoutCurrency(t)
 	for name, body := range map[string]map[string]any{
 		"missing fiat":       {"crypto_asset": "USDT", "crypto_network": "TRC20"},
 		"min above max":      {"crypto_asset": "USDT", "crypto_network": "TRC20", "fiat_currency": other, "min_amount_fiat": "10", "max_amount_fiat": "5"},
@@ -216,7 +228,7 @@ func TestAdminUpdateAndDeactivateCorridor(t *testing.T) {
 	ctx := context.Background()
 	base := env.srv.URL + "/v2/admin/corridors/"
 
-	fiat := "TST" + strings.ToUpper(uuid.NewString()[:8])
+	fiat := env.payoutCurrency(t)
 	var created struct {
 		ID string `json:"id"`
 	}
@@ -373,5 +385,322 @@ func TestAdminUpdateAndDeactivateCorridor(t *testing.T) {
 	// --- Admin-only ---
 	if resp = doJSON(t, env.client, http.MethodPatch, base+created.ID, "", map[string]any{"active": false}, nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated patch: expected 401, got %d", resp.StatusCode)
+	}
+}
+
+// GET /v2/admin/providers lists exactly the names corridor create accepts,
+// and the corridor list/detail responses carry each corridor's active
+// provider bindings.
+func TestAdminProvidersAndCorridorBindings(t *testing.T) {
+	env := newCorridorAdminTestEnv(t)
+	srv, client, token := env.srv, env.client, env.token
+
+	type option struct {
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+	}
+	var providers map[string][]option
+	if resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/providers", token, nil, &providers); resp.StatusCode != http.StatusOK {
+		t.Fatalf("list providers: expected 200, got %d", resp.StatusCode)
+	}
+	has := func(typ, name string) bool {
+		for _, o := range providers[typ] {
+			if o.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("collection", "busha") || !has("settlement", "flutterwave") || !has("settlement", "paystack") {
+		t.Fatalf("providers missing registered adapters: %+v", providers)
+	}
+	if _, ok := providers["compliance"]; !ok {
+		t.Fatalf("providers should always include the compliance key: %+v", providers)
+	}
+	if resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/providers", "", nil, nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("list providers without a token: expected 401, got %d", resp.StatusCode)
+	}
+
+	fiat := env.payoutCurrency(t)
+	var created struct {
+		ID string `json:"id"`
+	}
+	resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/corridors", token, map[string]any{
+		"crypto_asset": "USDT", "crypto_network": "TRC20", "fiat_currency": fiat,
+		"providers": []map[string]any{
+			{"type": "collection", "name": "busha", "priority": 0},
+			{"type": "settlement", "name": "paystack", "priority": 1},
+			{"type": "settlement", "name": "flutterwave", "priority": 0},
+		},
+	}, &created)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create corridor: expected 201, got %d", resp.StatusCode)
+	}
+
+	type binding struct {
+		Type     string `json:"type"`
+		Name     string `json:"name"`
+		Priority int    `json:"priority"`
+	}
+	var got struct {
+		ID        string    `json:"id"`
+		Providers []binding `json:"providers"`
+	}
+	if resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/corridors/"+created.ID, token, nil, &got); resp.StatusCode != http.StatusOK {
+		t.Fatalf("get corridor: expected 200, got %d", resp.StatusCode)
+	}
+	want := []binding{{"collection", "busha", 0}, {"settlement", "flutterwave", 0}, {"settlement", "paystack", 1}}
+	if len(got.Providers) != len(want) {
+		t.Fatalf("get corridor providers: got %+v, want %+v", got.Providers, want)
+	}
+	for i := range want {
+		if got.Providers[i] != want[i] {
+			t.Fatalf("get corridor providers[%d]: got %+v, want %+v", i, got.Providers[i], want[i])
+		}
+	}
+
+	var list struct {
+		Items []struct {
+			ID        string    `json:"id"`
+			Providers []binding `json:"providers"`
+		} `json:"items"`
+	}
+	if resp := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/corridors?limit=200", token, nil, &list); resp.StatusCode != http.StatusOK {
+		t.Fatalf("list corridors: expected 200, got %d", resp.StatusCode)
+	}
+	found := false
+	for _, c := range list.Items {
+		if c.ID == created.ID {
+			found = true
+			if len(c.Providers) != 3 {
+				t.Fatalf("list corridors: expected 3 providers on the new corridor, got %+v", c.Providers)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("list corridors: new corridor missing from the first 200")
+	}
+}
+
+// DELETE /v2/admin/corridors/{id}: an unused corridor is removed with its
+// bindings and tenant opt-ins (and audited); one with payment history is a
+// 409 and stays exactly as it was.
+func TestAdminDeleteCorridor(t *testing.T) {
+	env := newCorridorAdminTestEnv(t)
+	ctx := context.Background()
+	srv, client, token, stores := env.srv, env.client, env.token, env.stores
+
+	create := func() string {
+		t.Helper()
+		var created struct {
+			ID string `json:"id"`
+		}
+		resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/corridors", token, map[string]any{
+			"crypto_asset": "USDT", "crypto_network": "TRC20", "fiat_currency": env.payoutCurrency(t),
+			"providers": []map[string]any{
+				{"type": "collection", "name": "busha"},
+				{"type": "settlement", "name": "paystack"},
+			},
+		}, &created)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create corridor: expected 201, got %d", resp.StatusCode)
+		}
+		return created.ID
+	}
+	del := func(id string) int {
+		t.Helper()
+		return doJSON(t, client, http.MethodDelete, srv.URL+"/v2/admin/corridors/"+id, token, nil, nil).StatusCode
+	}
+
+	// --- Unused corridor with a tenant opt-in: deleted outright ---
+	unused := create()
+	tenantID, err := stores.tenant.CreateTenant(ctx, "delete-corridor-"+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if _, err := env.pool.Exec(ctx,
+		`INSERT INTO tenant_corridor_entitlements (tenant_id, corridor_id, active) VALUES ($1, $2, true)`,
+		tenantID, unused); err != nil {
+		t.Fatalf("seed entitlement: %v", err)
+	}
+	if code := del(unused); code != http.StatusNoContent {
+		t.Fatalf("delete unused corridor: expected 204, got %d", code)
+	}
+	if code := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/corridors/"+unused, token, nil, nil).StatusCode; code != http.StatusNotFound {
+		t.Fatalf("get deleted corridor: expected 404, got %d", code)
+	}
+	var leftovers int
+	if err := env.pool.QueryRow(ctx,
+		`SELECT (SELECT count(*) FROM corridor_providers WHERE corridor_id = $1) + (SELECT count(*) FROM tenant_corridor_entitlements WHERE corridor_id = $1)`,
+		unused).Scan(&leftovers); err != nil {
+		t.Fatalf("count leftovers: %v", err)
+	}
+	if leftovers != 0 {
+		t.Fatalf("delete left %d provider/entitlement rows behind", leftovers)
+	}
+	if !env.hasAuditEntry(t, "corridor.delete", unused) {
+		t.Fatal("expected a corridor.delete audit entry")
+	}
+	if code := del(unused); code != http.StatusNotFound {
+		t.Fatalf("delete twice: expected 404, got %d", code)
+	}
+
+	// --- Corridor with payment history: refused, untouched ---
+	used := create()
+	if _, err := env.pool.Exec(ctx,
+		`INSERT INTO treasury_address_reservations (corridor_id, tenant_id, provider_name, custody_type, crypto_asset, crypto_network, address)
+		 VALUES ($1, $2, 'busha', 'partner_custodied', 'USDT', 'TRC20', $3)`,
+		used, tenantID, "T"+uuid.NewString()); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	if code := del(used); code != http.StatusConflict {
+		t.Fatalf("delete corridor with history: expected 409, got %d", code)
+	}
+	var got struct {
+		Providers []struct{ Name string } `json:"providers"`
+	}
+	if code := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/corridors/"+used, token, nil, &got).StatusCode; code != http.StatusOK || len(got.Providers) != 2 {
+		t.Fatalf("refused delete should leave the corridor intact: status %d, providers %+v", code, got.Providers)
+	}
+}
+
+// PATCH crypto_network: allowed to a supported network until the corridor
+// carries a payment, then 409. Asset stays immutable, the catalog applies,
+// and moving onto an existing asset/network/currency is a 409.
+func TestAdminCorridorNetworkChange(t *testing.T) {
+	env := newCorridorAdminTestEnv(t)
+	ctx := context.Background()
+	srv, client, token, stores := env.srv, env.client, env.token, env.stores
+	fiat := env.payoutCurrency(t)
+
+	create := func(network string) string {
+		t.Helper()
+		var created struct {
+			ID string `json:"id"`
+		}
+		resp := doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/corridors", token, map[string]any{
+			"crypto_asset": "USDT", "crypto_network": network, "fiat_currency": fiat,
+			"providers": []map[string]any{{"type": "collection", "name": "busha"}, {"type": "settlement", "name": "paystack"}},
+		}, &created)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create corridor on %s: expected 201, got %d", network, resp.StatusCode)
+		}
+		return created.ID
+	}
+	type detail struct {
+		CryptoNetwork     string `json:"crypto_network"`
+		HasPaymentHistory bool   `json:"has_payment_history"`
+	}
+	get := func(id string) detail {
+		t.Helper()
+		var d detail
+		if code := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/corridors/"+id, token, nil, &d).StatusCode; code != http.StatusOK {
+			t.Fatalf("get corridor: expected 200, got %d", code)
+		}
+		return d
+	}
+	patch := func(id string, body map[string]any) int {
+		t.Helper()
+		return doJSON(t, client, http.MethodPatch, srv.URL+"/v2/admin/corridors/"+id, token, body, nil).StatusCode
+	}
+
+	id := create("TRC20")
+	if d := get(id); d.HasPaymentHistory {
+		t.Fatal("a new corridor has no payment history")
+	}
+	if code := patch(id, map[string]any{"crypto_network": "erc20"}); code != http.StatusOK {
+		t.Fatalf("move unused corridor to ERC20: expected 200, got %d", code)
+	}
+	if d := get(id); d.CryptoNetwork != "ERC20" {
+		t.Fatalf("network after move: got %q, want ERC20", d.CryptoNetwork)
+	}
+	if code := patch(id, map[string]any{"crypto_network": "BITCOIN"}); code != http.StatusBadRequest {
+		t.Fatalf("move USDT onto a network it isn't on: expected 400, got %d", code)
+	}
+	if code := patch(id, map[string]any{"crypto_network": "NOPE" + fiat}); code != http.StatusBadRequest {
+		t.Fatalf("move onto an unknown network: expected 400, got %d", code)
+	}
+	if code := patch(id, map[string]any{"crypto_asset": "BTC"}); code != http.StatusBadRequest {
+		t.Fatalf("change asset: expected 400, got %d", code)
+	}
+
+	// The asset can change too before any payment, to one on this network.
+	if code := patch(id, map[string]any{"crypto_asset": "eth"}); code != http.StatusOK {
+		t.Fatalf("change unused corridor to ETH on ERC20: expected 200, got %d", code)
+	}
+	if code := patch(id, map[string]any{"crypto_asset": "USDT"}); code != http.StatusOK {
+		t.Fatalf("change back to USDT: expected 200, got %d", code)
+	}
+
+	// Moving onto a pair another corridor already has.
+	other := create("BEP20")
+	if code := patch(other, map[string]any{"crypto_network": "ERC20"}); code != http.StatusConflict {
+		t.Fatalf("move onto an existing corridor's network: expected 409, got %d", code)
+	}
+
+	// After a payment, the network is locked.
+	tenantID, err := stores.tenant.CreateTenant(ctx, "network-change-"+uuid.NewString())
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if _, err := env.pool.Exec(ctx,
+		`INSERT INTO treasury_address_reservations (corridor_id, tenant_id, provider_name, custody_type, crypto_asset, crypto_network, address)
+		 VALUES ($1, $2, 'busha', 'partner_custodied', 'USDT', 'ERC20', $3)`,
+		id, tenantID, "0x"+uuid.NewString()); err != nil {
+		t.Fatalf("seed reservation: %v", err)
+	}
+	if d := get(id); !d.HasPaymentHistory {
+		t.Fatal("has_payment_history should be true once a reservation exists")
+	}
+	if code := patch(id, map[string]any{"crypto_network": "TRC20"}); code != http.StatusConflict {
+		t.Fatalf("move a corridor with payment history: expected 409, got %d", code)
+	}
+	if code := patch(id, map[string]any{"crypto_asset": "ETH"}); code != http.StatusConflict {
+		t.Fatalf("change the asset of a corridor with payment history: expected 409, got %d", code)
+	}
+	if code := patch(id, map[string]any{"active": false}); code != http.StatusOK {
+		t.Fatalf("other settings stay editable with history: expected 200, got %d", code)
+	}
+}
+
+// Payout currencies are exactly the KYB jurisdictions: listed by
+// GET /v2/admin/payout-currencies, and the only currencies a corridor may use.
+func TestAdminPayoutCurrencies(t *testing.T) {
+	env := newCorridorAdminTestEnv(t)
+	srv, client, token := env.srv, env.client, env.token
+
+	fiat := env.payoutCurrency(t)
+	var list []struct {
+		Code           string   `json:"code"`
+		Jurisdiction   string   `json:"jurisdiction"`
+		RequiredFields []string `json:"required_fields"`
+	}
+	if code := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/payout-currencies", token, nil, &list).StatusCode; code != http.StatusOK {
+		t.Fatalf("list payout currencies: expected 200, got %d", code)
+	}
+	var ngn, mine bool
+	for _, c := range list {
+		ngn = ngn || (c.Code == "NGN" && len(c.RequiredFields) > 0)
+		mine = mine || c.Code == fiat
+	}
+	if !ngn || !mine {
+		t.Fatalf("payout currencies should include NGN (with KYB fields) and %s: %+v", fiat, list)
+	}
+	if code := doJSON(t, client, http.MethodGet, srv.URL+"/v2/admin/payout-currencies", "", nil, nil).StatusCode; code != http.StatusUnauthorized {
+		t.Fatalf("list payout currencies without a token: expected 401, got %d", code)
+	}
+
+	create := func(currency string) int {
+		t.Helper()
+		return doJSON(t, client, http.MethodPost, srv.URL+"/v2/admin/corridors", token, map[string]any{
+			"crypto_asset": "USDT", "crypto_network": "TRC20", "fiat_currency": currency,
+			"providers": []map[string]any{{"type": "collection", "name": "busha"}, {"type": "settlement", "name": "paystack"}},
+		}, nil).StatusCode
+	}
+	if code := create("ZZ" + strings.ToUpper(uuid.NewString()[:6])); code != http.StatusBadRequest {
+		t.Fatalf("corridor in a currency with no KYB requirements: expected 400, got %d", code)
+	}
+	if code := create(fiat); code != http.StatusCreated {
+		t.Fatalf("corridor in a supported payout currency: expected 201, got %d", code)
 	}
 }
