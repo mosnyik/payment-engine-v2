@@ -73,8 +73,12 @@ type Case struct {
 	DeclaredCurrencies []string
 }
 
+// Decision is a provider's verdict. Hold wins over Approved: the provider
+// has run its checks but wants a person to make the final call, so the
+// case lands in the manual hold queue with Reason as the findings.
 type Decision struct {
 	Approved bool
+	Hold     bool
 	Reason   string
 }
 
@@ -126,6 +130,18 @@ type Store struct {
 func (s *Store) HasProvider(name string) bool {
 	_, ok := s.registry.Get(name)
 	return ok
+}
+
+// ProviderNames lists every registered screening provider by name. They
+// are only registered once configured, so each one is enabled.
+func (s *Store) ProviderNames() map[string]bool {
+	s.registry.mu.RLock()
+	defer s.registry.mu.RUnlock()
+	out := make(map[string]bool, len(s.registry.providers))
+	for name := range s.registry.providers {
+		out[name] = true
+	}
+	return out
 }
 
 func New(pool *db.Pool, registry *Registry) *Store {
@@ -194,18 +210,25 @@ func (s *Store) ScreenTenant(ctx context.Context, tenantID uuid.UUID, submittedD
 			SubmittedData: submittedData,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("compliance: screen: %w", err)
-		}
-		if decision.Approved {
-			status = StatusApproved
-		} else {
-			status = StatusRejected
+			// Fall back to manual review rather than failing the tenant's
+			// submission: the case is held with a note for the admin.
+			decision = Decision{Hold: true, Reason: fmt.Sprintf("%s: automated screening errored (%v), verify manually", providerName, err)}
 		}
 		resolvedProviderName = &providerName
 		decisionReason = &decision.Reason
-		now := time.Now()
-		resolvedAt = &now
+		if !decision.Hold {
+			if decision.Approved {
+				status = StatusApproved
+			} else {
+				status = StatusRejected
+			}
+			now := time.Now()
+			resolvedAt = &now
+		}
 	}
+
+	// The provider has seen the full BVN; nothing after this needs it.
+	submittedData = maskSubmittedData(submittedData)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -269,15 +292,17 @@ func (s *Store) ScreenSession(ctx context.Context, sessionID, tenantID uuid.UUID
 		if err != nil {
 			return nil, fmt.Errorf("compliance: screen: %w", err)
 		}
-		if decision.Approved {
-			status = StatusApproved
-		} else {
-			status = StatusRejected
-		}
 		resolvedProviderName = &providerName
 		decisionReason = &decision.Reason
-		now := time.Now()
-		resolvedAt = &now
+		if !decision.Hold {
+			if decision.Approved {
+				status = StatusApproved
+			} else {
+				status = StatusRejected
+			}
+			now := time.Now()
+			resolvedAt = &now
+		}
 	}
 
 	var holdExpiresAt *time.Time
@@ -448,6 +473,77 @@ func (s *Store) GetLatestCase(ctx context.Context, referenceType string, referen
 	return c, nil
 }
 
+var (
+	// ErrKYBUnderReview: the tenant already has a KYB case in the hold
+	// queue, so a second submission would only duplicate the review.
+	ErrKYBUnderReview = errors.New("compliance: kyb already under review")
+	// ErrKYBTooManyAttempts: more than MaxKYBSubmissionsPerDay in 24h.
+	// Each submission is a billed vendor lookup, and an unlimited form
+	// would let anyone use it to test BVNs and TINs.
+	ErrKYBTooManyAttempts = errors.New("compliance: too many kyb submissions")
+)
+
+// MaxKYBSubmissionsPerDay caps a tenant's KYB submissions in any 24h.
+const MaxKYBSubmissionsPerDay = 3
+
+// CheckKYBSubmissionAllowed is the self-service gate run before
+// ScreenTenant: no new case while one is under review, and at most
+// MaxKYBSubmissionsPerDay in the last 24 hours.
+func (s *Store) CheckKYBSubmissionAllowed(ctx context.Context, tenantID uuid.UUID) error {
+	var holds, recent int
+	err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE status = 'hold'),
+		        count(*) FILTER (WHERE created_at > now() - interval '24 hours')
+		 FROM compliance_cases
+		 WHERE case_type = 'kyb' AND reference_type = 'tenant' AND reference_id = $1`,
+		tenantID,
+	).Scan(&holds, &recent)
+	if err != nil {
+		return fmt.Errorf("compliance: count kyb submissions: %w", err)
+	}
+	if holds > 0 {
+		return ErrKYBUnderReview
+	}
+	if recent >= MaxKYBSubmissionsPerDay {
+		return ErrKYBTooManyAttempts
+	}
+	return nil
+}
+
+// sensitiveFields are masked in submitted_data before it is stored.
+var sensitiveFields = []string{"director_bvn"}
+
+// maskSubmittedData keeps the last four characters of each sensitive
+// field, so an admin can still tell submissions apart. Data that isn't a
+// JSON object is returned unchanged (validation has already run).
+func maskSubmittedData(data json.RawMessage) json.RawMessage {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return data
+	}
+	changed := false
+	for _, k := range sensitiveFields {
+		v, ok := m[k].(string)
+		if !ok || v == "" {
+			continue
+		}
+		keep := 4
+		if len(v) <= keep {
+			keep = 0
+		}
+		m[k] = strings.Repeat("•", len(v)-keep) + v[len(v)-keep:]
+		changed = true
+	}
+	if !changed {
+		return data
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 // ListHolds returns open hold-queue cases of the given type, oldest first —
 // this is the ops queue surface (exposed via platform/adminauth-gated
 // endpoints when the onboarding workflow wires it in).
@@ -487,9 +583,14 @@ func (s *Store) ResolveHold(ctx context.Context, caseID, adminID uuid.UUID, appr
 		status = StatusApproved
 	}
 
+	// Any automated findings already on the case (a provider that held it
+	// for review) are kept under the admin's reason, not overwritten.
 	row := s.pool.QueryRow(ctx,
 		`UPDATE compliance_cases
-		 SET status = $2, decision_reason = $3, resolved_by = $4, resolved_at = now(), provider_name = 'manual'
+		 SET status = $2,
+		     decision_reason = CASE WHEN decision_reason IS NULL OR decision_reason = '' THEN $3
+		                            ELSE $3 || E'\n\n' || decision_reason END,
+		     resolved_by = $4, resolved_at = now(), provider_name = 'manual'
 		 WHERE id = $1 AND status = 'hold'
 		 RETURNING `+caseColumns,
 		caseID, string(status), reason, adminID,

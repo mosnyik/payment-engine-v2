@@ -191,9 +191,23 @@ func (h *adminBrowseHandlers) listCorridors(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	resp := make([]corridorResponse, len(corridors))
+	ids := make([]uuid.UUID, len(corridors))
 	for i := range corridors {
-		resp[i] = toCorridorResponse(&corridors[i])
+		ids[i] = corridors[i].ID
+	}
+	bindings, err := h.corridor.ListActiveBindings(r.Context(), ids)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Same shape as POST /admin/corridors' response: the corridor plus its
+	// active provider bindings.
+	resp := make([]createCorridorResponse, len(corridors))
+	for i := range corridors {
+		resp[i] = createCorridorResponse{
+			corridorResponse: toCorridorResponse(&corridors[i]),
+			Providers:        toProviderBindingResponses(bindings[corridors[i].ID]),
+		}
 	}
 	writePaginated(w, resp, limit, offset, total)
 }
@@ -214,7 +228,28 @@ func (h *adminBrowseHandlers) getCorridor(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toCorridorResponse(c))
+	bindings, err := h.corridor.ListActiveBindings(r.Context(), []uuid.UUID{c.ID})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	used, err := h.corridor.HasPaymentHistory(r.Context(), c.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// has_payment_history: once true, the corridor can be neither deleted
+	// nor moved to another network.
+	writeJSON(w, http.StatusOK, struct {
+		createCorridorResponse
+		HasPaymentHistory bool `json:"has_payment_history"`
+	}{
+		createCorridorResponse: createCorridorResponse{
+			corridorResponse: toCorridorResponse(c),
+			Providers:        toProviderBindingResponses(bindings[c.ID]),
+		},
+		HasPaymentHistory: used,
+	})
 }
 
 // adminSessionResponse is the admin-facing session shape — richer than

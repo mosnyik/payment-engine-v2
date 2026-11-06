@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -203,6 +204,57 @@ func (h *corridorAdminHandlers) validateProviders(providers []providerBindingInp
 	return bindings, nil
 }
 
+type providerOption struct {
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
+func sortedProviderOptions(m map[string]bool) []providerOption {
+	out := make([]providerOption, 0, len(m))
+	for name, enabled := range m {
+		out = append(out, providerOption{Name: name, Enabled: enabled})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// GET /admin/providers — every provider name a corridor may bind, by type,
+// exactly the set validateProviders accepts. enabled=false means the
+// adapter exists but its credentials aren't configured, so a corridor
+// bound only to it can't move money yet.
+func (h *corridorAdminHandlers) listProviders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string][]providerOption{
+		string(corridor.ProviderTypeCollection): sortedProviderOptions(h.treasury.ProviderNames()),
+		string(corridor.ProviderTypeSettlement): sortedProviderOptions(h.settlement.ProviderNames()),
+		string(corridor.ProviderTypeCompliance): sortedProviderOptions(h.compliance.ProviderNames()),
+	})
+}
+
+type payoutCurrencyResponse struct {
+	Code           string   `json:"code"`
+	Jurisdiction   string   `json:"jurisdiction"`
+	RequiredFields []string `json:"required_fields"`
+}
+
+// GET /admin/payout-currencies — the currencies a corridor may pay out in:
+// those with KYB requirements (managed with cmd/jurisdictionctl).
+func (h *corridorAdminHandlers) listPayoutCurrencies(w http.ResponseWriter, r *http.Request) {
+	reqs, err := h.compliance.ListJurisdictionRequirements(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]payoutCurrencyResponse, len(reqs))
+	for i, req := range reqs {
+		fields := req.RequiredFields
+		if fields == nil {
+			fields = []string{}
+		}
+		out[i] = payoutCurrencyResponse{Code: req.FiatCurrency, Jurisdiction: req.Jurisdiction, RequiredFields: fields}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // POST /admin/corridors — creates a corridor plus its provider bindings in
 // one transaction. Create-only: an existing asset/network/fiat combination
 // is a 409, never an overwrite.
@@ -215,6 +267,26 @@ func (h *corridorAdminHandlers) createCorridor(w http.ResponseWriter, r *http.Re
 	in, bindings, err := h.validate(req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// Only an active asset on an active network it's available on, per the
+	// supported crypto catalog (GET /admin/crypto).
+	if err := h.corridor.CheckCryptoSupported(r.Context(), in.CryptoAsset, in.CryptoNetwork); err != nil {
+		if errors.Is(err, corridor.ErrUnsupportedCrypto) {
+			writeErr(w, http.StatusBadRequest, err)
+		} else {
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	// Only a supported payout currency: one with KYB requirements, so
+	// businesses opting in have something to be verified against.
+	switch ok, err := h.compliance.HasJurisdiction(r.Context(), in.FiatCurrency); {
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	case !ok:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("fiat_currency %s is not a supported payout currency: it has no KYB requirements (see GET /admin/payout-currencies)", in.FiatCurrency))
 		return
 	}
 
@@ -241,10 +313,12 @@ func (h *corridorAdminHandlers) createCorridor(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-// immutableCorridorFields are the natural key. Sessions, tenant
-// entitlements and the KYB jurisdiction gate are all tied to them, so a
-// change means creating a new corridor and deactivating this one.
-var immutableCorridorFields = map[string]bool{"crypto_asset": true, "crypto_network": true, "fiat_currency": true}
+// immutableCorridorFields never change: tenant entitlements and the KYB
+// jurisdiction gate are tied to the currency, so a change means creating a
+// new corridor and deactivating this one. crypto_asset and crypto_network
+// may change until the corridor carries its first payment
+// (corridor.UpdateCorridor enforces that, the handler checks the catalog).
+var immutableCorridorFields = map[string]bool{"fiat_currency": true}
 
 // applyCorridorPatch merges a PATCH body into c. Absent keys leave a field
 // unchanged; an explicit null clears min/max/travel-rule threshold. Unknown
@@ -279,6 +353,22 @@ func applyCorridorPatch(c *corridor.Corridor, patch map[string]json.RawMessage) 
 		switch {
 		case immutableCorridorFields[key]:
 			return fmt.Errorf("%s can't be changed; create a new corridor and deactivate this one", key)
+		case key == "crypto_asset":
+			var v string
+			if isNull(raw) || json.Unmarshal(raw, &v) != nil {
+				return errors.New("crypto_asset must be a string")
+			}
+			if c.CryptoAsset, err = corridor.NormalizeCode(v); err != nil {
+				return fmt.Errorf("crypto_asset: %w", err)
+			}
+		case key == "crypto_network":
+			var v string
+			if isNull(raw) || json.Unmarshal(raw, &v) != nil {
+				return errors.New("crypto_network must be a string")
+			}
+			if c.CryptoNetwork, err = corridor.NormalizeCode(v); err != nil {
+				return fmt.Errorf("crypto_network: %w", err)
+			}
 		case key == "active":
 			if isNull(raw) || json.Unmarshal(raw, &c.Active) != nil {
 				return errors.New("active must be a boolean")
@@ -335,8 +425,19 @@ func (h *corridorAdminHandlers) updateCorridor(w http.ResponseWriter, r *http.Re
 
 	var patchErr error
 	before, after, err := h.corridor.UpdateCorridor(r.Context(), id, func(c *corridor.Corridor) error {
+		prevAsset, prevNetwork := c.CryptoAsset, c.CryptoNetwork
 		if patchErr = applyCorridorPatch(c, patch); patchErr != nil {
 			return errCorridorPatchInvalid
+		}
+		// A new asset or network must be a supported pair in the catalog.
+		if c.CryptoAsset != prevAsset || c.CryptoNetwork != prevNetwork {
+			if err := h.corridor.CheckCryptoSupported(r.Context(), c.CryptoAsset, c.CryptoNetwork); err != nil {
+				if !errors.Is(err, corridor.ErrUnsupportedCrypto) {
+					return err // database trouble: a 500 below, not a bad request
+				}
+				patchErr = err
+				return errCorridorPatchInvalid
+			}
 		}
 		return nil
 	})
@@ -346,6 +447,13 @@ func (h *corridorAdminHandlers) updateCorridor(w http.ResponseWriter, r *http.Re
 		return
 	case errors.Is(err, errCorridorPatchInvalid):
 		writeErr(w, http.StatusBadRequest, patchErr)
+		return
+	case errors.Is(err, corridor.ErrInUse):
+		// Asset or network change on a corridor that has carried payments.
+		writeErr(w, http.StatusConflict, err)
+		return
+	case errors.Is(err, corridor.ErrAlreadyExists):
+		writeErr(w, http.StatusConflict, err)
 		return
 	case err != nil:
 		writeErr(w, http.StatusInternalServerError, err)
@@ -360,6 +468,38 @@ func (h *corridorAdminHandlers) updateCorridor(w http.ResponseWriter, r *http.Re
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// DELETE /admin/corridors/{corridorID} — permanently removes a corridor
+// that has never carried a payment (with its provider bindings and tenant
+// opt-ins). One with payment history is a 409: deactivate it instead
+// (PATCH {"active": false}), which keeps that history intact.
+func (h *corridorAdminHandlers) deleteCorridor(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "corridorID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	c, bindings, err := h.corridor.DeleteCorridor(r.Context(), id)
+	switch {
+	case errors.Is(err, corridor.ErrNotFound):
+		writeErr(w, http.StatusNotFound, err)
+		return
+	case errors.Is(err, corridor.ErrInUse):
+		writeErr(w, http.StatusConflict, err)
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if adminID, ok := adminauth.AdminIDFromContext(r.Context()); ok {
+		deleted := createCorridorResponse{corridorResponse: toCorridorResponse(c), Providers: toProviderBindingResponses(bindings)}
+		if err := h.admin.LogAction(r.Context(), adminID, "corridor.delete", id.String(), deleted); err != nil {
+			log.Printf("admin: corridor %s deleted but audit log write failed: %v", id, err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // PUT /admin/corridors/{corridorID}/providers {"providers": [...]} —

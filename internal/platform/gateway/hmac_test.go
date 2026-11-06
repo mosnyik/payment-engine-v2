@@ -215,3 +215,31 @@ func TestRequirePermission_ScopedKeyDenied(t *testing.T) {
 		t.Fatalf("expected 403 for a key scoped away from the required permission, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestRequireExplicitPermission(t *testing.T) {
+	cases := []struct {
+		name        string
+		permissions []string
+		want        int
+	}{
+		{"unscoped key is denied", nil, http.StatusForbidden},
+		{"key scoped to other actions is denied", []string{gateway.PermissionSessionsWrite}, http.StatusForbidden},
+		{"key granted the permission is allowed", []string{gateway.PermissionSessionsRead, gateway.PermissionKYCVerify}, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := fakeLookup{secret: "s3cret", tenantID: uuid.New(), known: true, permissions: tc.permissions}
+			handler := gateway.HMACMiddleware(lookup, 5*time.Minute, nil)(
+				gateway.RequireExplicitPermission(gateway.PermissionKYCVerify)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(http.StatusOK)
+				})),
+			)
+			req := newSignedRequest(t, "s3cret", http.MethodPost, "/v2/kyc/verify", []byte(`{}`), time.Now())
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("expected %d, got %d: %s", tc.want, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

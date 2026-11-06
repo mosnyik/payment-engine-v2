@@ -7,6 +7,7 @@ package wallet
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
@@ -26,6 +27,27 @@ const (
 	BSC      Chain = "bsc"
 	Tron     Chain = "tron"
 )
+
+// networkAliases maps the network codes corridors use (uppercase, per the
+// supported crypto catalog, plus common alternatives) to a Chain.
+var networkAliases = map[string]Chain{
+	"BITCOIN": Bitcoin, "BTC": Bitcoin,
+	"ETHEREUM": Ethereum, "ETH": Ethereum, "ERC20": Ethereum,
+	"BSC": BSC, "BEP20": BSC, "BNB": BSC,
+	"TRON": Tron, "TRX": Tron, "TRC20": Tron,
+}
+
+// ChainForNetwork maps a corridor's crypto_network to a Chain,
+// case-insensitively ("TRC20", "trx" and "tron" are all Tron). ok is false
+// for a network self-custody doesn't operate on; chain is then the
+// lowercased input, so error messages still name what was asked for.
+func ChainForNetwork(network string) (chain Chain, ok bool) {
+	key := strings.ToUpper(strings.TrimSpace(network))
+	if c, found := networkAliases[key]; found {
+		return c, true
+	}
+	return Chain(strings.ToLower(key)), false
+}
 
 // slip44CoinType per SLIP-44 (github.com/satoshilabs/slips/blob/master/slip-0044.md).
 var slip44CoinType = map[Chain]uint32{

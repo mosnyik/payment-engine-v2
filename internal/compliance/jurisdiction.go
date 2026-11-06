@@ -107,3 +107,17 @@ func (s *Store) IsJurisdictionApproved(ctx context.Context, tenantID uuid.UUID, 
 	}
 	return approved, nil
 }
+
+// HasJurisdiction reports whether fiatCurrency has KYB requirements
+// configured, which is what makes it a supported payout currency: a
+// corridor may only pay out in one (POST /admin/corridors checks it), so a
+// business can never be verified for a currency nothing is required for.
+func (s *Store) HasJurisdiction(ctx context.Context, fiatCurrency string) (bool, error) {
+	var ok bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM jurisdiction_kyb_requirements WHERE fiat_currency = $1)`, fiatCurrency,
+	).Scan(&ok); err != nil {
+		return false, fmt.Errorf("compliance: check jurisdiction: %w", err)
+	}
+	return ok, nil
+}

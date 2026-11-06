@@ -225,6 +225,21 @@ Verified: `internal/settlement/hyparrow_test.go` (dispatch outcome table against
 
 2Settle charges tenants no fee; its margin is the rate spread built into every rate lock (`internal/rate` `LockRate`). Settlement now credits the tenant the full locked fiat value: `fx_conversion` is a two-leg entry (`fiat_fx_clearing` → `tenant_payable`) with no `fee_revenue` leg. Removed `settlement.FeeResolver`, `tenant.Store.EffectiveFeeBps`, the `feeBpsOverride` parameter on `SetCorridorEntitlement`/`GrantCorridorEntitlement`, and the `fee_bps`/`fee_bps_override`/`fee_amount` API fields (an old client still sending `fee_bps_override` is ignored, not rejected). The DB columns are kept but unused; migration `000036` defaults `tenants.fee_bps` to 0 so new rows don't suggest a fee. Earlier phases' notes that mention the 1% fee describe what was built then.
 
+## Phase 16 — KYC as a service (Nuban) ✅ code complete
+
+Builders can verify a person's identity through 2Settle: `POST /v2/kyc/verify`. Design: ARCHITECTURE.md §5 "KYC as a service".
+
+- ✅ **`internal/kyc`**: `Service.Verify` validates the request (ID format per type, names, optional `YYYY-MM-DD` DOB, `consent` must be true), looks the identity up, compares names (case/punctuation-insensitive, middle name accepted as first) and DOB (several provider date formats, day-first), and records the check. Invalid requests never reach the provider, so they're never billed.
+- ✅ **Nuban adapter** (`nuban.go`): BVN, NIN, phone and driver's licence against `api-kycdata.nuban.com.ng` with Bearer auth; handles the phone endpoint's camelCase fields, reads the billed fee from `billing.verification_fee`, maps 404/400/"not found" to `not_found` and everything else (401, 429, 500 out-of-credit, bad body) to a generic 503. Errors never contain the ID number or the key; response bodies are never logged.
+- ✅ **Sandbox provider** (`sandbox.go`), used whenever `SANDBOX_MODE=true`: the ID number's last digit picks the outcome, nothing is billed.
+- ✅ **`kyc_checks`** (migration `000037`): one row per call, attributed to tenant and API key, with a keyed hash of the ID number and no personal data.
+- ✅ **`kyc:verify` permission**, explicit-only (`gateway.RequireExplicitPermission`): unscoped keys are refused.
+- ✅ **Config**: `NUBAN_KYC_ENABLED`, `NUBAN_KYC_API_URL`, `NUBAN_KYC_API_KEY`; with none configured the endpoint answers 503.
+
+Verified: `internal/kyc` (matching, validation, phone/licence normalisation, the Nuban adapter against a fake server, and the DB-backed service: no personal data stored, stable keyed hash, failed calls recorded), `internal/platform/gateway` (explicit permission), `internal/platform/config`, and `cmd/server/kyc_test.go` end to end through the router.
+
+*Open before go-live:* confirm the endpoints and the not-found/error response shapes with Nuban (the only docs found are at nuban-kyc-prod-ui.pages.dev, not nuban.com.ng), whether the v1 `NUBAN_API_KEY` works on this API, and how Nuban expects subject consent to be evidenced. Not built yet: charging tenants for checks, portal self-issuance of a `kyc:verify` key, portal/admin views of `kyc_checks`, and a Nuban wallet-balance alert.
+
 ## Dependency summary
 
 ```

@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/shopspring/decimal"
 
 	"github.com/sirfi/payment-engine-v2/internal/platform/db"
@@ -29,6 +30,11 @@ var (
 	// same (crypto_asset, crypto_network, fiat_currency) already exists, or
 	// when one of its provider bindings is duplicated.
 	ErrAlreadyExists = errors.New("corridor: already exists")
+	// ErrInUse is returned by DeleteCorridor when the corridor has payment
+	// history (sessions, settlements or deposit-address reservations). That
+	// history must keep pointing at a real corridor, so such a corridor can
+	// only be deactivated, never deleted.
+	ErrInUse = errors.New("corridor: has payment history")
 )
 
 type Corridor struct {
@@ -368,8 +374,27 @@ func (s *Store) UpdateCorridor(ctx context.Context, id uuid.UUID, apply func(c *
 		fields = []string{}
 	}
 
+	// The currency is what tenant entitlements and the KYB jurisdiction
+	// gate hang on, so it never changes. Asset and network may, but only
+	// before any payment has used the corridor: past payments must keep
+	// pointing at the asset and network they actually ran on.
+	if next.FiatCurrency != before.FiatCurrency {
+		return nil, nil, errors.New("corridor: fiat_currency can't change")
+	}
+	if next.CryptoAsset != before.CryptoAsset || next.CryptoNetwork != before.CryptoNetwork {
+		used, err := hasPaymentHistory(ctx, tx, id)
+		if err != nil {
+			return nil, nil, fmt.Errorf("corridor: update corridor: %w", err)
+		}
+		if used {
+			return nil, nil, ErrInUse
+		}
+	}
+
 	after, err = scanCorridor(tx.QueryRow(ctx,
 		`UPDATE corridors SET
+			crypto_network = $9,
+			crypto_asset = $10,
 			active = $2,
 			min_amount_fiat = $3,
 			max_amount_fiat = $4,
@@ -382,7 +407,12 @@ func (s *Store) UpdateCorridor(ctx context.Context, id uuid.UUID, apply func(c *
 		 RETURNING `+corridorColumns,
 		id, next.Active, next.MinAmountFiat, next.MaxAmountFiat, next.TravelRuleThresholdFiat,
 		int(next.TravelRuleWindow.Seconds()), int(next.ComplianceHoldTimeout.Seconds()), fields,
+		next.CryptoNetwork, next.CryptoAsset,
 	))
+	if isUniqueViolation(err) {
+		// Another corridor already has this asset/network/currency.
+		return nil, nil, ErrAlreadyExists
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("corridor: update corridor: %w", err)
 	}
@@ -524,6 +554,137 @@ func (s *Store) HasActiveCorridorForFiat(ctx context.Context, fiatCurrency strin
 		return false, fmt.Errorf("corridor: has active corridor for fiat: %w", err)
 	}
 	return exists, nil
+}
+
+// hasPaymentHistory reports whether any session, settlement or deposit
+// address reservation references the corridor. Those tables belong to
+// session, settlement and treasury; the check lives here because only this
+// module may delete a corridor or change its network.
+func hasPaymentHistory(ctx context.Context, q queryRower, id uuid.UUID) (bool, error) {
+	var used bool
+	err := q.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM sessions WHERE corridor_id = $1)
+		     OR EXISTS (SELECT 1 FROM settlements WHERE corridor_id = $1)
+		     OR EXISTS (SELECT 1 FROM treasury_address_reservations WHERE corridor_id = $1)`,
+		id,
+	).Scan(&used)
+	if err != nil {
+		return false, fmt.Errorf("check payment history: %w", err)
+	}
+	return used, nil
+}
+
+// HasPaymentHistory reports whether the corridor has ever carried a
+// payment. Such a corridor can't be deleted or moved to another network.
+func (s *Store) HasPaymentHistory(ctx context.Context, id uuid.UUID) (bool, error) {
+	used, err := hasPaymentHistory(ctx, s.pool, id)
+	if err != nil {
+		return false, fmt.Errorf("corridor: %w", err)
+	}
+	return used, nil
+}
+
+// DeleteCorridor permanently removes a corridor that has never carried a
+// payment, along with its provider bindings and tenant entitlements, and
+// returns what it removed. A corridor with payment history is ErrInUse.
+//
+// The corridor row is locked first, so no session can be created against
+// it while the history check runs; a session insert racing ahead of the
+// lock still can't slip through, because its foreign key makes the final
+// DELETE fail, which is also reported as ErrInUse.
+func (s *Store) DeleteCorridor(ctx context.Context, id uuid.UUID) (*Corridor, []ProviderBinding, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	c, err := scanCorridor(tx.QueryRow(ctx, `SELECT `+corridorColumns+` FROM corridors WHERE id = $1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: %w", err)
+	}
+
+	used, err := hasPaymentHistory(ctx, tx, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: %w", err)
+	}
+	if used {
+		return nil, nil, ErrInUse
+	}
+
+	var bindings []ProviderBinding
+	rows, err := tx.Query(ctx,
+		`DELETE FROM corridor_providers WHERE corridor_id = $1
+		 RETURNING id, corridor_id, provider_type, provider_name, priority, active, config`, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: providers: %w", err)
+	}
+	for rows.Next() {
+		var b ProviderBinding
+		var pt string
+		if err := rows.Scan(&b.ID, &b.CorridorID, &pt, &b.ProviderName, &b.Priority, &b.Active, &b.Config); err != nil {
+			rows.Close()
+			return nil, nil, fmt.Errorf("corridor: delete corridor: scan provider: %w", err)
+		}
+		b.ProviderType = ProviderType(pt)
+		bindings = append(bindings, b)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: providers: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM tenant_corridor_entitlements WHERE corridor_id = $1`, id); err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: entitlements: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM corridors WHERE id = $1`, id); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
+			return nil, nil, ErrInUse
+		}
+		return nil, nil, fmt.Errorf("corridor: delete corridor: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("corridor: delete corridor: commit: %w", err)
+	}
+	return c, bindings, nil
+}
+
+// ListActiveBindings returns the active provider bindings of each given
+// corridor, keyed by corridor id, ordered by type then priority. One query
+// for a whole page of corridors (the admin corridor list).
+func (s *Store) ListActiveBindings(ctx context.Context, corridorIDs []uuid.UUID) (map[uuid.UUID][]ProviderBinding, error) {
+	out := make(map[uuid.UUID][]ProviderBinding, len(corridorIDs))
+	if len(corridorIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, corridor_id, provider_type, provider_name, priority, active, config
+		 FROM corridor_providers
+		 WHERE corridor_id = ANY($1) AND active
+		 ORDER BY corridor_id, provider_type, priority ASC`,
+		corridorIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("corridor: list active bindings: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b ProviderBinding
+		var pt string
+		if err := rows.Scan(&b.ID, &b.CorridorID, &pt, &b.ProviderName, &b.Priority, &b.Active, &b.Config); err != nil {
+			return nil, fmt.Errorf("corridor: scan provider binding: %w", err)
+		}
+		b.ProviderType = ProviderType(pt)
+		out[b.CorridorID] = append(out[b.CorridorID], b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("corridor: list active bindings: %w", err)
+	}
+	return out, nil
 }
 
 // ListActiveProviders returns active provider bindings for a corridor,

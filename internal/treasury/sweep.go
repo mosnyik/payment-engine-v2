@@ -111,7 +111,7 @@ func (s *Sweeper) ExecuteSweep(ctx context.Context, reservationID uuid.UUID) err
 	if s.store.seed == nil {
 		return ErrHDWalletNotInitialized
 	}
-	chain := wallet.Chain(r.CryptoNetwork)
+	chain, _ := wallet.ChainForNetwork(r.CryptoNetwork)
 
 	deposits, total, err := s.store.getSweepableDeposits(ctx, reservationID)
 	if err != nil {

@@ -112,7 +112,7 @@
               "raw": "{{base_url}}/admin/tenants/{{tenant_id}}/api-keys",
               "host": ["{{base_url}}"], "path": ["admin", "tenants", "{{tenant_id}}", "api-keys"]
             },
-            "description": "Only path that can scope a key to specific permissions ('sessions:write'/'sessions:read' are the only two that exist today). Requires tenant_id and tenant status 'active' (KYB approved)."
+            "description": "Only path that can scope a key to specific permissions (permissions: 'sessions:write', 'sessions:read', and 'kyc:verify', which is never implied by an unscoped key and must be listed here to use KYC). Requires tenant_id and tenant status 'active' (KYB approved)."
           },
           "event": [
             { "listen": "test", "script": { "exec": [
@@ -272,6 +272,72 @@
               "pm.test('session created', () => pm.response.to.have.status(201));",
               "if (json.id) { pm.collectionVariables.set('session_id', json.id); pm.environment.set('session_id', json.id); }"
             ] } }
+          ]
+        },
+        {
+          "name": "KYC Verify (BVN / NIN / phone / driver's licence)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-API-Key",
+                "value": "{{api_key}}"
+              },
+              {
+                "key": "X-Timestamp",
+                "value": "{{x_timestamp}}"
+              },
+              {
+                "key": "X-Signature",
+                "value": "{{x_signature}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id_type\": \"bvn\",\n  \"id_number\": \"22233344455\",\n  \"first_name\": \"Ada\",\n  \"last_name\": \"Obi\",\n  \"date_of_birth\": \"1990-01-31\",\n  \"consent\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/kyc/verify",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "kyc",
+                "verify"
+              ]
+            },
+            "description": "KYC as a service. The API key must be explicitly granted 'kyc:verify' (use Admin > Issue Scoped API Key with permissions [\"kyc:verify\"]); an unscoped key gets 403. Returns only match / partial_match / no_match / not_found plus per-field checks, never the person's record. id_type: bvn | nin | phone | drivers_license. In sandbox the ID number's last digit picks the outcome: 0 not_found, 1 no_match, 2 partial_match, 9 provider unavailable (503), anything else match. The body uses literal values (no {{variables}}) because the pre-request script signs the raw text."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const method = 'POST';",
+                  "const path = '/v2/kyc/verify';",
+                  "const timestamp = Date.now().toString();",
+                  "const body = pm.request.body && pm.request.body.mode === 'raw' ? pm.request.body.raw : '';",
+                  "const bodyHash = CryptoJS.SHA256(body).toString(CryptoJS.enc.Hex);",
+                  "const toSign = `${method}|${path}|${timestamp}|${bodyHash}`;",
+                  "const secret = pm.collectionVariables.get('hmac_secret');",
+                  "const signature = CryptoJS.HmacSHA256(toSign, secret).toString(CryptoJS.enc.Hex);",
+                  "pm.collectionVariables.set('x_timestamp', timestamp); pm.environment.set('x_timestamp', timestamp);",
+                  "pm.collectionVariables.set('x_signature', signature); pm.environment.set('x_signature', signature);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('kyc check completed', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
           ]
         },
         {

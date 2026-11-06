@@ -150,6 +150,85 @@ paths:
           content:
             application/json: { schema: { $ref: "#/components/schemas/Error" } }
 
+  /kyc/verify:
+    post:
+      tags: [tenant]
+      summary: Verify a person's identity (KYC as a service)
+      description: >
+        Checks the name (and optionally date of birth) you were given against
+        the official record for a BVN, NIN, phone number or driver's licence.
+        Returns only whether each field matches, never the record itself.
+        The API key must be explicitly granted the kyc:verify permission
+        (an unscoped key is refused). Every successful lookup is billed.
+        In SANDBOX_MODE the outcome is picked by the ID number's last digit:
+        0 not_found, 1 no_match, 2 partial_match, 9 provider unavailable
+        (503), anything else match (send date_of_birth 1990-01-31 for a DOB
+        match).
+      security: [{ tenantAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id_type, id_number, first_name, last_name, consent]
+              properties:
+                id_type: { type: string, enum: [bvn, nin, phone, drivers_license] }
+                id_number:
+                  type: string
+                  description: >
+                    BVN/NIN: 11 digits. Phone: Nigerian number, 080..., 234...
+                    or +234... Driver's licence: letters and digits.
+                  example: "22233344455"
+                first_name: { type: string, example: Ada }
+                last_name: { type: string, example: Obi }
+                date_of_birth: { type: string, format: date, example: "1990-01-31", description: Optional. }
+                consent:
+                  type: boolean
+                  description: Must be true. You confirm the person agreed to this check (NDPA).
+      responses:
+        "200":
+          description: Check completed (including not_found)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  check_id: { type: string, format: uuid }
+                  id_type: { type: string, enum: [bvn, nin, phone, drivers_license] }
+                  result:
+                    type: string
+                    enum: [match, partial_match, no_match, not_found]
+                    description: >
+                      match: every field sent matches. partial_match: some
+                      match, others don't or can't be compared. no_match:
+                      neither name matches. not_found: no record for this ID.
+                  checks:
+                    type: object
+                    description: Per field, one of match, mismatch, not_checked, unavailable. Empty for not_found.
+                    properties:
+                      first_name: { type: string }
+                      last_name: { type: string }
+                      date_of_birth: { type: string }
+                  created_at: { type: string, format: date-time }
+        "400":
+          description: Invalid request (bad id_type or id_number format, missing name, consent not true, unknown field)
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "401":
+          description: Missing/invalid tenant credentials
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "403":
+          description: API key not granted kyc:verify
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+        "503":
+          description: KYC not configured on this deployment, or the provider is temporarily unavailable
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Error" } }
+
   /webhooks/settlement/{providerName}:
     post:
       tags: [webhooks]

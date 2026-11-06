@@ -89,6 +89,17 @@ type Config struct {
 	// which rejects every portal_url (fail closed).
 	PortalAllowedOrigins []string
 
+	// Youverify is the KYB screening vendor (internal/compliance
+	// YouverifyProvider). Disabled by default: KYB cases then go straight
+	// to the manual hold queue. Ignored in SANDBOX_MODE, which always
+	// auto-approves.
+	Youverify YouverifyConfig
+
+	// NubanKYC is the identity-lookup vendor behind POST /v2/kyc/verify
+	// (internal/kyc NubanProvider). Disabled by default: the endpoint then
+	// answers 503, unless SANDBOX_MODE is on (free simulated results).
+	NubanKYC NubanKYCConfig
+
 	RateEngine   RateEngineConfig
 	Treasury     TreasuryConfig
 	Session      SessionConfig
@@ -133,6 +144,21 @@ type SessionConfig struct {
 // RateProviderConfig configures one external HTTP rate-provider adapter
 // (Busha, LiquidRamp, Anchor) — see internal/rate. All default disabled:
 // none of these have a real endpoint/response shape wired in yet.
+// YouverifyConfig is the KYB vendor's settings (YOUVERIFY_*).
+type YouverifyConfig struct {
+	Enabled bool
+	APIURL  string // default https://api.youverify.co (live, billed)
+	APIKey  string
+}
+
+// NubanKYCConfig is the KYC vendor's settings (NUBAN_KYC_*). Separate
+// from the v1 account-lookup NUBAN_API_KEY: different product and host.
+type NubanKYCConfig struct {
+	Enabled bool
+	APIURL  string // default https://api-kycdata.nuban.com.ng (live, billed)
+	APIKey  string
+}
+
 type RateProviderConfig struct {
 	Enabled bool
 	APIURL  string
@@ -391,6 +417,35 @@ func Load(source Source) (*Config, error) {
 	auditLogRetentionCheckInterval := durationOrDefault(source, "AUDIT_LOG_RETENTION_CHECK_INTERVAL", 24*time.Hour, &errs)
 	httpAddr := stringOrDefault(source, "HTTP_ADDR", ":3700")
 	portalAllowedOrigins := originListOrEmpty(source, "PORTAL_ALLOWED_ORIGINS", &errs)
+	youverify := YouverifyConfig{
+		Enabled: boolOrDefault(source, "YOUVERIFY_ENABLED", false),
+		APIURL:  stringOrDefault(source, "YOUVERIFY_API_URL", "https://api.youverify.co"),
+		APIKey:  stringOrDefault(source, "YOUVERIFY_API_KEY", ""),
+	}
+	if youverify.Enabled {
+		if strings.TrimSpace(youverify.APIKey) == "" {
+			errs = append(errs, "YOUVERIFY_ENABLED requires YOUVERIFY_API_KEY")
+		}
+		u, err := url.Parse(youverify.APIURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			errs = append(errs, "YOUVERIFY_API_URL must be an HTTPS origin (https://api.youverify.co or https://api.sandbox.youverify.co)")
+		}
+	}
+
+	nubanKYC := NubanKYCConfig{
+		Enabled: boolOrDefault(source, "NUBAN_KYC_ENABLED", false),
+		APIURL:  stringOrDefault(source, "NUBAN_KYC_API_URL", "https://api-kycdata.nuban.com.ng"),
+		APIKey:  stringOrDefault(source, "NUBAN_KYC_API_KEY", ""),
+	}
+	if nubanKYC.Enabled {
+		if strings.TrimSpace(nubanKYC.APIKey) == "" {
+			errs = append(errs, "NUBAN_KYC_ENABLED requires NUBAN_KYC_API_KEY")
+		}
+		u, err := url.Parse(nubanKYC.APIURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			errs = append(errs, "NUBAN_KYC_API_URL must be an HTTPS origin (e.g. https://api-kycdata.nuban.com.ng)")
+		}
+	}
 
 	session := SessionConfig{
 		TTLCheckInterval: durationOrDefault(source, "SESSION_TTL_CHECK_INTERVAL", 30*time.Second, &errs),
@@ -526,6 +581,8 @@ func Load(source Source) (*Config, error) {
 		AuditLogRetentionCheckInterval: auditLogRetentionCheckInterval,
 		HTTPAddr:                       httpAddr,
 		PortalAllowedOrigins:           portalAllowedOrigins,
+		Youverify:                      youverify,
+		NubanKYC:                       nubanKYC,
 		RateEngine:                     rateEngine,
 		Treasury:                       treasury,
 		Session:                        session,

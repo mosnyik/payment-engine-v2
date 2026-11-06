@@ -66,6 +66,11 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 	protected.With(gateway.RequirePermission(gateway.PermissionSessionsWrite)).Post("/sessions", sh.createSession)
 	protected.With(gateway.RequirePermission(gateway.PermissionSessionsRead)).Get("/sessions/{sessionID}", sh.getSession)
 
+	// KYC as a service. Explicit permission only: an unscoped key doesn't
+	// get it, since every call is billed by the provider.
+	kh := &kycHandlers{kyc: stores.kyc}
+	protected.With(gateway.RequireExplicitPermission(gateway.PermissionKYCVerify)).Post("/kyc/verify", kh.verify)
+
 	h := &adminHandlers{tenant: stores.tenant, compliance: stores.compliance, admin: stores.admin, session: stores.session, sandboxMode: cfg.SandboxMode}
 	bh := &adminBrowseHandlers{tenant: stores.tenant, corridor: stores.corridor, session: stores.session, admin: stores.admin, requestAudit: stores.audit}
 	sth := &settlementHandlers{settlement: stores.settlement}
@@ -83,6 +88,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		notification: stores.notification,
 		ledger:       stores.ledger,
 		sandboxMode:  cfg.SandboxMode,
+		kybProvider:  portalKYBProvider(cfg.SandboxMode, cfg.Youverify.Enabled),
 	}
 
 	r.With(publicLimit).Post("/admin/login", h.login)
@@ -113,6 +119,7 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		portal.Post("/logout-all", ph.logoutAll)
 		portal.Post("/delete-account", ph.deleteAccount)
 		portal.Post("/kyb", ph.submitKYB)
+		portal.Get("/kyb", ph.getKYB)
 		portal.Get("/sessions", ph.listSessions)
 		portal.Get("/sessions/{sessionID}", ph.getSession)
 		portal.Get("/settlements", ph.listSettlements)
@@ -159,8 +166,26 @@ func buildRouter(cfg *config.Config, stores *appStores) (chi.Router, error) {
 		admin.Post("/compliance/holds/{caseID}/resolve", h.resolveHold)
 		admin.Post("/tenants/{tenantID}/api-keys", h.issueAPIKey)
 		admin.Post("/tenants/{tenantID}/corridors/{corridorID}", h.setCorridorEntitlement)
+		admin.Get("/providers", ch.listProviders)
+		admin.Get("/payout-currencies", ch.listPayoutCurrencies)
+
+		// Supported crypto catalog (networks, assets) — what corridors may use.
+		cc := &cryptoCatalogHandlers{corridor: stores.corridor, admin: stores.admin}
+		admin.Get("/crypto", cc.catalog)
+		admin.Get("/crypto/networks", cc.listNetworks)
+		admin.Post("/crypto/networks", cc.createNetwork)
+		admin.Get("/crypto/networks/{code}", cc.getNetwork)
+		admin.Patch("/crypto/networks/{code}", cc.updateNetwork)
+		admin.Delete("/crypto/networks/{code}", cc.deleteNetwork)
+		admin.Get("/crypto/assets", cc.listAssets)
+		admin.Post("/crypto/assets", cc.createAsset)
+		admin.Get("/crypto/assets/{code}", cc.getAsset)
+		admin.Patch("/crypto/assets/{code}", cc.updateAsset)
+		admin.Delete("/crypto/assets/{code}", cc.deleteAsset)
+
 		admin.Post("/corridors", ch.createCorridor)
 		admin.Patch("/corridors/{corridorID}", ch.updateCorridor)
+		admin.Delete("/corridors/{corridorID}", ch.deleteCorridor)
 		admin.Put("/corridors/{corridorID}/providers", ch.replaceProviders)
 		admin.Post("/tenants/{tenantID}/webhook", h.setWebhookURL)
 		admin.Post("/sessions/{sessionID}/resolve", h.resolveSessionHold)
